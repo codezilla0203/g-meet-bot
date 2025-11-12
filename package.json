@@ -1,0 +1,24 @@
+{
+  "name": "cxflow-meeting-bot-api",
+  "version": "2.0.0",
+  "description": "A Recall.ai-style Meeting Bot API for joining and recording Google Meet sessions.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "start:legacy": "node src/server-legacy.js",
+    "dev": "nodemon src/server.js",
+    "setup": "node scripts/setup-env.js",
+    "test": "node examples/test.py"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "fs-extra": "^11.2.0",
+    "googleapis": "^128.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "uuid": "^9.0.1",
+    "ws": "^8.14.2"
+  }
+}

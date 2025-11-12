@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Generated files
+*.mp4
+*.mp3
+*.wav
+*.webm
+*.txt
+error_*.png
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+*.temp
+.cache/
+
+# Chrome profiles
+chrome-profiles/
+
+# Backup
+*-backup.js
+*-old.js
+*-clean.js
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# Credentials
+credentials.json
+token.json
+*.pem
+*.key
+
+# Build
+dist/
+build/
