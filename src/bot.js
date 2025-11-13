@@ -31,20 +31,29 @@ class Bot {
         
         // Monitoring
         this.participantCheckInterval = null;
+        this.keepAliveInterval = null;
+        this._cdp = null;
+
+        // Dedupe memory for finalized sentences per speaker
+        this._lastSentenceKeyBySpeaker = new Map();
 
         const runtimeRoot = path.join(__dirname, '../runtime');
         this.botDir = path.join(runtimeRoot, this.id);
         this.audioDir = path.join(this.botDir, 'audio');
         this.transcriptsDir = path.join(this.botDir, 'transcripts');
+        this.videoDir = path.join(this.botDir, 'video');
         this.botsPidDir = path.join(runtimeRoot, 'bots');
         try {
             fs.ensureDirSync(this.botsPidDir);
             fs.ensureDirSync(this.botDir);
             fs.ensureDirSync(this.audioDir);
             fs.ensureDirSync(this.transcriptsDir);
+            fs.ensureDirSync(this.videoDir);
         } catch {}
         this.browserPidFile = path.join(this.botsPidDir, `${this.id}.pid`);
-        this.outputFile = path.join(this.audioDir, `${this.id}.webm`);
+        this.outputFile = path.join(this.videoDir, `${this.id}.video.webm`);
+        this.audioFile = path.join(this.videoDir, `${this.id}.audio.webm`);
+        this.finalFile = path.join(this.videoDir, `${this.id}.final.webm`);
         // Fine-grained transcripts
         this.wordsFile = path.join(this.transcriptsDir, `${this.id}.words.jsonl`);
         this.sentencesFile = path.join(this.transcriptsDir, `${this.id}.sentences.jsonl`);
@@ -88,21 +97,33 @@ class Bot {
     async launchBrowser() {
         console.log(`[${this.id}] 🌐 Launching browser...`);
 
+        const headlessEnv = process.env.BOT_HEADLESS || process.env.HEADLESS || '';
+        const headlessMode = headlessEnv === '1' || /^true$/i.test(headlessEnv);
+        const extPath = path.join(__dirname, '../chrome-tab-capture');
         this.browser = await puppeteer.launch({
-            headless: false,
+            headless: headlessMode ? 'new' : false,
             defaultViewport: { width: 1920, height: 1080 },
             args: [
+                `--load-extension=${extPath}`,
+                `--disable-extensions-except=${extPath}`,
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--autoplay-policy=no-user-gesture-required',
                 '--use-fake-ui-for-media-stream',
                 '--use-fake-device-for-media-stream',
                 '--enable-features=WebCodecs',
+                '--enable-usermedia-screen-capturing',
+                '--allow-http-screen-capture',
+                '--auto-select-desktop-capture-source=Meet',
                 // Prevent background throttling so recording and captions keep running without focus
                 '--disable-background-timer-throttling',
                 '--disable-renderer-backgrounding',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-features=CalculateNativeWinOcclusion',
+                '--disable-background-media-suspend',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-features=BackForwardCache,OptimizationHints',
                 '--window-size=1920,1080',
                 '--start-maximized'
             ]
@@ -125,6 +146,8 @@ class Bot {
                 try {
                     Object.defineProperty(document, 'hidden', { get: () => false });
                     Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+                    // Pretend the page always has focus
+                    try { document.hasFocus = () => true; } catch {}
                 } catch {}
                 document.addEventListener('visibilitychange', (e) => {
                     try { e.stopImmediatePropagation(); } catch {}
@@ -135,6 +158,19 @@ class Bot {
                 window.addEventListener('focus', (e) => {
                     try { e.stopImmediatePropagation(); } catch {}
                 }, true);
+                // Ensure requestAnimationFrame keeps firing at a steady pace even if throttled
+                try {
+                    const nativeRAF = window.requestAnimationFrame.bind(window);
+                    let last = Date.now();
+                    window.requestAnimationFrame = (cb) => nativeRAF((t) => {
+                        last = Date.now();
+                        cb(t);
+                    });
+                    // Fallback tick in case RAF is throttled
+                    setInterval(() => {
+                        try { nativeRAF(() => {}); } catch {}
+                    }, 1000);
+                } catch {}
             });
         } catch {}
         await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
@@ -142,6 +178,9 @@ class Bot {
         // Prepare capture helper and inject interceptors
         this.capture = new WebRTCCapture(this.id, this.page);
         await this.capture.injectWebRTCInterceptor();
+
+        // Start CDP keep-alive to prevent background throttling
+        await this.startKeepAlive();
 
         // Write Chrome PID file for crash/restart cleanup
         try {
@@ -155,6 +194,29 @@ class Bot {
         } catch {}
         
         console.log(`[${this.id}] ✅ Browser ready`);
+    }
+
+    async startKeepAlive() {
+        try {
+            this._cdp = await this.page.target().createCDPSession();
+            try { await this._cdp.send('Emulation.setIdleOverride', { isUserActive: true, isScreenUnlocked: true }); } catch {}
+            try { await this._cdp.send('Page.setWebLifecycleState', { state: 'active' }); } catch {}
+            // Re-assert active state periodically
+            if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+            this.keepAliveInterval = setInterval(async () => {
+                try { await this._cdp.send('Emulation.setIdleOverride', { isUserActive: true, isScreenUnlocked: true }); } catch {}
+                try { await this._cdp.send('Page.setWebLifecycleState', { state: 'active' }); } catch {}
+            }, 10000);
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Keep-alive CDP setup failed: ${e.message}`);
+        }
+    }
+
+    async stopKeepAlive() {
+        try { if (this.keepAliveInterval) clearInterval(this.keepAliveInterval); } catch {}
+        this.keepAliveInterval = null;
+        try { await this._cdp?.detach?.(); } catch {}
+        this._cdp = null;
     }
 
     /**
@@ -624,8 +686,13 @@ class Bot {
                 }
             }
             if (!clicked) {
-                // Try keyboard shortcut (sometimes works): 'c'
-                try { await this.page.keyboard.press('KeyC'); clicked = true; } catch {}
+                // Fallback: Try keyboard shortcut 'Shift+c'
+                try {
+                    await this.page.keyboard.down('Shift');
+                    await this.page.keyboard.press('KeyC');
+                    await this.page.keyboard.up('Shift');
+                    clicked = true;
+                } catch {}
             }
             await this.page.waitForTimeout(800);
             console.log(`[${this.id}] ✅ Captions toggled`);
@@ -668,288 +735,237 @@ class Bot {
     }
 
     /**
-     * Start WebRTC recording
+     * Start full tab recording (UI + audio) to video folder
      */
     async startRecording() {
-        console.log(`[${this.id}] 🎥 Starting recording...`);
-
+        console.log(`[${this.id}] 🎥+🎙️ Starting tab video + remote audio capture...`);
         try {
-            // Wait for remote media to appear
-            await this.page.waitForFunction(() => Array.isArray(window.__meetingTracks) && window.__meetingTracks.some(t => t.type === 'remote'), { polling: 1000, timeout: 120000 }).catch(() => {});
-            await this.page.waitForTimeout(1500);
-
-            await this.capture.startContainerCapture(this.outputFile, {
-                remoteOnly: true,
-                mixAllParticipants: true,
+            await this.page.waitForTimeout(1200);
+            await this.capture.startTabCapture(this.outputFile, {
                 width: 1280,
                 height: 720,
-                fps: 15
+                fps: 25,
+                videoBitsPerSecond: 2500000,
+                audioBitsPerSecond: 128000
             });
-
-            await this.capture.startRawCapture({
-                audioPath: path.join(this.audioDir, `${this.id}.f32le`),
-                videoPath: path.join(this.audioDir, `${this.id}.i420`),
-                sampleRate: 48000,
-                fps: 5,
-                maxWidth: 640,
-                maxHeight: 360,
-                remoteOnly: true
-            });
-
-            // If streaming is enabled, forward raw audio chunks to WS
-            if (this.streamSocket && this.streamSocket.readyState === WebSocket.OPEN) {
-                this.capture.setAudioForwarder((buffer, sampleRate) => {
-                    try {
-                        const msg = {
-                            type: 'audio',
-                            botId: this.id,
-                            encoding: 'f32le',
-                            sampleRate,
-                            chunk: buffer.toString('base64'),
-                            ts: Date.now()
-                        };
-                        this.streamSocket.send(JSON.stringify(msg));
-                    } catch {}
-                });
-            }
-
+            await this.capture.startRemoteAudioCapture(this.audioFile, { audioBitsPerSecond: 128000 });
             this.isCapturing = true;
-            console.log(`[${this.id}] ✅ Recording started`);
-        } catch (error) {
-            console.error(`[${this.id}] ❌ Failed to start recording:`, error);
-            throw error;
+            console.log(`[${this.id}] ✅ Video at ${this.outputFile}, audio at ${this.audioFile}`);
+        } catch (e) {
+            console.error(`[${this.id}] ❌ Failed to start recording:`, e.message);
+            this.isCapturing = false;
         }
     }
 
     async startCaptionsObserver() {
         try {
-            // Bridge to receive caption lines
+            // Bridge to receive caption lines from the browser
             await this.page.exposeFunction(`__onCaption_${this.id}`, async (payload) => {
                 try {
-                    const iso = new Date(payload.ts).toISOString();
-                    // Approximate audio offset if raw capture is running
-                    let audioOffsetMs = null;
-                    try {
-                        const startMs = this.capture?.getAudioStartEpochMs?.();
-                        if (startMs && Number.isFinite(startMs)) {
-                            audioOffsetMs = Math.max(0, payload.ts - startMs);
+                    const nowIso = new Date(payload.ts).toISOString();
+
+                    // Normalize shape: default to final if state missing
+                    const state = payload.state === 'pending' ? 'pending' : 'final';
+                    const speaker = payload.speaker || 'Unknown Speaker';
+                    const text = String(payload.text || '').trim();
+                    const utteranceId = payload.utteranceId || `${speaker}`;
+
+                    if (!text) return;
+
+                    if (state === 'pending') {
+                        // Stream live replacement updates only; don't persist
+                        if (this.streamSocket && this.streamSocket.readyState === WebSocket.OPEN) {
+                            const msg = {
+                                type: 'caption_update',
+                                botId: this.id,
+                                speaker,
+                                utteranceId,
+                                text,
+                                prevText: payload.prevText || '',
+                                ts: payload.ts,
+                                iso: nowIso,
+                                state: 'pending'
+                            };
+                            this.streamSocket.send(JSON.stringify(msg));
                         }
-                    } catch {}
-                    const baseRecord = {
-                        ts: payload.ts,
-                        iso,
-                        botId: this.id,
-                        speaker: payload.speaker || '',
-                        lang: payload.lang || 'auto',
-                        text: payload.text,
-                        unit: payload.unit || 'sentence',
-                        audioOffsetMs
-                    };
-                    // 1) Append to transcript files (JSONL per unit)
-                    if (baseRecord.unit === 'word') {
-                        fs.appendFileSync(this.wordsFile, JSON.stringify(baseRecord) + '\n');
-                    } else {
-                        fs.appendFileSync(this.sentencesFile, JSON.stringify(baseRecord) + '\n');
+                        // Console hint of replacement
+                        const hhmmss = new Date(payload.ts).toTimeString().split(' ')[0];
+                        console.log(`[${this.id}] ✏️ ${hhmmss} ${speaker}: ${text} [editing]`);
+                        return;
                     }
-                    // 2) Emit over WS (if connected)
+
+                    // Node-side dedupe by normalized key per speaker+utterance
+                    const normalizeKey = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const dedupeKey = normalizeKey(`${speaker}|${utteranceId}|${text}`);
+                    const prevKey = this._lastSentenceKeyBySpeaker.get(`${speaker}|${utteranceId}`);
+                    if (prevKey === dedupeKey) return;
+                    this._lastSentenceKeyBySpeaker.set(`${speaker}|${utteranceId}`, dedupeKey);
+
+                    const record = {
+                        ts: payload.ts,
+                        iso: nowIso,
+                        botId: this.id,
+                        speaker,
+                        text,
+                        unit: 'sentence',
+                        utteranceId
+                    };
+
+                    // Append only finalized sentences
+                    fs.appendFileSync(this.sentencesFile, JSON.stringify(record) + '\n');
+
+                    // Emit final over WS
                     if (this.streamSocket && this.streamSocket.readyState === WebSocket.OPEN) {
-                        const msg = { type: 'caption', botId: this.id, ...payload };
-                        if (audioOffsetMs != null) msg.audioOffsetMs = audioOffsetMs;
+                        const msg = { type: 'caption_final', botId: this.id, ...record, state: 'final' };
                         this.streamSocket.send(JSON.stringify(msg));
                     }
-                    // 3) Print sentences only to keep console readable
-                    if (baseRecord.unit === 'sentence') {
+
+                    // Log to console
                         const hhmmss = new Date(payload.ts).toTimeString().split(' ')[0];
-                        const display = `${payload.speaker ? payload.speaker + ': ' : ''}${payload.text}`;
-                        console.log(`[${this.id}] 💬 ${hhmmss} ${display}`);
-                    }
+                    console.log(`[${this.id}] 💬 ${hhmmss} ${speaker}: ${text}`);
+
                 } catch (e) {
-                    // Make sure we at least see errors in console for debugging
                     console.warn(`[${this.id}] ⚠️ Caption pipeline error: ${e.message}`);
                 }
             });
 
-            // Inject observer in page context
+            // Inject the MutationObserver into the page context
             await this.page.evaluate((botId) => {
                 const send = window[`__onCaption_${botId}`];
                 if (!send) return;
 
-                window.__captionLastTs = 0;
-                const now = () => Date.now();
+                // Per-speaker buffering and replacement tracking
+                const buffers = new Map(); // speaker -> { text, lastSentPending, timer, lastTs, utteranceId }
+                const endsWithPunctuation = (t) => /[.!?\u2026]\s*$/.test(String(t || ''));
+                const normalizeText = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+                const isSpeakerEcho = (speaker, text) => normalizeText(text).toLowerCase() === normalizeText(speaker).toLowerCase();
+                const FINAL_IDLE_MS = 2500; // long pause to finalize if no punctuation
+                const PUNCT_STABLE_MS = 900; // short stabilization for punctuated sentences
+                const PENDING_THROTTLE_MS = 150; // limit pending spam
 
-                // State: per-speaker incremental buffers and emitted sentences
-                const stateBySpeaker = new Map();
-                const getState = (speaker) => {
-                    const key = speaker || '';
-                    if (!stateBySpeaker.has(key)) {
-                        stateBySpeaker.set(key, { prevText: '', emittedSentenceKeys: new Set() });
+                const scheduleFinalize = (speaker) => {
+                    const st = buffers.get(speaker);
+                    if (!st) return;
+                    const text = normalizeText(st.text);
+                    const delay = endsWithPunctuation(text) ? PUNCT_STABLE_MS : FINAL_IDLE_MS;
+                    if (st.timer) clearTimeout(st.timer);
+                    st.timer = setTimeout(() => {
+                        const latest = normalizeText(buffers.get(speaker)?.text || '');
+                        if (!latest || isSpeakerEcho(speaker, latest)) return;
+                        send({ ts: Date.now(), speaker, text: latest, utteranceId: st.utteranceId, state: 'final' });
+                        // Start a new utterance id for next turn
+                        buffers.delete(speaker);
+                    }, delay);
+                };
+
+                const maybeSendPending = (speaker, prevText, text) => {
+                    const st = buffers.get(speaker);
+                    const now = Date.now();
+                    if (!st) return;
+                    if (st.lastPendingSentAt && (now - st.lastPendingSentAt) < PENDING_THROTTLE_MS) return;
+                    const norm = normalizeText(text);
+                    if (!norm || norm === st.lastSentPending) return;
+                    st.lastSentPending = norm;
+                    st.lastPendingSentAt = now;
+                    send({ ts: now, speaker, text: norm, prevText, utteranceId: st.utteranceId, state: 'pending' });
+                };
+
+                const sameUtteranceHeuristic = (oldText, newText) => {
+                    const a = normalizeText(oldText);
+                    const b = normalizeText(newText);
+                    if (!a) return true;
+                    if (b.startsWith(a)) return true; // continuation
+                    // small edits/replacements treated as same utterance
+                    return Math.abs(b.length - a.length) <= 20;
+                };
+
+                const handleCaptionUpdate = (speaker, text) => {
+                    if (!speaker) speaker = '';
+                    const cleaned = normalizeText(text);
+                    if (!cleaned || cleaned.length < 2) return;
+                    if (isSpeakerEcho(speaker, cleaned)) return;
+                    const now = Date.now();
+                    let st = buffers.get(speaker);
+                    if (!st) {
+                        st = { text: '', lastSentPending: '', lastPendingSentAt: 0, timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
+                        buffers.set(speaker, st);
                     }
-                    return stateBySpeaker.get(key);
-                };
-
-                const looksLikeName = (s) => {
-                    if (!s) return false;
-                    s = s.trim();
-                    if (s.length === 0 || s.length > 60) return false;
-                    if (!/^[A-Za-zÀ-ÖØ-öø-ÿ]/.test(s)) return false;
-                    const words = s.split(/\s+/).filter(Boolean);
-                    if (words.length < 1 || words.length > 4) return false;
-                    if (/[:;,.!?]/.test(s)) return false;
-                    return true;
-                };
-
-                // Ignore obvious system noise (joins/leaves, etc.)
-                const isSystemNoise = (text) => {
-                    const t = (text || '').toLowerCase();
-                    return (
-                        t.includes('has left the meeting') ||
-                        t.includes('left the meeting') ||
-                        t.includes('joined the meeting') ||
-                        t.includes('has joined') ||
-                        t.includes('raised hand') ||
-                        t.includes('lowered hand') ||
-                        t.includes('started presenting') ||
-                        t.includes('stopped presenting') ||
-                        t.includes('muted') ||
-                        t.includes('unmuted')
-                    );
-                };
-
-                const normalizeText = (text) => {
-                    if (!text) return '';
-                    let t = String(text).replace(/\s+/g, ' ').trim();
-                    // Strip leading list/counter markers like "2.", "3)", "(4)", "[5]", "- ", "• "
-                    t = t.replace(/^(?:\(?\d{1,3}\)?[.)\-:]|\[\d{1,3}\]|[•–—\-])\s+/u, '');
-                    // Collapse stray zero-width and non-breaking spaces
-                    t = t.replace(/[\u200B\u00A0]+/g, '');
-                    return t;
-                };
-
-                const sentenceKey = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase();
-
-                const sentenceSegments = (t) => {
-                    const segs = [];
-                    let last = 0;
-                    const re = /[^.!?]+[.!?]+/g;
-                    let m;
-                    while ((m = re.exec(t)) !== null) {
-                        const seg = m[0].trim();
-                        if (seg) segs.push({ text: seg, complete: true });
-                        last = re.lastIndex;
+                    const prevText = st.text || '';
+                    // If new text looks like a new turn and previous existed without finalization, finalize previous
+                    if (prevText && !sameUtteranceHeuristic(prevText, cleaned)) {
+                        if (st.timer) clearTimeout(st.timer);
+                        // Finalize previous before starting new utterance
+                        send({ ts: now - 1, speaker, text: normalizeText(prevText), utteranceId: st.utteranceId, state: 'final' });
+                        // Start new utterance id
+                        st = { text: '', lastSentPending: '', lastPendingSentAt: 0, timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
+                        buffers.set(speaker, st);
                     }
-                    const rem = t.slice(last).trim();
-                    if (rem) segs.push({ text: rem, complete: false });
-                    return segs;
+                    st.text = cleaned;
+                    st.lastTs = now;
+                    maybeSendPending(speaker, prevText, cleaned);
+                    scheduleFinalize(speaker);
                 };
 
-                const emitWord = (speaker, text) => {
-                    const ts = now();
-                    window.__captionLastTs = ts;
-                    send({ text, speaker: looksLikeName(speaker) ? speaker : '', lang: 'auto', ts, unit: 'word' });
-                };
-                const emitSentence = (speaker, text) => {
-                    const ts = now();
-                    window.__captionLastTs = ts;
-                    send({ text, speaker: looksLikeName(speaker) ? speaker : '', lang: 'auto', ts, unit: 'sentence' });
-                };
+                const observeRegion = (captionRegion) => {
+                    let lastKnownSpeaker = "Unknown Speaker";
 
-                const processCaption = (speaker, rawText) => {
-                    let content = normalizeText(rawText);
-                    if (!content || content.length < 2) return;
-                    if (isSystemNoise(content)) return;
+                    const handleNode = (node) => {
+                        if (!(node instanceof HTMLElement)) return;
 
-                    const s = getState(speaker);
-                    const prev = s.prevText || '';
+                        const speakerElem = node.querySelector(".NWpY1d");
+                        let speaker = speakerElem?.textContent?.trim() || lastKnownSpeaker;
 
-                    const appended = content.startsWith(prev);
-                    const delta = appended ? content.slice(prev.length) : content;
-
-                    // Emit new words only when the text appended (avoid re-emitting on resets/corrections)
-                    if (appended && delta) {
-                        const tokens = delta.split(/\s+/).map(w => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')).filter(Boolean);
-                        for (const w of tokens) emitWord(speaker, w);
-                    }
-
-                    // Emit any completed new sentences we haven't emitted before
-                    const segs = sentenceSegments(content);
-                    for (const seg of segs) {
-                        if (!seg.complete) continue; // only emit completed sentences
-                        const key = sentenceKey(seg.text);
-                        if (!s.emittedSentenceKeys.has(key)) {
-                            s.emittedSentenceKeys.add(key);
-                            emitSentence(speaker, seg.text);
+                        if (speaker && speaker !== "Unknown Speaker") {
+                            lastKnownSpeaker = speaker;
                         }
-                    }
 
-                    s.prevText = content;
-                };
+                        const clone = node.cloneNode(true);
+                        const speakerLabelInClone = clone.querySelector(".NWpY1d");
+                        if (speakerLabelInClone) speakerLabelInClone.remove();
 
-                const tryParseFromRegion = (region) => {
-                    if (!region) return;
-                    // Prefer the explicit Meet caption tiles structure if present
-                    try {
-                        const container = region.closest('[role="region"][aria-label*="caption" i], [aria-label="Captions"]') || region;
-                        const tiles = container.querySelectorAll('.nMcdL');
-                        if (tiles && tiles.length) {
-                            tiles.forEach(tile => {
-                                const nameEl = tile.querySelector('.NWpY1d');
-                                const textEl = tile.querySelector('.ygicle, .ygicle.VbkSUe');
-                                const speaker = (nameEl?.innerText || '').trim();
-                                const raw = (textEl?.innerText || '').trim();
-                                if (!raw) return;
-                                processCaption(speaker, raw);
-                            });
-                            return; // handled via tiles
+                        const caption = clone.textContent?.trim() || "";
+
+                        if (caption) {
+                            handleCaptionUpdate(speaker, caption);
                         }
-                    } catch {}
+                    };
 
-                    // Fallback parsing from generic live/log regions
-                    let text = (region.innerText || '').trim();
-                    if (!text) return;
-
-                    // Common patterns: "Speaker\ncontent" or "Speaker: content"
-                    let speaker = '';
-                    let content = text;
-                    const parts = text.split('\n').filter(Boolean);
-                    if (parts.length >= 2 && looksLikeName(parts[0])) {
-                        speaker = parts[0].trim();
-                        content = parts.slice(1).join(' ').trim();
-                    } else {
-                        const m = text.match(/^\s*([^:]{1,60}):\s*(.+)$/);
-                        if (m && looksLikeName(m[1])) {
-                            speaker = m[1].trim();
-                            content = m[2].trim();
-                        }
-                    }
-                    processCaption(speaker, content);
-                };
-
-                const captionScopeSelector = '[role="region"][aria-label*="caption" i], [aria-label="Captions"], [aria-live], [role="log"], [class*="caption" i], [class*="transcript" i]';
-
-                const obs = new MutationObserver((mutations) => {
-                    for (const m of mutations) {
-                        if (m.type === 'childList') {
-                            m.addedNodes.forEach(n => {
-                                if (n.nodeType !== Node.ELEMENT_NODE) return;
-                                tryParseFromRegion(n.closest ? n.closest(captionScopeSelector) : null);
-                                if (n.querySelectorAll) {
-                                    n.querySelectorAll(captionScopeSelector).forEach(tryParseFromRegion);
-                                }
-                            });
-                        } else if (m.type === 'characterData') {
-                            const p = m.target && m.target.parentElement;
-                            tryParseFromRegion(p ? (p.closest ? p.closest(captionScopeSelector) : null) : null);
+                    const observer = new MutationObserver((mutations) => {
+                        for (const mutation of mutations) {
+                            const nodes = Array.from(mutation.addedNodes);
+                            if (nodes.length > 0) {
+                                nodes.forEach((node) => {
+                                    if (node instanceof HTMLElement) {
+                                        handleNode(node);
+                                    }
+                                });
+                            } else if (
+                                mutation.type === "characterData" &&
+                                mutation.target.parentElement instanceof HTMLElement
+                            ) {
+                                handleNode(mutation.target.parentElement);
                         }
                     }
                 });
-                obs.observe(document.body, { childList: true, subtree: true, characterData: true });
-                window.__captionObserver = obs;
 
-                // Seed existing live regions
-                try {
-                    document.querySelectorAll(captionScopeSelector).forEach(tryParseFromRegion);
-                } catch {}
+                    observer.observe(captionRegion, {
+                        childList: true,
+                        subtree: true,
+                        characterData: true,
+                    });
+                    window.__captionObserver = observer;
+                };
+                
+                const interval = setInterval(() => {
+                    const region = document.querySelector('[role="region"][aria-label*="Captions"]');
+                    if (region) {
+                        clearInterval(interval);
+                        observeRegion(region);
+                    }
+                }, 1000);
+
             }, this.id);
+
             console.log(`[${this.id}] ✅ Captions observer started`);
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ Could not start captions observer: ${e.message}`);
@@ -1037,6 +1053,9 @@ class Bot {
             await this.stopRecording();
         }
 
+        // Stop keep-alive
+        await this.stopKeepAlive();
+
         // Close browser
         if (this.browser) {
             await this.browser.close();
@@ -1051,40 +1070,53 @@ class Bot {
         if (this.onLeave) {
             this.onLeave();
         }
+        // Reset dedupe cache
+        try { this._lastSentenceKeyBySpeaker.clear(); } catch {}
     }
 
     /**
      * Stop recording and save file
      */
     async stopRecording() {
-        if (!this.isCapturing) return;
-
-        console.log(`[${this.id}] ⏹️ Stopping recording...`);
+        const { execFile } = require('child_process');
+        let ffmpeg;
+        try { ffmpeg = require('ffmpeg-static'); } catch {}
 
         try {
-            // Stop raw and container capture via helper
-            if (this.capture) {
-                await this.capture.stopRawCapture();
-                await this.capture.stopContainerCapture();
+            if (this.isCapturing) {
+                await this.capture.stopTabCapture();
+                await this.capture.stopRemoteAudioCapture();
             }
-            this.isCapturing = false;
-        } catch (error) {
-            console.error(`[${this.id}] ❌ Error stopping recording:`, error);
+        } catch {}
+
+        // Mux if ffmpeg available and files exist
+        try {
+            if (ffmpeg && await fs.pathExists(this.outputFile) && await fs.pathExists(this.audioFile)) {
+                await new Promise((res, rej) => {
+                    execFile(ffmpeg, ['-y','-i', this.outputFile, '-i', this.audioFile, '-c:v','copy','-c:a','copy', this.finalFile], (err)=> err?rej(err):res());
+                });
+                console.log(`[${this.id}] 🎬 Muxed A+V -> ${this.finalFile}`);
+            } else {
+                console.warn(`[${this.id}] ⚠️ ffmpeg not available or capture files missing; skipping mux.`);
+            }
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ ffmpeg mux error: ${e.message}`);
         }
+        this.isCapturing = false;
+        return;
     }
 
     /**
      * Get bot status
      */
     getStats() {
-        const captureStats = this.capture?.getStats?.() || {};
         return {
             botId: this.id,
             isRecording: this.isCapturing,
-            outputFile: this.outputFile,
-            rawAudioFile: captureStats.rawAudioFile,
-            rawVideoFile: captureStats.rawVideoFile,
-            rawMetaFile: captureStats.rawMetaFile,
+            outputFile: this.finalFile,
+            rawAudioFile: null,
+            rawVideoFile: null,
+            rawMetaFile: null,
             hasSeenParticipants: this.hasSeenParticipants
         };
     }

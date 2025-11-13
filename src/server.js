@@ -8,6 +8,8 @@ require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const app = express();
 app.use(express.json());
+// Serve static frontend
+app.use(express.static(path.join(__dirname, '../public')));
 
 const PORT = process.env.PORT || 3000;
 const RUNTIME_DIR = path.join(__dirname, '../runtime/bots');
@@ -544,19 +546,46 @@ wss.on('connection', async (ws) => {
                 const chunk = Buffer.from(msg.chunk, 'base64');
                 // Optionally store original raw audio
                 try { audioStream?.write(chunk); } catch {}
-                // Compute lightweight audio level for monitors (RMS)
-                try {
-                    const f32 = new Float32Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / 4));
-                    let sum = 0;
-                    for (let i = 0; i < f32.length; i++) { const s = f32[i]; sum += s * s; }
-                    const rms = f32.length ? Math.sqrt(sum / f32.length) : 0;
-                    broadcastMonitor(botId, 'audio-level', { ts: Date.now(), rms, sampleRate: msg.sampleRate, bytes: chunk.length });
-                } catch {}
+                // No audio forwarding to frontend (UI is captions-only)
                 return;
             }
 
             if (msg.type === 'caption') {
                 appendTranscript(botId, { type: 'caption', text: msg.text, speaker: msg.speaker, lang: msg.lang, ts: msg.ts || Date.now() });
+                // Forward final caption to clients and SSE
+                const payload = { type: 'caption_final', text: msg.text, speaker: msg.speaker, ts: msg.ts || Date.now() };
+                broadcastMonitor(botId, 'caption_final', payload);
+                broadcastClient(botId, { botId, ...payload });
+                return;
+            }
+
+            if (msg.type === 'caption_update') {
+                // Pending replacement from bot
+                const payload = {
+                    type: 'caption_update',
+                    speaker: msg.speaker || '',
+                    utteranceId: msg.utteranceId || '',
+                    text: msg.text || '',
+                    prevText: msg.prevText || '',
+                    ts: msg.ts || Date.now()
+                };
+                broadcastMonitor(botId, 'caption_update', payload);
+                broadcastClient(botId, { botId, ...payload });
+                return;
+            }
+
+            if (msg.type === 'caption_final') {
+                const payload = {
+                    type: 'caption_final',
+                    speaker: msg.speaker || '',
+                    utteranceId: msg.utteranceId || '',
+                    text: msg.text || '',
+                    ts: msg.ts || Date.now()
+                };
+                // Persist final caption as transcript segment
+                appendTranscript(botId, { type: 'caption', text: payload.text, speaker: payload.speaker, ts: payload.ts });
+                broadcastMonitor(botId, 'caption_final', payload);
+                broadcastClient(botId, { botId, ...payload });
                 return;
             }
         } catch (e) {
@@ -567,6 +596,50 @@ wss.on('connection', async (ws) => {
     ws.on('close', () => {
         try { audioStream?.close(); } catch {}
     });
+});
+
+// Frontend clients (browsers) subscribe here to get audio + caption updates
+const clientRooms = new Map(); // botId -> Set<ws>
+function getRoom(botId) {
+    if (!clientRooms.has(botId)) clientRooms.set(botId, new Set());
+    return clientRooms.get(botId);
+}
+function broadcastClient(botId, messageObject) {
+    const room = clientRooms.get(botId);
+    if (!room || room.size === 0) return;
+    const data = JSON.stringify(messageObject);
+    for (const sock of room) {
+        try { sock.send(data); } catch {}
+    }
+}
+const wssClient = new WebSocketServer({ server, path: '/ws/client' });
+wssClient.on('connection', (ws, req) => {
+    // Parse botId from query string ?botId=...
+    try {
+        const url = new URL(req.url, `http://localhost:${PORT}`);
+        const botId = url.searchParams.get('botId');
+        if (!botId) {
+            try { ws.close(); } catch {}
+            return;
+        }
+        console.log(`📡 Client WS connected for bot ${botId} from ${req.socket.remoteAddress}`);
+        const room = getRoom(botId);
+        room.add(ws);
+        // Hello message
+        try { ws.send(JSON.stringify({ type: 'hello', botId, ts: Date.now() })); } catch {}
+        // Keepalive ping
+        const pingIv = setInterval(() => {
+            try { ws.ping(); } catch {}
+        }, 15000);
+        ws.on('close', () => {
+            const r = clientRooms.get(botId);
+            if (r) r.delete(ws);
+            clearInterval(pingIv);
+            console.log(`📴 Client WS disconnected for bot ${botId}`);
+        });
+    } catch {
+        try { ws.close(); } catch {}
+    }
 });
 
 // Graceful shutdown to avoid orphaned browsers/bots on restarts

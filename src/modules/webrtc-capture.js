@@ -19,6 +19,7 @@ class WebRTCCapture {
         this.botId = botId;
         this.page = page;
         this.isCapturing = false;
+        this.isTabCapturing = false;
         this.mediaRecorder = null;
         this.recordedChunks = [];
         this.outputPath = null;
@@ -241,6 +242,10 @@ class WebRTCCapture {
                         const mixedAudio = dest.stream.getAudioTracks()[0];
                         if (mixedAudio) combinedStream.addTrack(mixedAudio);
                         window.__mixAudioCtx = ac;
+                        // Keep AudioContext running in background
+                        window.__mixAudioKeepAlive = setInterval(() => {
+                            try { if (ac.state !== 'running') ac.resume(); } catch {}
+                        }, 1500);
                     } catch (e) {
                         console.warn('[Mix] Audio mix failed, falling back to first audio track', e);
                         if (audioTracks[0]) combinedStream.addTrack(audioTracks[0]);
@@ -370,6 +375,7 @@ class WebRTCCapture {
                     try { if (window.__mixAudioCtx) window.__mixAudioCtx.close(); } catch {}
                     try { clearInterval(window.__mixAudioInterval); } catch {}
                     try { clearInterval(window.__mixVideoInterval); } catch {}
+                    try { clearInterval(window.__mixAudioKeepAlive); } catch {}
                 };
                 window.__mediaRecorder.start(1000);
             }, remoteOnly, mixAllParticipants, width, height, fps);
@@ -474,6 +480,10 @@ class WebRTCCapture {
                 // IMPORTANT: Do NOT connect to ctx.destination to avoid local playback noise/echo
                 src.connect(node); // processing only
                 window.__rawAudioCtx = ctx;
+                // Keep AudioContext running in background
+                window.__rawAudioKeepAlive = setInterval(() => {
+                    try { if (ctx.state !== 'running') ctx.resume(); } catch {}
+                }, 1500);
             } catch (e) {
                 console.error('[RawCapture] Audio worklet init error:', e);
             }
@@ -571,6 +581,66 @@ class WebRTCCapture {
         console.log(`[${this.botId}] ✅ Raw capture files closed (${this.rawAudioPath}, ${this.rawVideoPath})`);
     }
 
+    async startRemoteAudioCapture(outputPath, { audioBitsPerSecond = 128000 } = {}) {
+        console.log(`[${this.botId}] 🎙️  Starting remote-audio capture…`);
+        this.audioOutputPath = outputPath;
+        const ok = await this.page.evaluate(async (bps) => {
+            try {
+                const ac = new (window.AudioContext || window.webkitAudioContext)();
+                const dest = ac.createMediaStreamDestination();
+                const attached = new Set();
+                const attach = (tr) => {
+                    if (!tr || attached.has(tr.id)) return;
+                    attached.add(tr.id);
+                    try {
+                        const src = new MediaStreamAudioSourceNode(ac, { mediaStream: new MediaStream([tr]) });
+                        src.connect(dest);
+                    } catch {}
+                };
+                const scan = () => {
+                    (window.__meetingTracks || []).filter(t=>t && t.type==='remote' && t.kind==='audio' && t.track && t.track.readyState==='live').forEach(t=>attach(t.track));
+                };
+                scan();
+                window.__raScanIv = setInterval(scan, 2000);
+                const track = dest.stream.getAudioTracks()[0];
+                if (!track) return { success:false, error:'no remote audio track' };
+                const rec = new MediaRecorder(new MediaStream([track]), { mimeType:'audio/webm;codecs=opus', audioBitsPerSecond:bps });
+                const chunks=[];
+                rec.ondataavailable=e=>{ if(e.data&&e.data.size) chunks.push(e.data)};
+                rec.onstop=()=>{
+                    try{clearInterval(window.__raScanIv)}catch{}
+                    try{ac.close()}catch{}
+                    window.__raBlob=new Blob(chunks,{type:'audio/webm'});
+                };
+                rec.start(1000);
+                window.__raRec=rec;
+                return {success:true};
+            } catch(e){
+                return {success:false,error:e.message};
+            }
+        }, audioBitsPerSecond);
+        if(!ok.success) throw new Error(ok.error||'remote audio capture failed');
+        this.audioCapture = true;
+    }
+
+    async stopRemoteAudioCapture() {
+        if(!this.audioCapture) return;
+        const bytes = await this.page.evaluate(async ()=>{
+            try{ if(window.__raRec && window.__raRec.state==='recording') window.__raRec.stop(); }catch{}
+            await new Promise(r=>setTimeout(r,1200));
+            if(!window.__raBlob) return null;
+            const buf=await window.__raBlob.arrayBuffer();
+            return Array.from(new Uint8Array(buf));
+        });
+        if(bytes){
+            await fs.writeFile(this.audioOutputPath, Buffer.from(bytes));
+            console.log(`[${this.botId}] ✅ Saved remote audio ${this.audioOutputPath}`);
+        } else {
+            console.warn(`[${this.botId}] ⚠️ remote audio bytes empty`);
+        }
+        this.audioCapture=false;
+    }
+
     getStats() {
         return {
             isCapturing: this.isCapturing,
@@ -583,6 +653,128 @@ class WebRTCCapture {
 
     getAudioStartEpochMs() {
         return this.audioStartEpochMs;
+    }
+
+    // ============ Full Tab Capture using getDisplayMedia (audio + video) ============
+    async startTabCapture(outputPath, { width = 1280, height = 720, fps = 25, audioBitsPerSecond = 128000, videoBitsPerSecond = 2500000 } = {}) {
+        console.log(`[${this.botId}] 🖥️ Starting full tab capture via getDisplayMedia...`);
+        this.outputPath = outputPath;
+        try {
+            const result = await this.page.evaluate(async (W, H, fpsVal, vBps, aBps) => {
+                // 0) Ask our extension for a real tab-capture streamId (granted with audio)
+                const resp = await chrome.runtime.sendMessage({ type: 'GET_STREAM_ID' }).catch(()=>null);
+                if (!resp || !resp.ok) {
+                    return { success:false, error: `extension failed: ${resp?.error||'no response'}` };
+                }
+                const id = resp.streamId;
+                try {
+                    console.log('[TabCapture] Starting tab capture...');
+                    
+                    // 1) Directly obtain combined A+V via streamId
+                    const gUM = await navigator.mediaDevices.getUserMedia({
+                        audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: id } },
+                        video: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: id, maxWidth: W, maxHeight: H, maxFrameRate: fpsVal } }
+                    });
+                    const combined = gUM;
+
+                    const videoTrack = combined.getVideoTracks()[0];
+                    console.log(`[TabCapture] combined stream tracks v=${combined.getVideoTracks().length} a=${combined.getAudioTracks().length}`);
+ 
+                    console.log(`[TabCapture] Combined stream has ${combined.getVideoTracks().length} video, ${combined.getAudioTracks().length} audio tracks`);
+
+                    const options = {
+                        mimeType: 'video/webm;codecs=vp9,opus',
+                        videoBitsPerSecond: vBps,
+                        audioBitsPerSecond: aBps
+                    };
+                    if (!(window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(options.mimeType))) {
+                        options.mimeType = 'video/webm;codecs=vp8,opus';
+                        console.log('[TabCapture] Fallback to vp8,opus codec');
+                    }
+                    console.log(`[TabCapture] Using mimeType: ${options.mimeType}`);
+                    
+                    window.__tabRecordedChunks = [];
+                    window.__tabMediaRecorder = new MediaRecorder(combined, options);
+                    
+                    window.__tabMediaRecorder.onerror = (e) => {
+                        console.error('[TabCapture] MediaRecorder error:', e);
+                    };
+                    
+                    window.__tabMediaRecorder.ondataavailable = (e) => {
+                        if (e.data && e.data.size > 0) {
+                            console.log(`[TabCapture] Data chunk received: ${(e.data.size/1024).toFixed(2)} KB`);
+                            window.__tabRecordedChunks.push(e.data);
+                        }
+                    };
+                    
+                    window.__tabMediaRecorder.onstart = () => {
+                        console.log('[TabCapture] ✅ MediaRecorder started');
+                    };
+                    
+                    window.__tabMediaRecorder.onstop = () => {
+                        console.log(`[TabCapture] MediaRecorder stopped, total chunks: ${window.__tabRecordedChunks.length}`);
+                        try { combined.getTracks().forEach(t=>t.stop()); } catch {}
+                        try { if (window.__tabMixAudioInterval) clearInterval(window.__tabMixAudioInterval); } catch {}
+                        try { if (window.__tabAudioKeep) clearInterval(window.__tabAudioKeep); } catch {}
+                        try { ac.close(); } catch {}
+                        const blob = new Blob(window.__tabRecordedChunks, { type: options.mimeType });
+                        console.log(`[TabCapture] Final blob size: ${(blob.size/1024/1024).toFixed(2)} MB`);
+                        window.__tabFinalRecording = blob;
+                    };
+                    
+                    window.__tabMediaRecorder.start(1000);
+                    console.log('[TabCapture] MediaRecorder.start(1000) called');
+
+                    // Keep AudioContext alive in background
+                    window.__tabAudioKeep = setInterval(() => {
+                        try { if (ac.state !== 'running') ac.resume(); } catch {}
+                    }, 1500);
+                    
+                    return { success: true, message: 'Tab capture started' };
+                } catch (err) {
+                    console.error('[TabCapture] Error in evaluate:', err.message);
+                    return { success: false, error: err.message };
+                }
+            }, width, height, fps, videoBitsPerSecond, audioBitsPerSecond);
+            
+            if (!result || !result.success) {
+                throw new Error(`Tab capture failed: ${result?.error || 'unknown'}`);
+            }
+            console.log(`[${this.botId}] ✅ Tab capture started successfully`);
+            this.isTabCapturing = true;
+        } catch (e) {
+            console.error(`[${this.botId}] ❌ Failed to start tab capture:`, e.message);
+            throw e;
+        }
+    }
+
+    async stopTabCapture() {
+        try {
+            await this.page.evaluate(() => {
+                try { clearInterval(window.__tabAudioKeep); } catch {}
+                try { clearInterval(window.__tabMixAudioInterval); } catch {}
+                if (window.__tabMediaRecorder && window.__tabMediaRecorder.state === 'recording') {
+                    window.__tabMediaRecorder.stop();
+                }
+            });
+            await this.page.waitForTimeout(1500);
+            const bytes = await this.page.evaluate(async () => {
+                if (!window.__tabFinalRecording) return null;
+                const buf = await window.__tabFinalRecording.arrayBuffer();
+                return Array.from(new Uint8Array(buf));
+            });
+            if (bytes) {
+                const buffer = Buffer.from(bytes);
+                await fs.writeFile(this.outputPath, buffer);
+                console.log(`[${this.botId}] ✅ Saved ${this.outputPath} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
+            } else {
+                console.warn(`[${this.botId}] ⚠️ No tab recording bytes available`);
+            }
+        } catch (e) {
+            console.warn(`[${this.botId}] ⚠️ stopTabCapture error: ${e.message}`);
+        } finally {
+            this.isTabCapturing = false;
+        }
     }
 }
 
