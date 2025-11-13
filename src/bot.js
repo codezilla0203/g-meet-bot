@@ -2,6 +2,7 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs-extra');
 const path = require('path');
+const { spawn, execSync, spawnSync } = require('child_process');
 const { WebRTCCapture } = require('./modules/webrtc-capture');
 const WebSocket = require('ws');
 
@@ -39,28 +40,32 @@ class Bot {
 
         const runtimeRoot = path.join(__dirname, '../runtime');
         this.botDir = path.join(runtimeRoot, this.id);
-        this.audioDir = path.join(this.botDir, 'audio');
+        // Video-only output
         this.transcriptsDir = path.join(this.botDir, 'transcripts');
         this.videoDir = path.join(this.botDir, 'video');
+        this.audioDir = path.join(this.botDir, 'audio');
         this.botsPidDir = path.join(runtimeRoot, 'bots');
         try {
             fs.ensureDirSync(this.botsPidDir);
             fs.ensureDirSync(this.botDir);
-            fs.ensureDirSync(this.audioDir);
             fs.ensureDirSync(this.transcriptsDir);
             fs.ensureDirSync(this.videoDir);
+            fs.ensureDirSync(this.audioDir);
         } catch {}
         this.browserPidFile = path.join(this.botsPidDir, `${this.id}.pid`);
         this.outputFile = path.join(this.videoDir, `${this.id}.video.webm`);
-        this.audioFile = path.join(this.videoDir, `${this.id}.audio.webm`);
-        this.finalFile = path.join(this.videoDir, `${this.id}.final.webm`);
+        this.audioFile = path.join(this.audioDir, `${this.id}.audio.wav`);
+        this.audioFallbackFile = null; // used when capturing via page (webm)
         // Fine-grained transcripts
-        this.wordsFile = path.join(this.transcriptsDir, `${this.id}.words.jsonl`);
         this.sentencesFile = path.join(this.transcriptsDir, `${this.id}.sentences.jsonl`);
 
         // Streaming
         this.streamSocket = null;
         this.hasSeenParticipants = false;
+
+        // Upload server (for offscreen recordings)
+        this.uploadServer = null;
+        this.uploadPort = 0;
     }
 
     /**
@@ -97,21 +102,22 @@ class Bot {
     async launchBrowser() {
         console.log(`[${this.id}] 🌐 Launching browser...`);
 
+        // Upload server not needed for video-only tab capture
+
         const headlessEnv = process.env.BOT_HEADLESS || process.env.HEADLESS || '';
         const headlessMode = headlessEnv === '1' || /^true$/i.test(headlessEnv);
-        const extPath = path.join(__dirname, '../chrome-tab-capture');
         this.browser = await puppeteer.launch({
             headless: headlessMode ? 'new' : false,
             defaultViewport: { width: 1920, height: 1080 },
             args: [
-                `--load-extension=${extPath}`,
-                `--disable-extensions-except=${extPath}`,
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--autoplay-policy=no-user-gesture-required',
                 '--use-fake-ui-for-media-stream',
                 '--use-fake-device-for-media-stream',
                 '--enable-features=WebCodecs',
+                '--enable-audio-output',
+                '--no-mute-audio',
                 '--enable-usermedia-screen-capturing',
                 '--allow-http-screen-capture',
                 '--auto-select-desktop-capture-source=Meet',
@@ -195,6 +201,10 @@ class Bot {
         
         console.log(`[${this.id}] ✅ Browser ready`);
     }
+
+    async startUploadServer() { /* no-op: removed */ }
+
+    async stopUploadServer() { /* no-op: removed */ }
 
     async startKeepAlive() {
         try {
@@ -738,22 +748,158 @@ class Bot {
      * Start full tab recording (UI + audio) to video folder
      */
     async startRecording() {
-        console.log(`[${this.id}] 🎥+🎙️ Starting tab video + remote audio capture...`);
+        console.log(`[${this.id}] 🎥 Starting video-only recording...`);
         try {
             await this.page.waitForTimeout(1200);
             await this.capture.startTabCapture(this.outputFile, {
                 width: 1280,
                 height: 720,
                 fps: 25,
-                videoBitsPerSecond: 2500000,
-                audioBitsPerSecond: 128000
+                videoBitsPerSecond: 2500000
             });
-            await this.capture.startRemoteAudioCapture(this.audioFile, { audioBitsPerSecond: 128000 });
+            // ---- Start separate audio capture ----
+            await this.startAudioRecording();
             this.isCapturing = true;
-            console.log(`[${this.id}] ✅ Video at ${this.outputFile}, audio at ${this.audioFile}`);
+            console.log(`[${this.id}] ✅ Recording started`);
         } catch (e) {
             console.error(`[${this.id}] ❌ Failed to start recording:`, e.message);
             this.isCapturing = false;
+        }
+    }
+
+    /**
+     * Spawn ffmpeg to record system/virtual-cable audio into WAV file
+     */
+    async startAudioRecording() {
+        try {
+            let device = process.env.AUDIO_DEVICE;
+
+            // Auto-detect VB cable friendly name on Windows if not provided
+            if (process.platform === 'win32' && !device) {
+                try {
+                    const probe = spawnSync('ffmpeg', ['-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], { encoding: 'utf8' });
+                    const lines = ((probe.stdout || '') + (probe.stderr || '')).split(/\r?\n/);
+                    const audioLinesStart = lines.findIndex(l => /DirectShow audio devices/i.test(l));
+                    if (audioLinesStart !== -1) {
+                        for (let i = audioLinesStart + 1; i < lines.length; i++) {
+                            const raw = lines[i] || '';
+                            const line = raw.trim();
+                            if (/DirectShow video devices/i.test(line)) break; // end of audio section
+                            if (!line.startsWith('"')) continue; // skip Alternative name lines
+                            if (/VB-Audio|CABLE Output/i.test(line)) {
+                                device = line.replace(/^"|"$/g, '');
+                                break;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`[${this.id}] ⚠️ Device auto-detect failed: ${e.message}`);
+                }
+            }
+
+            // If Windows and still no concrete device, fallback to page-side audio capture
+            if (process.platform === 'win32' && (!device || /^default$/i.test(device))) {
+                console.warn(`[${this.id}] ℹ️ No DirectShow VB device found; using page-side remote audio capture.`);
+                this.audioViaPage = true;
+                this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
+                await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
+                return;
+            }
+
+            const rate = process.env.AUDIO_RATE || '16000';
+            const args = [];
+
+            if (process.platform === 'win32') {
+                args.push('-y', '-f', 'dshow', '-i', `audio=${device}`);
+            } else if (process.platform === 'linux') {
+                // Assume Pulse/ALSA loopback present as env AUDIO_DEVICE else default
+                args.push('-y', '-f', 'alsa', '-i', device);
+            } else if (process.platform === 'darwin') {
+                args.push('-y', '-f', 'avfoundation', '-i', `:${device}`);
+            } else {
+                console.warn(`[${this.id}] ⚠️ Unsupported platform for audio recording`);
+                return;
+            }
+
+            args.push('-ac', '1', '-ar', rate, '-f', 'wav', this.audioFile);
+
+            console.log(`[${this.id}] 🔊 Starting audio capture (${device}) -> ${this.audioFile}`);
+            const startedAt = Date.now();
+            this.audioProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+            // Monitor stderr for immediate failure detection
+            let stderrBuffer = '';
+            let fallbackTriggered = false;
+            const stderrHandler = async (chunk) => {
+                const text = chunk.toString();
+                stderrBuffer += text;
+                // Also output to console for visibility
+                process.stderr.write(text);
+                // Check for device not found errors immediately
+                if (/Could not find audio|Error opening input|I\/O error/i.test(stderrBuffer) && !this.audioViaPage && !fallbackTriggered) {
+                    fallbackTriggered = true;
+                    console.warn(`[${this.id}] ⚠️ FFmpeg device error detected, switching to page-side audio...`);
+                    try {
+                        this.audioViaPage = true;
+                        this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
+                        this.audioProcess.stderr.removeListener('data', stderrHandler);
+                        this.audioProcess.kill('SIGTERM'); // stop failed FFmpeg
+                        await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
+                        console.log(`[${this.id}] ✅ Successfully switched to page-side audio capture (recording remote participants only)`);
+                    } catch (e) {
+                        console.error(`[${this.id}] ❌ Fallback audio start failed: ${e.message}`);
+                        fallbackTriggered = false; // allow retry
+                    }
+                }
+            };
+            this.audioProcess.stderr.on('data', stderrHandler);
+            // Pipe stdout to console
+            this.audioProcess.stdout.pipe(process.stdout);
+
+            this.audioProcess.on('exit', (code, sig) => {
+                console.log(`[${this.id}] 🔊 Audio recorder exited (code=${code}, sig=${sig})`);
+                // Fast failure -> fallback to page-side capture automatically if not already handled
+                const ranMs = Date.now() - startedAt;
+                if (process.platform === 'win32' && code !== 0 && ranMs < 4000 && !this.audioViaPage) {
+                    (async () => {
+                        try {
+                            console.warn(`[${this.id}] ⚠️ FFmpeg audio device failed; switching to page-side remote audio.`);
+                            this.audioViaPage = true;
+                            this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
+                            await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
+                        } catch (e) {
+                            console.error(`[${this.id}] ❌ Fallback audio start failed: ${e.message}`);
+                        }
+                    })();
+                }
+            });
+        } catch (e) {
+            console.error(`[${this.id}] ❌ Failed to start audio recording:`, e.message);
+            try {
+                console.warn(`[${this.id}] ℹ️ Falling back to page-side remote audio capture.`);
+                this.audioViaPage = true;
+                this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
+                await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
+            } catch {}
+        }
+    }
+
+    /** Stop ffmpeg audio capture */
+    async stopAudioRecording() {
+        if (this.audioViaPage) {
+            await this.capture.stopAudioOnlyCapture();
+            this.audioViaPage = false;
+            return;
+        }
+        if (this.audioProcess && !this.audioProcess.killed) {
+            console.log(`[${this.id}] ⏹️ Stopping audio capture...`);
+            try {
+                this.audioProcess.kill('SIGINT');
+            } catch {}
+            await new Promise((resolve) => {
+                this.audioProcess.once('exit', () => resolve());
+                setTimeout(resolve, 3000); // fallback
+            });
         }
     }
 
@@ -1041,124 +1187,48 @@ class Bot {
         if (this.isLeaving) return;
         this.isLeaving = true;
 
-        console.log(`[${this.id}] 🧹 Leaving meeting...`);
+		console.log(`[${this.id}] 📴 Leaving meeting...`);
+		try { if (this.isCapturing) await this.stopRecording(); } catch {}
+		try { if (this.participantCheckInterval) clearInterval(this.participantCheckInterval); } catch {}
+		this.participantCheckInterval = null;
+		try { await this.stopKeepAlive(); } catch {}
+		try { await this.page?.close?.(); } catch {}
+		try { await this.browser?.close?.(); } catch {}
+		try { if (typeof this.onLeave === 'function') this.onLeave(); } catch {}
+		this.isLeaving = false;
+	}
 
-        // Stop monitoring
-        if (this.participantCheckInterval) {
-            clearInterval(this.participantCheckInterval);
-        }
+	/**
+	 * Bot status for API
+	 */
+	getStats() {
+		return {
+			isCapturing: this.isCapturing,
+			videoFile: this.outputFile,
+			audioFile: this.audioViaPage ? (this.audioFallbackFile || null) : this.audioFile
+		};
+	}
 
-        // Stop recording and save
-        if (this.isCapturing) {
-            await this.stopRecording();
-        }
-
-        // Stop keep-alive
-        await this.stopKeepAlive();
-
-        // Close browser
-        if (this.browser) {
-            await this.browser.close();
-        }
-
-        // Remove PID file
-        try { fs.removeSync(this.browserPidFile); } catch {}
-
-        console.log(`[${this.id}] ✅ Bot finished`);
-
-        // Trigger callback
-        if (this.onLeave) {
-            this.onLeave();
-        }
-        // Reset dedupe cache
-        try { this._lastSentenceKeyBySpeaker.clear(); } catch {}
-    }
-
-    /**
-     * Stop recording and save file
-     */
-    async stopRecording() {
-        const { execFile } = require('child_process');
-        let ffmpeg;
-        try { ffmpeg = require('ffmpeg-static'); } catch {}
-
-        try {
-            if (this.isCapturing) {
-                await this.capture.stopTabCapture();
-                await this.capture.stopRemoteAudioCapture();
-            }
-        } catch {}
-
-        // Mux if ffmpeg available and files exist
-        try {
-            if (ffmpeg && await fs.pathExists(this.outputFile) && await fs.pathExists(this.audioFile)) {
-                await new Promise((res, rej) => {
-                    execFile(ffmpeg, ['-y','-i', this.outputFile, '-i', this.audioFile, '-c:v','copy','-c:a','copy', this.finalFile], (err)=> err?rej(err):res());
-                });
-                console.log(`[${this.id}] 🎬 Muxed A+V -> ${this.finalFile}`);
-            } else {
-                console.warn(`[${this.id}] ⚠️ ffmpeg not available or capture files missing; skipping mux.`);
-            }
-        } catch (e) {
-            console.warn(`[${this.id}] ⚠️ ffmpeg mux error: ${e.message}`);
-        }
-        this.isCapturing = false;
-        return;
-    }
-
-    /**
-     * Get bot status
-     */
-    getStats() {
-        return {
-            botId: this.id,
-            isRecording: this.isCapturing,
-            outputFile: this.finalFile,
-            rawAudioFile: null,
-            rawVideoFile: null,
-            rawMetaFile: null,
-            hasSeenParticipants: this.hasSeenParticipants
-        };
-    }
-
-    /**
-     * Diagnostics: return detailed participants and track info from page context
-     */
-    async getParticipantsDiagnostics() {
-        try {
-            const data = await this.page.evaluate(() => {
-                const result = { inCall: false, uiCount: null, remoteParticipants: [], meetingTracks: { total: 0, remote: 0, local: 0 } };
-                result.inCall = !!document.querySelector('button[aria-label*="Leave call"], button[aria-label*="End call"]');
-                try {
-                    const btns = Array.from(document.querySelectorAll('button[aria-label]'));
-                    for (const b of btns) {
-                        const label = (b.getAttribute('aria-label') || '');
-                        if (/people|participants|everyone/i.test(label)) {
-                            const m = label.match(/\((\d+)\)/);
-                            if (m && m[1]) { result.uiCount = parseInt(m[1], 10); break; }
-                        }
-                    }
-                } catch {}
-                try {
-                    const tracks = Array.isArray(window.__meetingTracks) ? window.__meetingTracks : [];
-                    result.meetingTracks.total = tracks.length;
-                    result.meetingTracks.remote = tracks.filter(t => t.type === 'remote').length;
-                    result.meetingTracks.local = tracks.filter(t => t.type === 'local').length;
-                } catch {}
-                try {
-                    if (window.__remoteParticipants instanceof Map) {
-                        window.__remoteParticipants.forEach(p => {
-                            result.remoteParticipants.push({ id: p.id, tracks: Array.from(p.tracks || []), kinds: Array.from(p.kinds || []), lastSeen: p.lastSeen });
-                        });
-                    }
-                } catch {}
-                return result;
-            });
-            return data;
-        } catch (e) {
-            return { error: e.message };
-        }
-    }
+	/**
+	 * Diagnostics for participants/tracks
+	 */
+	async getParticipantsDiagnostics() {
+		const counts = await this.page.evaluate(() => {
+			let remoteParticipants = 0;
+			try {
+				if (window.__remoteParticipants instanceof Map) {
+					remoteParticipants = window.__remoteParticipants.size;
+				}
+			} catch {}
+			let liveTracks = 0;
+			try {
+				liveTracks = (window.__meetingTracks || []).filter(t => t.track && t.track.readyState === 'live').length;
+			} catch {}
+			return { remoteParticipants, liveTracks };
+		});
+		const total = await this.getParticipantCount().catch(() => null);
+		return { ...counts, totalIncludingBot: total };
+	}
 }
 
 module.exports = { Bot };
