@@ -3,44 +3,58 @@
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<title>Meet Bot - Live Transcription</title>
+	<title>Google Meet Bot - Recording & Transcript</title>
 	<style>
-		body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; color: #111; background: #fafafa; }
+		body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; color: #111; background: #f3f4f6; }
 		header { background: #111827; color: #fff; padding: 16px 20px; }
 		header h1 { margin: 0; font-size: 18px; }
 		main { max-width: 960px; margin: 24px auto; padding: 0 16px; }
 		.card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
-		.row { display: flex; gap: 8px; align-items: center; }
-		input[type=text] { flex: 1; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
+		.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+		input[type=text] { flex: 1; min-width: 260px; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
 		button { padding: 10px 14px; background: #2563eb; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }
 		button:disabled { opacity: 0.6; cursor: not-allowed; }
 		.small { font-size: 12px; color: #6b7280; }
 		#status { margin-top: 8px; }
-		#transcripts { font-size: 14px; line-height: 1.5; }
-		.utt { padding: 6px 8px; border-bottom: 1px solid #f3f4f6; }
-		.utt.pending { opacity: 0.7; font-style: italic; }
-		.speaker { font-weight: 600; color: #111827; margin-right: 6px; }
-		.badge { display: inline-block; font-size: 12px; padding: 3px 8px; border-radius: 999px; background: #eef2ff; color: #3730a3; }
+		.badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 3px 8px; border-radius: 999px; background: #eef2ff; color: #3730a3; margin-top: 8px; margin-right: 6px; }
+		.badge-label { font-weight: 600; text-transform: uppercase; }
+		#audioRow { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+		audio { width: 100%; max-width: 480px; }
+		audio.muted { opacity: 0.6; }
+		#transcriptList { font-size: 14px; line-height: 1.5; }
+		.utt { padding: 10px 8px; border-bottom: 1px solid #f3f4f6; }
+		.utt-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap; }
+		.speaker { font-weight: 600; color: #111827; }
+		.time-btn { font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid #d1d5db; background: #f9fafb; color: #111827; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
+		.time-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+		.time-btn span { font-size: 10px; }
+		.utt-text { color: #111827; }
+		.hidden { display: none; }
 	</style>
 </head>
 <body>
-	<header><h1>Google Meet Bot - Live Audio + Captions</h1></header>
+	<header><h1>Google Meet Bot - Recording & Transcript</h1></header>
 	<main>
 		<section class="card">
 			<div class="row">
 				<input id="meetUrl" type="text" placeholder="https://meet.google.com/xxx-xxxx-xxx">
 				<button id="startBtn">Start Bot</button>
 			</div>
-			<div id="status" class="small">Idle</div>
-			<span id="botId" class="badge" style="display:none;"></span>
+			<div id="status" class="small">Enter a Google Meet URL and click Start Bot to begin recording.</div>
+			<div id="badges"></div>
 		</section>
-		<section class="card">
-			<div class="small">Live transcript</div>
-			<div id="transcripts"></div>
+		<section id="recordingCard" class="card hidden">
+			<div class="small">Recording</div>
+			<div id="audioRow">
+				<audio id="audio" controls class="muted"></audio>
+				<span id="audioHint" class="small">Recording will appear here once the meeting finishes.</span>
+			</div>
+		</section>
+		<section id="transcriptCard" class="card hidden">
+			<div class="small">Transcript</div>
+			<div id="transcriptList"></div>
 		</section>
 	</main>
 	<script src="./main.js"></script>
 </body>
 </html>
-
-

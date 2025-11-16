@@ -3,8 +3,8 @@ const { v4: uuidv4 } = require('uuid');
 const { Bot } = require('./bot');
 const path = require('path');
 const fs = require('fs-extra');
-const { WebSocketServer } = require('ws');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
+const { spawn } = require('child_process');
 
 const app = express();
 app.use(express.json());
@@ -14,15 +14,15 @@ app.use(express.static(path.join(__dirname, '../public')));
 const PORT = process.env.PORT || 3000;
 const RUNTIME_DIR = path.join(__dirname, '../runtime/bots');
 fs.ensureDirSync(RUNTIME_DIR);
-const TRANSCRIPTS_DIR = path.join(__dirname, '../runtime/transcripts');
-const AUDIO_DIR = path.join(__dirname, '../runtime/audio');
-fs.ensureDirSync(TRANSCRIPTS_DIR);
-fs.ensureDirSync(AUDIO_DIR);
+const RUNTIME_ROOT = path.join(__dirname, '../runtime');
+fs.ensureDirSync(RUNTIME_ROOT);
 
+// Maximum lifetime for a single bot (minutes). After this TTL the bot is
+// force-stopped even if still in a meeting or recording.
+const BOT_MAX_LIFETIME_MINUTES = Number(process.env.BOT_MAX_LIFETIME_MINUTES || 90);
+const BOT_MAX_LIFETIME_MS = BOT_MAX_LIFETIME_MINUTES * 60 * 1000;
 // In-memory storage for active bots
 const activeBots = new Map();
-const transcripts = new Map(); // botId -> { segments: [], partial: '' }
-const monitors = new Map();    // botId -> Set<SSE response>
 
 // Kill leftover Chrome processes from previous crash/restart
 async function cleanupLeftoverBrowsers() {
@@ -44,35 +44,6 @@ async function cleanupLeftoverBrowsers() {
             try { await fs.remove(full); } catch {}
         }
     } catch {}
-}
-
-function getTranscriptState(botId) {
-    if (!transcripts.has(botId)) transcripts.set(botId, { segments: [], partial: '', updatedAt: Date.now() });
-    return transcripts.get(botId);
-}
-
-function appendTranscript(botId, segment) {
-    const state = getTranscriptState(botId);
-    state.segments.push(segment);
-    state.updatedAt = Date.now();
-    // Persist JSONL line and plain text
-    const jsonlPath = path.join(TRANSCRIPTS_DIR, `${botId}.jsonl`);
-    const txtPath = path.join(TRANSCRIPTS_DIR, `${botId}.txt`);
-    try {
-        fs.appendFileSync(jsonlPath, JSON.stringify(segment) + '\n');
-        if (segment.text) fs.appendFileSync(txtPath, segment.text + '\n');
-    } catch {}
-    // Fan-out to SSE monitors
-    broadcastMonitor(botId, 'caption', segment);
-}
-
-function broadcastMonitor(botId, event, data) {
-    const subs = monitors.get(botId);
-    if (!subs || subs.size === 0) return;
-    const payload = `event: ${event}\n` + `data: ${JSON.stringify({ botId, ...data })}\n\n`;
-    for (const res of subs) {
-        try { res.write(payload); } catch {}
-    }
 }
 
 /**
@@ -133,17 +104,41 @@ app.post('/v1/bots', async (req, res) => {
         console.log(`🤖 Creating bot ${botId} for: ${meeting_url}`);
 
         // Create bot cleanup callback
-        const onLeaveCallback = () => {
+        const onLeaveCallback = async () => {
             console.log(`🧹 Bot ${botId} finished`);
             const botData = activeBots.get(botId);
             if (botData) {
                 botData.status = 'completed';
                 botData.endTime = new Date().toISOString();
+                if (botData.ttlTimer) {
+                    clearTimeout(botData.ttlTimer);
+                    botData.ttlTimer = null;
+                }
             }
+
+            // If a recording file exists, extract audio to runtime/<botId>/audio
+            try {
+                const botInstance = botData?.bot;
+                if (botInstance && typeof botInstance.getStats === 'function') {
+                    const stats = botInstance.getStats();
+                    const recordingFile = stats.recordingFile || stats.recordingPath;
+                    if (recordingFile) {
+                        await extractAudioForBot(botId, recordingFile);
+                    }
+                }
+            } catch (e) {
+                console.error(`❌ Error extracting audio for bot ${botId}:`, e && e.message ? e.message : e);
+            }
+
             // Remove bot instance to free memory
             if (activeBots.has(botId)) {
                 activeBots.delete(botId);
                 console.log(`🗑️  Bot ${botId} removed from active list`);
+            }
+
+            // If no active bots remain, just log; keep HTTP server running for future requests
+            if (activeBots.size === 0) {
+                console.log('📴 No active bots remaining – HTTP server remains running');
             }
         };
 
@@ -158,10 +153,27 @@ app.post('/v1/bots', async (req, res) => {
             botName: bot_name,
             status: 'starting',
             createdAt: new Date().toISOString(),
-            outputFile: `${botId}.webm`
+            outputFile: `${botId}.webm`,
+            ttlTimer: null,
         };
         
         activeBots.set(botId, botData);
+
+        // Per-bot hard TTL: force stop after BOT_MAX_LIFETIME_MS even if
+        // recording is still in progress. This prevents orphaned bots.
+        botData.ttlTimer = setTimeout(async () => {
+            try {
+                const current = activeBots.get(botId);
+                if (!current) return;
+                console.log(`⏱️ Bot ${botId} reached TTL of ${BOT_MAX_LIFETIME_MINUTES} minutes, forcing shutdown...`);
+                if (current.bot && typeof current.bot.leaveMeet === 'function') {
+                    await current.bot.leaveMeet().catch(() => {});
+                }
+                activeBots.delete(botId);
+            } catch (e) {
+                console.error(`❌ Error during TTL shutdown for bot ${botId}:`, e);
+            }
+        }, BOT_MAX_LIFETIME_MS);
 
         // Start bot (async, don't wait)
         bot.joinMeet(meeting_url)
@@ -169,10 +181,17 @@ app.post('/v1/bots', async (req, res) => {
                 console.log(`✅ Bot ${botId} started successfully`);
                 botData.status = 'recording';
             })
-            .catch(error => {
+            .catch(async (error) => {
                 console.error(`❌ Bot ${botId} failed:`, error.message);
                 botData.status = 'failed';
                 botData.error = error.message;
+
+                // Ensure we don't leave any Chrome/Playwright processes running
+                try {
+                    if (bot && typeof bot.leaveMeet === 'function') {
+                        await bot.leaveMeet().catch(() => {});
+                    }
+                } catch {}
             });
 
         // Return immediate response
@@ -283,6 +302,11 @@ app.delete('/v1/bots/:botId', async (req, res) => {
     try {
         console.log(`🛑 Stopping bot ${botId}...`);
 
+        if (botData.ttlTimer) {
+            clearTimeout(botData.ttlTimer);
+            botData.ttlTimer = null;
+        }
+
         if (botData.bot && botData.status === 'recording') {
             await botData.bot.leaveMeet();
         }
@@ -312,30 +336,45 @@ app.delete('/v1/bots/:botId', async (req, res) => {
 app.get('/v1/recordings', async (req, res) => {
     try {
         const recordings = [];
-        
-        // Get all .webm files in current directory
-        const files = await fs.readdir('.');
-        const webmFiles = files.filter(file => file.endsWith('.webm'));
-        
-        for (const file of webmFiles) {
-            try {
-                const stats = await fs.stat(file);
-                const botId = file.replace('.webm', '');
-                const botData = activeBots.get(botId);
-                
-                recordings.push({
-                    recording_id: botId,
-                    filename: file,
-                    size: stats.size,
-                    size_mb: (stats.size / 1024 / 1024).toFixed(2),
-                    created_at: stats.birthtime.toISOString(),
-                    modified_at: stats.mtime.toISOString(),
-                    bot_name: botData?.botName || 'Unknown',
-                    meeting_url: botData?.meetingUrl || 'Unknown'
-                });
-            } catch (e) {
-                console.warn(`Warning: Could not get stats for ${file}`);
+        // Look for recordings saved under runtime/<botId>/video/*.webm
+        try {
+            const botDirs = await fs.readdir(RUNTIME_ROOT);
+            for (const d of botDirs) {
+                const botDir = path.join(RUNTIME_ROOT, d);
+                // Only consider directories that look like bot folders (skip 'bots' dir)
+                const stat = await fs.stat(botDir).catch(() => null);
+                if (!stat || !stat.isDirectory()) continue;
+                if (d === 'bots') continue;
+
+                const videoDir = path.join(botDir, 'video');
+                if (!(await fs.pathExists(videoDir))) continue;
+
+                const files = await fs.readdir(videoDir).catch(() => []);
+                const webmFiles = files.filter(f => f.endsWith('.webm'));
+                for (const file of webmFiles) {
+                    try {
+                        const fullPath = path.join(videoDir, file);
+                        const stats = await fs.stat(fullPath);
+                        const botId = d;
+                        const botData = activeBots.get(botId);
+
+                        recordings.push({
+                            recording_id: botId,
+                            filename: path.join('runtime', botId, 'video', file),
+                            size: stats.size,
+                            size_mb: (stats.size / 1024 / 1024).toFixed(2),
+                            created_at: stats.birthtime.toISOString(),
+                            modified_at: stats.mtime.toISOString(),
+                            bot_name: botData?.botName || 'Unknown',
+                            meeting_url: botData?.meetingUrl || 'Unknown'
+                        });
+                    } catch (e) {
+                        console.warn(`Warning: Could not get stats for ${file} in ${videoDir}`);
+                    }
+                }
             }
+        } catch (e) {
+            console.warn('Warning: could not scan runtime recordings:', e && e.message ? e.message : e);
         }
         
         // Sort by creation time (newest first)
@@ -354,26 +393,40 @@ app.get('/v1/recordings', async (req, res) => {
 });
 
 /**
- * Download recording or transcript
+ * Download recording
  */
 app.get('/v1/recordings/:recordingId', async (req, res) => {
     const { recordingId } = req.params;
     try {
-        const filename = `${recordingId}.webm`;
         const contentType = 'video/webm';
-        if (!(await fs.pathExists(filename))) {
-            return res.status(404).json({ 
-                error: 'Recording not found',
-                recording_id: recordingId,
-                filename
-            });
+
+        // Primary: look under runtime/<botId>/video/<botId>.webm
+        const candidate = path.join(RUNTIME_ROOT, recordingId, 'video', `${recordingId}.webm`);
+        if (await fs.pathExists(candidate)) {
+            const stats = await fs.stat(candidate);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Content-Length', stats.size);
+            res.setHeader('Content-Disposition', `attachment; filename="${recordingId}.webm"`);
+            const stream = fs.createReadStream(candidate);
+            return stream.pipe(res);
         }
-        const stats = await fs.stat(filename);
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Content-Length', stats.size);
-        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        const stream = fs.createReadStream(filename);
-        stream.pipe(res);
+
+        // Fallback: check root (legacy)
+        const legacy = `${recordingId}.webm`;
+        if (await fs.pathExists(legacy)) {
+            const stats = await fs.stat(legacy);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Content-Length', stats.size);
+            res.setHeader('Content-Disposition', `attachment; filename="${recordingId}.webm"`);
+            const stream = fs.createReadStream(legacy);
+            return stream.pipe(res);
+        }
+
+        return res.status(404).json({ 
+            error: 'Recording not found',
+            recording_id: recordingId,
+            attempted_paths: [candidate, legacy]
+        });
     } catch (error) {
         console.error(`❌ Error downloading ${req.params.recordingId}:`, error);
         res.status(500).json({ error: error.message });
@@ -381,64 +434,31 @@ app.get('/v1/recordings/:recordingId', async (req, res) => {
 });
 
 /**
- * Get combined transcript for a bot (captions + ASR if available)
+ * Get live captions for a bot
  */
 app.get('/v1/transcripts/:botId', async (req, res) => {
     const { botId } = req.params;
     try {
-        const state = getTranscriptState(botId);
-        const jsonlPath = path.join(TRANSCRIPTS_DIR, `${botId}.jsonl`);
-        let fileSegments = [];
-        if (await fs.pathExists(jsonlPath)) {
+        const botRootDir = path.join(RUNTIME_ROOT, botId);
+        const captionsPath = path.join(botRootDir, 'transcripts', 'captions.json');
+
+        let captions = null;
+
+        if (await fs.pathExists(captionsPath)) {
             try {
-                const lines = (await fs.readFile(jsonlPath, 'utf8')).split(/\r?\n/).filter(Boolean);
-                fileSegments = lines.map(l => JSON.parse(l));
+                const raw = await fs.readFile(captionsPath, 'utf8');
+                captions = JSON.parse(raw);
             } catch {}
         }
-        // Merge in-memory (latest) with file-backed history
-        const combined = fileSegments.concat(state.segments.slice(fileSegments.length));
+
         res.json({
             bot_id: botId,
-            segments: combined,
-            partial: state.partial || '',
-            updated_at: new Date(state.updatedAt || Date.now()).toISOString()
+            captions,
+            updated_at: new Date().toISOString()
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
-});
-
-/**
- * Real-time monitoring via Server-Sent Events (SSE)
- * Streams caption events and audio-level metrics as they arrive.
- */
-app.get('/v1/stream/:botId', (req, res) => {
-    const { botId } = req.params;
-    // Setup SSE headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders && res.flushHeaders();
-
-    // Register subscriber
-    if (!monitors.has(botId)) monitors.set(botId, new Set());
-    const set = monitors.get(botId);
-    set.add(res);
-
-    // Send a hello and latest partial
-    const state = getTranscriptState(botId);
-    try { res.write(`event: hello\n` + `data: ${JSON.stringify({ botId, partial: state.partial || '', segments: state.segments.length })}\n\n`); } catch {}
-
-    // Heartbeat to keep connection alive
-    const iv = setInterval(() => {
-        try { res.write(`event: ping\n` + `data: ${Date.now()}\n\n`); } catch {}
-    }, 15000);
-
-    req.on('close', () => {
-        clearInterval(iv);
-        const s = monitors.get(botId);
-        if (s) s.delete(res);
-    });
 });
 
 /**
@@ -450,10 +470,10 @@ app.get('/v1/info', (req, res) => {
         version: '1.0.0',
         features: {
             webrtc_recording: true,
-            webhooks: false,
-            ws_audio_streaming: true,
-            server_side_asr: false,
-            sse_monitoring: true
+                webhooks: false,
+                ws_audio_streaming: false,
+                server_side_asr: false,
+                sse_monitoring: false
         },
         environment: {
             node_version: process.version,
@@ -466,11 +486,51 @@ app.get('/v1/info', (req, res) => {
             'DELETE /v1/bots/:id': 'Stop bot',
             'GET /v1/recordings': 'List recordings',
             'GET /v1/recordings/:id': 'Download recording',
-            'GET /v1/transcripts/:id': 'Get combined captions transcript for a bot',
-            'GET /v1/bots/:id/participants': 'Diagnostics for participant counting',
-            'GET /v1/stream/:id': 'SSE real-time captions and audio level'
+            'GET /v1/transcripts/:id': 'Get live captions for a bot',
+            'GET /v1/bots/:id/participants': 'Diagnostics for participant counting'
         }
     });
+});
+
+/**
+ * Download extracted audio (WAV) for a bot
+ */
+app.head('/v1/bots/:botId/audio', async (req, res) => {
+    const { botId } = req.params;
+    try {
+        const audioPath = path.join(RUNTIME_ROOT, botId, 'audio', `${botId}.wav`);
+        if (!(await fs.pathExists(audioPath))) {
+            return res.status(404).end();
+        }
+        const stats = await fs.stat(audioPath);
+        res.setHeader('Content-Type', 'audio/wav');
+        res.setHeader('Content-Length', stats.size);
+        res.status(200).end();
+    } catch (error) {
+        res.status(500).end();
+    }
+});
+
+app.get('/v1/bots/:botId/audio', async (req, res) => {
+    const { botId } = req.params;
+    try {
+        const audioPath = path.join(RUNTIME_ROOT, botId, 'audio', `${botId}.wav`);
+        if (!(await fs.pathExists(audioPath))) {
+            return res.status(404).json({
+                error: 'Audio not found',
+                bot_id: botId
+            });
+        }
+        const stats = await fs.stat(audioPath);
+        res.setHeader('Content-Type', 'audio/wav');
+        res.setHeader('Content-Length', stats.size);
+        res.setHeader('Content-Disposition', `attachment; filename="${botId}.wav"`);
+        const stream = fs.createReadStream(audioPath);
+        stream.pipe(res);
+    } catch (error) {
+        console.error(`❌ Error streaming audio for bot ${botId}:`, error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Error handling middleware
@@ -499,150 +559,31 @@ app.use((req, res) => {
     });
 });
 
-// Start server
-const server = app.listen(PORT, () => {
-    console.log(`🚀 Google Meet Recording Bot API`);
-    console.log(`📡 Server running on http://localhost:${PORT}`);
-    
-    console.log(``);
-    console.log(`📖 API Endpoints:`);
-    console.log(`   Health Check: http://localhost:${PORT}/health`);
-    console.log(`   API Info:     http://localhost:${PORT}/v1/info`);
-    console.log(``);
-    console.log(`🤖 Test Bot Creation (PowerShell):`);
-    console.log(`   See examples/test.py or use test-api.json file`);
+// Start server (only when run directly). This allows tests to require the app
+// without starting a listener and prevents EADDRINUSE during automated tests.
+let server = null;
+if (require.main === module) {
+    server = app.listen(PORT, () => {
+        console.log(`🚀 Google Meet Recording Bot API`);
+        console.log(`📡 Server running on http://localhost:${PORT}`);
+        
+        console.log(``);
+        console.log(`📖 API Endpoints:`);
+        console.log(`   Health Check: http://localhost:${PORT}/health`);
+        console.log(`   API Info:     http://localhost:${PORT}/v1/info`);
+        console.log(``);
+        console.log(`🤖 Test Bot Creation (PowerShell):`);
+        console.log(`   See examples/test.py or use test-api.json file`);
 
-    // On startup, attempt to clean up any leftover Chrome processes
-    cleanupLeftoverBrowsers()
-        .then(() => console.log('🧹 Startup cleanup of leftover Chrome processes completed'))
-        .catch(() => console.warn('⚠️ Startup cleanup encountered issues'));
-});
-
-// Attach WebSocket server for audio/captions streaming
-const wss = new WebSocketServer({ server, path: '/ws/stream' });
-wss.on('connection', async (ws) => {
-    let botId = null;
-    let audioStream = null; // Write raw incoming audio if desired
-
-    ws.on('message', async (data) => {
-        try {
-            const msg = JSON.parse(data.toString());
-            if (msg.type === 'hello') {
-                botId = msg.botId || `ws_${Date.now()}`;
-                if (!audioStream) {
-                    try {
-                        const fpath = path.join(AUDIO_DIR, `${botId}.f32le`);
-                        audioStream = fs.createWriteStream(fpath, { flags: 'a' });
-                    } catch {}
-                }
-                // Initialize transcript state
-                getTranscriptState(botId);
-                return;
-            }
-
-            if (!botId) return; // ignore until hello
-
-            if (msg.type === 'audio' && msg.encoding === 'f32le') {
-                const chunk = Buffer.from(msg.chunk, 'base64');
-                // Optionally store original raw audio
-                try { audioStream?.write(chunk); } catch {}
-                // No audio forwarding to frontend (UI is captions-only)
-                return;
-            }
-
-            if (msg.type === 'caption') {
-                appendTranscript(botId, { type: 'caption', text: msg.text, speaker: msg.speaker, lang: msg.lang, ts: msg.ts || Date.now() });
-                // Forward final caption to clients and SSE
-                const payload = { type: 'caption_final', text: msg.text, speaker: msg.speaker, ts: msg.ts || Date.now() };
-                broadcastMonitor(botId, 'caption_final', payload);
-                broadcastClient(botId, { botId, ...payload });
-                return;
-            }
-
-            if (msg.type === 'caption_update') {
-                // Pending replacement from bot
-                const payload = {
-                    type: 'caption_update',
-                    speaker: msg.speaker || '',
-                    utteranceId: msg.utteranceId || '',
-                    text: msg.text || '',
-                    prevText: msg.prevText || '',
-                    ts: msg.ts || Date.now()
-                };
-                broadcastMonitor(botId, 'caption_update', payload);
-                broadcastClient(botId, { botId, ...payload });
-                return;
-            }
-
-            if (msg.type === 'caption_final') {
-                const payload = {
-                    type: 'caption_final',
-                    speaker: msg.speaker || '',
-                    utteranceId: msg.utteranceId || '',
-                    text: msg.text || '',
-                    ts: msg.ts || Date.now()
-                };
-                // Persist final caption as transcript segment
-                appendTranscript(botId, { type: 'caption', text: payload.text, speaker: payload.speaker, ts: payload.ts });
-                broadcastMonitor(botId, 'caption_final', payload);
-                broadcastClient(botId, { botId, ...payload });
-                return;
-            }
-        } catch (e) {
-            // ignore bad messages
-        }
+        // On startup, attempt to clean up any leftover Chrome processes
+        cleanupLeftoverBrowsers()
+            .then(() => console.log('🧹 Startup cleanup of leftover Chrome processes completed'))
+            .catch(() => console.warn('⚠️ Startup cleanup encountered issues'));
     });
-
-    ws.on('close', () => {
-        try { audioStream?.close(); } catch {}
-    });
-});
-
-// Frontend clients (browsers) subscribe here to get audio + caption updates
-const clientRooms = new Map(); // botId -> Set<ws>
-function getRoom(botId) {
-    if (!clientRooms.has(botId)) clientRooms.set(botId, new Set());
-    return clientRooms.get(botId);
 }
-function broadcastClient(botId, messageObject) {
-    const room = clientRooms.get(botId);
-    if (!room || room.size === 0) return;
-    const data = JSON.stringify(messageObject);
-    for (const sock of room) {
-        try { sock.send(data); } catch {}
-    }
-}
-const wssClient = new WebSocketServer({ server, path: '/ws/client' });
-wssClient.on('connection', (ws, req) => {
-    // Parse botId from query string ?botId=...
-    try {
-        const url = new URL(req.url, `http://localhost:${PORT}`);
-        const botId = url.searchParams.get('botId');
-        if (!botId) {
-            try { ws.close(); } catch {}
-            return;
-        }
-        console.log(`📡 Client WS connected for bot ${botId} from ${req.socket.remoteAddress}`);
-        const room = getRoom(botId);
-        room.add(ws);
-        // Hello message
-        try { ws.send(JSON.stringify({ type: 'hello', botId, ts: Date.now() })); } catch {}
-        // Keepalive ping
-        const pingIv = setInterval(() => {
-            try { ws.ping(); } catch {}
-        }, 15000);
-        ws.on('close', () => {
-            const r = clientRooms.get(botId);
-            if (r) r.delete(ws);
-            clearInterval(pingIv);
-            console.log(`📴 Client WS disconnected for bot ${botId}`);
-        });
-    } catch {
-        try { ws.close(); } catch {}
-    }
-});
 
 // Graceful shutdown to avoid orphaned browsers/bots on restarts
+let serverClosePromise = null;
 async function gracefulShutdown(reason = 'shutdown') {
     try {
         console.log(`\n⚙️  Initiating graceful shutdown due to: ${reason}`);
@@ -658,17 +599,24 @@ async function gracefulShutdown(reason = 'shutdown') {
         }
         await Promise.allSettled(shutdownPromises);
     } catch {}
-    // Close HTTP server
+    // Close HTTP server once (if it exists)
     try {
-        await new Promise(resolve => server.close(resolve));
-        console.log('✅ HTTP server closed');
-    } catch {}
+        if (server) {
+            if (!serverClosePromise) {
+                serverClosePromise = new Promise(resolve => server.close(resolve));
+            }
+            await serverClosePromise;
+            console.log('✅ HTTP server closed');
+        }
+    } catch (e) {
+        console.warn('⚠️ Error closing HTTP server:', e && e.message ? e.message : e);
+    }
 }
 
-process.on('SIGINT', () => {
+process.once('SIGINT', () => {
     gracefulShutdown('SIGINT (Ctrl+C)').finally(() => process.exit(0));
 });
-process.on('SIGTERM', () => {
+process.once('SIGTERM', () => {
     gracefulShutdown('SIGTERM').finally(() => process.exit(0));
 });
 process.on('uncaughtException', (err) => {
@@ -681,3 +629,51 @@ process.on('unhandledRejection', (reason) => {
 });
 
 module.exports = app;
+
+/**
+ * Extract audio from a recorded WebM/MP4 file into a WAV file.
+ * Audio is saved under runtime/<botId>/audio/<botId>.wav
+ */
+async function extractAudioForBot(botId, recordingFile) {
+    try {
+        const botDir = path.join(RUNTIME_ROOT, botId);
+        const audioDir = path.join(botDir, 'audio');
+        fs.ensureDirSync(audioDir);
+
+        const audioPath = path.join(audioDir, `${botId}.wav`);
+        console.log(`🎧 Bot ${botId}: extracting audio to ${audioPath}...`);
+        await extractAudioWithFfmpeg(recordingFile, audioPath);
+        console.log(`✅ Bot ${botId}: audio saved to ${audioPath}`);
+    } catch (e) {
+        console.error(`❌ Bot ${botId}: audio extraction error`, e && e.message ? e.message : e);
+    }
+}
+
+function extractAudioWithFfmpeg(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const ffmpeg = spawn('ffmpeg', [
+            '-y',
+            '-i', inputPath,
+            '-vn',
+            '-acodec', 'pcm_s16le',
+            '-ar', '16000',
+            '-ac', '1',
+            outputPath,
+        ]);
+
+        ffmpeg.stderr.on('data', (data) => {
+            const msg = data.toString();
+            if (msg.toLowerCase().includes('error')) {
+                console.error(`ffmpeg: ${msg.trim()}`);
+            }
+        });
+
+        ffmpeg.on('close', (code) => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(`ffmpeg exited with code ${code}`));
+            }
+        });
+    });
+}

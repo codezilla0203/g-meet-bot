@@ -5,8 +5,16 @@ const path = require('path');
 const { spawn, execSync, spawnSync } = require('child_process');
 const { WebRTCCapture } = require('./modules/webrtc-capture');
 const WebSocket = require('ws');
+const crypto = require('crypto');
 
 puppeteer.use(StealthPlugin());
+
+// Google Meet lobby/admission constants (GoogleMeetBot style)
+const GOOGLE_LOBBY_MODE_HOST_TEXT = 'Waiting for the host to let you in';
+const GOOGLE_REQUEST_DENIED = 'Your request to join was denied';
+const GOOGLE_REQUEST_TIMEOUT = 'Your request to join wasn\'t answered';
+const GOOGLE_REMOVED_FROM_MEETING = 'You\'ve been removed from the meeting';
+const GOOGLE_NO_RESPONSE = 'No one responded to your request to join the call';
 
 /**
  * Google Meet Recording Bot - Final Clean Version
@@ -24,6 +32,9 @@ class Bot {
         this.botName = botName;
         this.onLeave = onLeaveCallback;
         
+        // Security ID for browser<->node communication
+        this.slightlySecretId = crypto.randomBytes(16).toString('hex');
+        
         // Core components
         this.browser = null;
         this.page = null;
@@ -34,54 +45,129 @@ class Bot {
         this.participantCheckInterval = null;
         this.keepAliveInterval = null;
         this._cdp = null;
-
-        // Dedupe memory for finalized sentences per speaker
-        this._lastSentenceKeyBySpeaker = new Map();
+        this.modalDismissInterval = null; // GoogleMeetBot style perpetual modal dismissal
+        this.pageValidityInterval = null; // Check if still on valid Meet page
+        this.speakerActivityInterval = null; // Interval for sampling active speaker names
 
         const runtimeRoot = path.join(__dirname, '../runtime');
+        this.runtimeRoot = runtimeRoot;
         this.botDir = path.join(runtimeRoot, this.id);
-        // Video-only output
+        // Video output + derived data
         this.transcriptsDir = path.join(this.botDir, 'transcripts');
         this.videoDir = path.join(this.botDir, 'video');
-        this.audioDir = path.join(this.botDir, 'audio');
+        this.speakerTimeframesFile = path.join(this.botDir, 'SpeakerTimeframes.json');
         this.botsPidDir = path.join(runtimeRoot, 'bots');
         try {
             fs.ensureDirSync(this.botsPidDir);
             fs.ensureDirSync(this.botDir);
             fs.ensureDirSync(this.transcriptsDir);
             fs.ensureDirSync(this.videoDir);
-            fs.ensureDirSync(this.audioDir);
         } catch {}
+        // Live captions (Google Meet native captions)
+        this.captions = [];
+        this.captionsIndex = 0;
+        this.captionsFile = path.join(this.transcriptsDir, 'captions.json');
         this.browserPidFile = path.join(this.botsPidDir, `${this.id}.pid`);
-        this.outputFile = path.join(this.videoDir, `${this.id}.video.webm`);
-        this.audioFile = path.join(this.audioDir, `${this.id}.audio.wav`);
-        this.audioFallbackFile = null; // used when capturing via page (webm)
-        // Fine-grained transcripts
-        this.sentencesFile = path.join(this.transcriptsDir, `${this.id}.sentences.jsonl`);
-
-        // Streaming
-        this.streamSocket = null;
         this.hasSeenParticipants = false;
 
-        // Upload server (for offscreen recordings)
-        this.uploadServer = null;
-        this.uploadPort = 0;
+        // Recording (GoogleMeetBot style - MediaRecorder based)
+        this.slightlySecretId = crypto.randomBytes(16).toString('hex'); // For secure browser<->node communication
+        this.recordingPath = path.join(this.videoDir, `${this.id}.webm`);
+        this.recordingStartedAt = 0;
+        this.recordingChunks = []; // Store recording chunks temporarily
+        this.maxRecordingDuration = parseInt(process.env.MAX_RECORDING_DURATION) || 60; // minutes
+        this.inactivityLimit = parseInt(process.env.INACTIVITY_LIMIT) || 10; // minutes
+        this.activateInactivityAfter = parseInt(process.env.ACTIVATE_INACTIVITY_AFTER) || 2; // minutes
+
+        // Speaker activity tracking (MeetsBot style)
+        this.registeredActivityTimestamps = {};
+        this.participants = [];
+        this.lastActivity = undefined;
+        this.timeAloneStarted = Infinity;
+        // Helper list of self-labels to ignore when parsing aria-label names
+        this._SELF_VIEW_LABELS = [
+            'you',
+            'your video',
+            'self view'
+        ];
+    }
+
+    // Helper: click selector if visible within timeout
+    async clickIfVisible(selector, timeout = 3000) {
+        try {
+            await this.page.waitForSelector(selector, { visible: true, timeout });
+            await this.page.click(selector).catch(() => {});
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    // Dismiss overlays like "Got it" / "Continue" and press Escape to clear dialogs
+    async dismissOverlays() {
+        try {
+            // Run in page context – Node does not have DOM APIs like querySelectorAll/offsetParent
+            await this.page.evaluate(() => {
+                try {
+                    const buttons = Array.from(document.querySelectorAll('button'));
+                    const gotItButtons = buttons.filter((btn) => {
+                        const el = btn;
+                        return el.offsetParent !== null && (el.innerText || '').includes('Got it');
+                    });
+                    if (gotItButtons.length > 0) {
+                        console.log('[Browser] ✖️ Dismissing modal');
+                        gotItButtons[0].click();
+                    }
+                } catch (err) {
+                    console.error('[Browser] Modal dismiss evaluate error:', err);
+                }
+            });
+        } catch (error) {
+            console.error('[Browser] Modal dismiss error:', error);
+        }
+    }
+
+    // Collapse preview flows where there is a two-step join (click the second "Join now" if visible)
+    async collapsePreviewIfNeeded() {
+        try {
+            const xp = "//button[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'join now')]";
+            const btns = await this.page.$x(xp).catch(() => []);
+            if (btns && btns.length > 1) {
+                try { await this.page.evaluate((n) => n.click(), btns[1]); console.log(`[${this.id}] clicked 2-step Join`); } catch {}
+            }
+        } catch {}
     }
 
     /**
      * Orchestrate full join + record flow
      */
     async joinMeet(meetUrl) {
-        // Setup streaming first so we don't miss early events
-        await this.setupStreaming();
-
         await this.launchBrowser();
+        await this.dismissInitialModals();
         await this.navigateAndJoin(meetUrl);
         await this.waitForAdmission();
-        await this.muteInCall();
-        await this.ensureTiledLayout();
+        
+        try {
+            for (let i = 0; i < 5; i++) {
+                await this.page.keyboard.press('Escape').catch(() => {});
+                await this.page.waitForTimeout(200).catch(() => {});
+            }
+        } catch {}
+        
+        // Maximize window and force Tiled layout before recording
+        try {
+            await this.page.setViewport({ width: 1920, height: 1080 });
+            await this.page.evaluate(() => {
+                window.moveTo(0, 0);
+                window.resizeTo(screen.availWidth, screen.availHeight);
+            });
+        } catch {}
 
-        // Wait for other participants before enabling captions/recording
+        // await this.hideSelfView();
+
+        // Mute mic/camera BEFORE recording starts
+        await this.muteInCall();
+
         const others = await this.waitForOtherParticipants(120000);
         if (!others) {
             console.log(`[${this.id}] ⏹️ No other participants joined within timeout; leaving.`);
@@ -90,11 +176,314 @@ class Bot {
         }
         this.hasSeenParticipants = true;
 
-        await this.enableCaptions();
-        await this.startCaptionsObserver();
+        // Enable and start collecting Google Meet live captions (best-effort, non-fatal on failure)
+        try {
+            await this.enableCaptions();
+            // await this.ensureTiledLayout(); // This is needed to ensure the tiled layout is selected
+            await this.startCaptionsCollector();
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Could not start captions collector:`, e && e.message ? e.message : e);
+        }
+
         await this.startRecording();
-        await this.hideSelfView();
         this.startParticipantMonitoring();
+
+        // await this.ensureTiledLayout();
+    }
+
+    /**
+     * Helper: check if captions region is visible.
+     */
+    async captionsRegionVisible(timeoutMs = 4000) {
+        try {
+            await this.page.waitForSelector('[role="region"][aria-label*="Captions"]', {
+                timeout: timeoutMs,
+                visible: true
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Best-effort enabling of Google Meet captions using keyboard shortcut and CC button.
+     * Based on proven Playwright implementation patterns.
+     * Fails silently if not possible; caller should treat errors as non-fatal.
+     */
+    async enableCaptions() {
+        try {
+            await this.dismissOverlays();
+            console.log(`[${this.id}] 💬 Enabling captions...`);
+            // Attempt clicking captions button via common selectors
+            const sels = [
+                'button[aria-label*="Turn on captions" i]',
+                'button[aria-label*="captions" i]',
+            ];
+            await this.page.waitForTimeout(1000);
+            let clicked = false;
+            for (const sel of sels) {
+                const btn = await this.page.$(sel);
+                if (btn) {
+                    try { await btn.click({ delay: 20 }); clicked = true; break; } catch {}
+                }
+            }
+            if(console.log(`[${this.id}] ✅ Captions toggled by button`))
+            if (!clicked) {
+                // Fallback: Try keyboard shortcut 'Shift+c'
+                try {
+                    await this.page.keyboard.press('KeyC');
+                    clicked = true;
+                } catch {}
+            }
+            if(clicked)console.log(`[${this.id}] ✅ Captions toggled`);
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Could not enable captions: ${e.message}`);
+        }
+    }
+
+
+    /**
+     * Start a MutationObserver in the browser to stream Google Meet caption updates
+     * back into Node via page.exposeFunction.
+     */
+
+    
+    async startCaptionsCollector() {
+        if (!this.page) return;
+        if (this.captionsCollectorStarted) return;
+        this.captionsCollectorStarted = true;
+
+        console.log(`[${this.id}] 📝 Starting captions collector...`);
+
+        // Expose a Node-side handler to receive caption updates from the page
+        await this.page.exposeFunction('screenAppOnCaption', async (speaker, text) => {
+            try {
+                const captionText = (text || '').trim();
+                const speakerName = (speaker || '').trim() || 'Unknown Speaker';
+
+                // Basic filtering: ignore empty/very short captions or obvious UI placeholders
+                if (!captionText || captionText.length < 2) return;
+                const lc = captionText.toLowerCase();
+                if (lc.includes('no captions') || lc.includes('captions off') || lc.includes('captions disabled')) return;
+
+                const timestampMs = Date.now();
+
+                // Ignore captions that appear before recording actually starts to avoid noisy pre/post entries
+                if (!this.recordingStartedAt || this.recordingStartedAt === 0) return;
+
+                const index = this.captionsIndex++;
+                const offsetMs = Math.max(timestampMs - this.recordingStartedAt, 0);
+                const offsetSeconds = Math.round(offsetMs / 1000);
+
+                // Deduplicate simple repeated/partial updates: if last caption has identical speaker and text, skip
+                const last = this.captions.length ? this.captions[this.captions.length - 1] : null;
+                if (last && last.speaker === speakerName && last.text === captionText) return;
+
+                // If last caption is very recent and is a prefix of this caption, replace it (prefer longer text)
+                if (last && last.speaker === speakerName && (timestampMs - last.timestampMs) < 1500) {
+                    if (captionText.startsWith(last.text) && captionText.length > last.text.length) {
+                        // extend last caption
+                        last.text = captionText;
+                        last.timestampMs = timestampMs;
+                        last.offsetSeconds = offsetSeconds;
+                        // update speaker activity too
+                        this.registerSpeakerActivity(speakerName, timestampMs);
+                        return;
+                    }
+                }
+
+                this.captions.push({
+                    index,
+                    speaker: speakerName,
+                    text: captionText,
+                    timestampMs,
+                    offsetSeconds
+                });
+
+                // Reuse the same speaker activity registration used by active-speaker sampling
+                this.registerSpeakerActivity(speakerName, timestampMs);
+            } catch (e) {
+                console.warn(`[${this.id}] ⚠️ Error handling caption event:`, e && e.message ? e.message : e);
+            }
+        });
+
+        // Do not block on caption region—attach observer immediately; log a warning if not found within 5 s
+        (async () => {
+            try {
+                await this.page.waitForSelector('[aria-live]', { timeout: 5000 });
+            } catch {
+                console.warn(`[${this.id}] ⚠️ aria-live region not visible after 5 s; observer will still attempt to attach`);
+            }
+        })().catch(()=>{});
+
+        // Inject the MutationObserver into the page to watch for caption updates (utterance-based)
+        await this.page.evaluate(() => {
+            try {
+                const send = typeof window.screenAppOnCaption === 'function'
+                    ? window.screenAppOnCaption
+                    : null;
+                if (!send) return;
+
+                const badgeSel = '.NWpY1d, .xoMHSc';
+
+                // Per-speaker buffering and replacement tracking
+                const buffers = new Map(); // speaker -> { text, timer, lastTs, utteranceId }
+
+                const endsWithPunctuation = (t) => /[.!?\u2026]\s*$/.test(String(t || ''));
+                const normalizeText = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+                const isSpeakerEcho = (speaker, text) =>
+                    normalizeText(text).toLowerCase() === normalizeText(speaker).toLowerCase();
+
+                const FINAL_IDLE_MS = 2500;   // long pause to finalize if no punctuation
+                const PUNCT_STABLE_MS = 900;  // short stabilization for punctuated sentences
+
+                const sameUtteranceHeuristic = (oldText, newText) => {
+                    const a = normalizeText(oldText);
+                    const b = normalizeText(newText);
+                    if (!a) return true;
+                    if (b.startsWith(a)) return true; // continuation
+                    // small edits/replacements treated as same utterance
+                    return Math.abs(b.length - a.length) <= 20;
+                };
+
+                const scheduleFinalize = (speaker) => {
+                    const st = buffers.get(speaker);
+                    if (!st) return;
+
+                    const text = normalizeText(st.text);
+                    const delay = endsWithPunctuation(text) ? PUNCT_STABLE_MS : FINAL_IDLE_MS;
+
+                    if (st.timer) clearTimeout(st.timer);
+                    st.timer = setTimeout(() => {
+                        const latestState = buffers.get(speaker);
+                        if (!latestState) return;
+                        const latest = normalizeText(latestState.text || '');
+                        if (!latest || isSpeakerEcho(speaker, latest)) return;
+
+                        // Emit a finalized sentence to Node
+                        send(speaker || 'Unknown Speaker', latest);
+
+                        // Start a new utterance id for next turn
+                        buffers.delete(speaker);
+                    }, delay);
+                };
+
+                const handleCaptionUpdate = (speaker, text) => {
+                    if (!speaker) speaker = '';
+                    const cleaned = normalizeText(text);
+                    if (!cleaned || cleaned.length < 2) return;
+                    if (isSpeakerEcho(speaker, cleaned)) return;
+
+                    const now = Date.now();
+                    let st = buffers.get(speaker);
+
+                    if (!st) {
+                        st = { text: '', timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
+                        buffers.set(speaker, st);
+                    }
+
+                    const prevText = st.text || '';
+
+                    // If new text looks like a new turn and previous existed without finalization, finalize previous
+                    if (prevText && !sameUtteranceHeuristic(prevText, cleaned)) {
+                        if (st.timer) clearTimeout(st.timer);
+
+                        const prevFinal = normalizeText(prevText);
+                        if (prevFinal && !isSpeakerEcho(speaker, prevFinal)) {
+                            send(speaker || 'Unknown Speaker', prevFinal);
+                        }
+
+                        // Start new utterance id
+                        st = { text: '', timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
+                        buffers.set(speaker, st);
+                    }
+
+                    st.text = cleaned;
+                    st.lastTs = now;
+
+                    scheduleFinalize(speaker);
+                };
+
+                const observeRegion = (captionRegion) => {
+                    let lastKnownSpeaker = 'Unknown Speaker';
+
+                    const handleNode = (node) => {
+                        if (!(node instanceof HTMLElement)) return;
+
+                        const speakerElem = node.querySelector(badgeSel);
+                        let speaker = speakerElem && speakerElem.textContent
+                            ? speakerElem.textContent.trim()
+                            : lastKnownSpeaker;
+
+                        if (speaker && speaker !== 'Unknown Speaker') {
+                            lastKnownSpeaker = speaker;
+                        }
+
+                        // Clone node and remove speaker label to isolate caption text
+                        const clone = node.cloneNode(true);
+                        const badge = clone.querySelector(badgeSel);
+                        if (badge && badge.parentNode) {
+                            badge.parentNode.removeChild(badge);
+                        }
+
+                        const caption = (clone.textContent || '').trim();
+                        if (caption) {
+                            handleCaptionUpdate(speaker, caption);
+                        }
+                    };
+
+                    const observer = new MutationObserver((mutations) => {
+                        for (const mutation of mutations) {
+                            const nodes = Array.from(mutation.addedNodes);
+                            if (nodes.length > 0) {
+                                nodes.forEach((n) => {
+                                    if (n instanceof HTMLElement) handleNode(n);
+                                });
+                            } else if (
+                                mutation.type === 'characterData' &&
+                                mutation.target &&
+                                mutation.target.parentElement instanceof HTMLElement
+                            ) {
+                                handleNode(mutation.target.parentElement);
+                            }
+                        }
+                    });
+
+                    observer.observe(captionRegion, {
+                        childList: true,
+                        subtree: true,
+                        characterData: true,
+                    });
+
+                    window.__captionsObserver = observer;
+                };
+
+                // Try to find caption region repeatedly (UI can mount lazily)
+                const tryStartObserver = () => {
+                    const region =
+                        document.querySelector('[role="region"][aria-label*="Captions"]') ||
+                        document.querySelector('[role="region"][aria-label*="captions" i]') ||
+                        document.querySelector('[aria-live]');
+
+                    if (region) {
+                        observeRegion(region);
+                        return true;
+                    }
+                    return false;
+                };
+
+                if (!tryStartObserver()) {
+                    const interval = setInterval(() => {
+                        if (tryStartObserver()) {
+                            clearInterval(interval);
+                        }
+                    }, 1000);
+                }
+            } catch (e) {
+                console.error('[Browser] Failed to start captions observer:', e);
+            }
+        });
     }
     /**
      * Launch browser with working configuration
@@ -106,20 +495,27 @@ class Bot {
 
         const headlessEnv = process.env.BOT_HEADLESS || process.env.HEADLESS || '';
         const headlessMode = headlessEnv === '1' || /^true$/i.test(headlessEnv);
+
+        // IMPORTANT:
+        // - Puppeteer adds `--mute-audio` by default which can result in recordings with no audio.
+        // - We explicitly ignore that default arg and add explicit audio/MediaRecorder flags,
+        //   mirroring the proven configuration from `meeting-bot` so that tab audio
+        //   (other participants) is actually present in the captured stream.
         this.browser = await puppeteer.launch({
             headless: headlessMode ? 'new' : false,
             defaultViewport: { width: 1920, height: 1080 },
+            ignoreDefaultArgs: ['--mute-audio'],
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--autoplay-policy=no-user-gesture-required',
-                '--use-fake-ui-for-media-stream',
-                '--use-fake-device-for-media-stream',
-                '--enable-features=WebCodecs',
+                '--enable-features=WebCodecs,MediaRecorder',
                 '--enable-audio-output',
                 '--no-mute-audio',
                 '--enable-usermedia-screen-capturing',
                 '--allow-http-screen-capture',
+                // Auto-accept tab capture where supported (Chrome >= 135 / matching policy)
+                '--auto-accept-this-tab-capture',
                 '--auto-select-desktop-capture-source=Meet',
                 // Prevent background throttling so recording and captions keep running without focus
                 '--disable-background-timer-throttling',
@@ -146,6 +542,24 @@ class Bot {
         });
 
         this.page = await this.browser.newPage();
+
+        // Mirror browser console logs into Node console for easier debugging of
+        // things like audio track availability and MediaRecorder behaviour.
+        // Ignore very noisy, known-safe warnings from Google Meet (TrustedScript, etc.).
+        // this.page.on('console', (msg) => {
+        //     try {
+        //         const text = msg.text() || '';
+        //         if (
+        //             text.includes("This document requires 'TrustedScript' assignment") ||
+        //             text.includes('TrustedScript') ||
+        //             text.includes("Error with Permissions-Policy header: Unrecognized feature")
+        //         ) {
+        //             return;
+        //         }
+        //         console.log(`[${this.id}][Browser ${msg.type()}] ${text}`);
+        //     } catch {}
+        // });
+
         // Keep page "visible" to the site even if the window is unfocused/minimized
         try {
             await this.page.evaluateOnNewDocument(() => {
@@ -202,10 +616,6 @@ class Bot {
         console.log(`[${this.id}] ✅ Browser ready`);
     }
 
-    async startUploadServer() { /* no-op: removed */ }
-
-    async stopUploadServer() { /* no-op: removed */ }
-
     async startKeepAlive() {
         try {
             this._cdp = await this.page.target().createCDPSession();
@@ -239,15 +649,60 @@ class Bot {
             // Navigate to meeting
             await this.page.goto(meetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
             
-            // Grant permissions
+            // Grant permissions (GoogleMeetBot style - include display-capture)
             const context = this.browser.defaultBrowserContext();
-            await context.overridePermissions(meetUrl, ['microphone', 'camera', 'notifications']);
+            await context.overridePermissions(meetUrl, [
+                'microphone', 
+                'camera', 
+                'notifications',
+            ]);
 
             // Initial pause to allow pre-join UI to render
-            await this.page.waitForTimeout(2000);
+            await this.page.waitForTimeout(3000);
 
-            // Do not mute in pre-join screen; we will mute after admission using in-call controls
-            
+            // Debug: log all button texts currently visible (Puppeteer equivalent of Playwright .allTextContents)
+            try {
+                const allButtons = await this.page.$$eval('button', els =>
+                    els
+                        .map(el => (el.innerText || el.textContent || '').trim())
+                        .filter(Boolean)
+                );
+                console.log(`[${this.id}] Visible buttons on screen:`, allButtons);
+            } catch {}
+
+            // Dismiss device permission prompt like
+            // "Continue without microphone and camera" / "Continue without mic and camera"
+            try {
+                const clicked = await this.page.evaluate(() => {
+                    const candidates = Array.from(document.querySelectorAll('button'));
+                    for (const btn of candidates) {
+                        const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                        if (!text) continue;
+                        if (
+                            text.includes('continue without microphone and camera') ||
+                            text.includes('continue without mic and camera')
+                        ) {
+                            try {
+                                btn.click();
+                                return true;
+                            } catch {
+                                // ignore individual click failures
+                            }
+                        }
+                    }
+                    return false;
+                });
+
+                if (clicked) {
+                    console.log(`[${this.id}] ✅ Clicked "Continue without microphone and camera" prompt`);
+                    await this.page.waitForTimeout(1000);
+                } else {
+                    console.log(`[${this.id}] ℹ️ No device check prompt found (expected)`);
+                }
+            } catch {
+                console.log(`[${this.id}] ℹ️ Device check prompt handling failed (non-critical)`);
+            }
+
             // Enter name and join
             await this.requestToJoin();
 
@@ -256,74 +711,6 @@ class Bot {
             throw error;
         }
     }
-
-    /**
-     * Establish optional WS streaming to the server for audio/captions
-     */
-    async setupStreaming() {
-        try {
-            const defaultPort = process.env.PORT || 3000;
-            const url = process.env.STREAM_WS_URL || `ws://localhost:${defaultPort}/ws/stream`;
-            this.streamSocket = new WebSocket(url);
-            this.streamSocket.on('open', () => {
-                try { this.streamSocket.send(JSON.stringify({ type: 'hello', botId: this.id })); } catch {}
-            });
-            this.streamSocket.on('close', () => { this.streamSocket = null; });
-            this.streamSocket.on('error', () => {});
-        } catch {}
-    }
-
-    /**
-     * Mute microphone and camera
-     */
-    /**
-     * Verify mic & camera really muted (retry loop)
-     */
-    async verifyMutedState(maxWaitMs = 8000) {
-        const start = Date.now();
-        while (Date.now() - start < maxWaitMs) {
-            const state = await this.page.evaluate(() => {
-                const result = { audioOff: false, videoOff: false };
-                // Heuristic: look for buttons that would now read "Turn on microphone" / "Turn on camera"
-                const btns = [...document.querySelectorAll('button[aria-label]')];
-                for (const b of btns) {
-                    const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                    if (label.includes('turn on microphone') || label.includes('unmute microphone')) result.audioOff = true;
-                    if (label.includes('turn on camera') || label.includes('turn on video')) result.videoOff = true;
-                }
-                // Deep check via tracks
-                try {
-                    if (Array.isArray(window.__meetingTracks)) {
-                        const locals = window.__meetingTracks.filter(t => t.type === 'local');
-                        for (const t of locals) {
-                            if (t.track.kind === 'audio' && t.track.enabled === false) result.audioOff = true;
-                            if (t.track.kind === 'video' && t.track.enabled === false) result.videoOff = true;
-                        }
-                    }
-                } catch {}
-                return result;
-            });
-            if (state.audioOff && state.videoOff) {
-                console.log(`[${this.id}] ✅ Mic & camera confirmed muted`);
-                return true;
-            }
-            // Attempt re-toggle if still on
-            if (!state.audioOff) {
-                await this.page.keyboard.down('Control');
-                await this.page.keyboard.press('KeyD');
-                await this.page.keyboard.up('Control');
-            }
-            if (!state.videoOff) {
-                await this.page.keyboard.down('Control');
-                await this.page.keyboard.press('KeyE');
-                await this.page.keyboard.up('Control');
-            }
-            await this.page.waitForTimeout(600);
-        }
-        console.warn(`[${this.id}] ⚠️ Timed out verifying muted state; proceeding anyway`);
-        return false;
-    }
-
     /**
      * Enter bot name and request to join
      */
@@ -453,18 +840,96 @@ class Bot {
     }
 
     /**
-     * Wait for organizer to admit the bot
+     * Wait for organizer to admit the bot (GoogleMeetBot enhanced)
      */
     async waitForAdmission() {
         console.log(`[${this.id}] ⏳ Waiting for admission...`);
-        await this.page.waitForSelector('button[aria-label*="Leave call"], button[aria-label*="End call"]', { timeout: 300000 }); // 5 min
-        // Mark admitted and clear any stale pre-admission tracks (waiting room artifacts)
-        try {
-            await this.page.evaluate(() => { window.__admittedSettle = true; if (typeof window.__resetMeetingState === 'function') window.__resetMeetingState(); });
-        } catch {}
-        // Give a short grace period for real remote media to flow
-        await this.page.waitForTimeout(1500);
-        console.log(`[${this.id}] ✅ Admitted to meeting & state reset`);
+        
+        const wanderingTime = 300000; // 5 minutes
+        const start = Date.now();
+        
+        while (Date.now() - start < wanderingTime) {
+            try {
+                // Check for lobby/denial states
+                const lobbyStatus = await this.page.evaluate((constants) => {
+                    const bodyText = document.body.innerText || '';
+                    
+                    if (bodyText.includes(constants.DENIED)) {
+                        return 'DENIED';
+                    }
+                    if (bodyText.includes(constants.TIMEOUT)) {
+                        return 'TIMEOUT';
+                    }
+                    if (bodyText.includes(constants.NO_RESPONSE)) {
+                        return 'NO_RESPONSE';
+                    }
+                    if (bodyText.includes(constants.WAITING)) {
+                        return 'WAITING';
+                    }
+                    
+                    // Check if admitted (Leave button present)
+                    const leaveBtn = document.querySelector('button[aria-label*="Leave call"], button[aria-label*="End call"]');
+                    if (leaveBtn) {
+                        return 'ADMITTED';
+                    }
+                    
+                    return 'UNKNOWN';
+                }, {
+                    DENIED: GOOGLE_REQUEST_DENIED,
+                    TIMEOUT: GOOGLE_REQUEST_TIMEOUT,
+                    NO_RESPONSE: GOOGLE_NO_RESPONSE,
+                    WAITING: GOOGLE_LOBBY_MODE_HOST_TEXT
+                });
+                
+                if (lobbyStatus === 'DENIED' || lobbyStatus === 'TIMEOUT' || lobbyStatus === 'NO_RESPONSE') {
+                    throw new Error(`Bot admission ${lobbyStatus}: Request was denied or timed out`);
+                }
+                
+                if (lobbyStatus === 'WAITING') {
+                    console.log(`[${this.id}] 🚪 Waiting in lobby for host to admit...`);
+                    await this.page.waitForTimeout(2000);
+                    continue;
+                }
+                
+                if (lobbyStatus === 'ADMITTED') {
+                    // Mark admitted and clear any stale pre-admission tracks
+                    try {
+                        await this.page.evaluate(() => { 
+                            window.__admittedSettle = true; 
+                            if (typeof window.__resetMeetingState === 'function') window.__resetMeetingState(); 
+                        });
+                    } catch {}
+                    // Give a short grace period for real remote media to flow
+                    await this.page.waitForTimeout(1500);
+                    console.log(`[${this.id}] ✅ Admitted to meeting & state reset`);
+
+                    // Dismiss any blocking onboarding/self-view modals (e.g. "Others may see your video differently")
+                    return;
+                }
+                
+                // Unknown state, wait and retry
+                await this.page.waitForTimeout(2000);
+            } catch (error) {
+                if (error.message.includes('admission')) {
+                    throw error;
+                }
+                // Continue waiting on transient errors
+            }
+        }
+        
+        throw new Error('Admission timeout: Bot was not admitted within 5 minutes');
+    }
+
+    /**
+     * Best-effort dismissal of blocking modals (e.g. "Got it", self-view tips)
+     * that can appear immediately after admission and block UI interactions.
+     */
+    async dismissInitialModals(maxRounds = 5) {
+        console.log(`[${this.id}] 🔔 Dismissing initial modals if present...`);
+        for (let i = 0; i < maxRounds; i++) {
+            await this.page.keyboard.press('Escape').catch(() => {});
+            await this.page.waitForTimeout(100);
+        }
     }
 
     /**
@@ -479,6 +944,7 @@ class Bot {
                 const admitted = await this.page.evaluate(() => !!document.querySelector('button[aria-label*="Leave call"], button[aria-label*="End call"]'));
                 if (!admitted) {
                     await this.page.waitForTimeout(1000);
+                    console.log(`[${this.id}] 🚪 Waiting in lobby for host to admit...`);
                     continue;
                 }
                 // Prefer presence of remote tracks (most reliable for actual media)
@@ -635,79 +1101,67 @@ class Bot {
     }
 
     /**
-     * Encourage Meet to deliver many remote video streams by switching to Tiled layout.
+     * Configure Google Meet layout at start of meeting.
+     * 
+     * Current behaviour:
+     * - Open "More options" menu
+     * - Open "Adjust view" / "Change layout" dialog if present
+     * - Select the "Sidebar" layout so the main speaker is large and others are
+     *   on the side (matches your screenshots)
      */
     async ensureTiledLayout() {
         try {
-            const moreBtnSelectors = [
-                'button[aria-label*="More options"]',
-                'button[aria-label*="More"]',
-                'button[aria-label*="Menu"]'
-            ];
-            for (const sel of moreBtnSelectors) {
-                const btn = await this.page.$(sel);
-                if (btn) { await btn.click().catch(()=>{}); await this.page.waitForTimeout(300); break; }
-            }
-            const layoutXPaths = [
-                '//div[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"change layout")]//ancestor::button',
-                '//span[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"change layout")]//ancestor::button'
-            ];
-            for (const xp of layoutXPaths) {
-                const items = await this.page.$x(xp);
-                if (items.length) { await items[0].click().catch(()=>{}); await this.page.waitForTimeout(250); break; }
-            }
-            const tiledXPaths = [
-                '//div[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"tiled")]//ancestor::button',
-                '//span[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"tiled")]//ancestor::button'
-            ];
-            for (const xp of tiledXPaths) {
-                const items = await this.page.$x(xp);
-                if (items.length) { await items[0].click().catch(()=>{}); await this.page.waitForTimeout(200); break; }
-            }
-            const slider = await this.page.$('input[type="range"], div[role="slider"]');
-            if (slider) {
-                await slider.focus();
-                for (let i = 0; i < 12; i++) {
-                    await this.page.keyboard.press('ArrowRight');
-                    await this.page.waitForTimeout(40);
-                }
-            }
-            await this.page.keyboard.press('Escape');
-        } catch {}
-    }
+            await this.dismissOverlays();
+            console.log(`[${this.id}] 🎛️ Configuring layout to Tiled...`);
 
-    /**
-     * Turn on captions after admission (varies by UI)
-     */
-    async enableCaptions() {
-        try {
-            console.log(`[${this.id}] 💬 Enabling captions...`);
-            // Attempt clicking captions button via common selectors
-            const sels = [
-                'button[aria-label*="Turn on captions" i]',
-                'button[aria-label*="captions" i]',
-                'button[aria-label*="Subtitles" i]'
-            ];
-            let clicked = false;
-            for (const sel of sels) {
-                const btn = await this.page.$(sel);
-                if (btn) {
-                    try { await btn.click({ delay: 20 }); clicked = true; break; } catch {}
-                }
-            }
-            if (!clicked) {
-                // Fallback: Try keyboard shortcut 'Shift+c'
+            // 1) Click the "More options" button in the bottom bar
+            const moreClicked = await this.page.evaluate(async () => {
                 try {
-                    await this.page.keyboard.down('Shift');
-                    await this.page.keyboard.press('KeyC');
-                    await this.page.keyboard.up('Shift');
-                    clicked = true;
-                } catch {}
+                    const btns = Array.from(document.querySelectorAll('button[aria-label]'));
+                    const cand = btns.find((b) => {
+                        const label = (b.getAttribute('aria-label') || '').toLowerCase().trim();
+                        // We only want the bottom-bar menu, NOT "More options for <name>" on participant tiles
+                        return label === 'more options';
+                    });
+                    if (!cand) return false;
+                    await cand.click().catch(()=>{});
+                    return true;
+                } catch {
+                    return false;
+                }
+            });
+
+            if (!moreClicked) {
+                console.warn(`[${this.id}] ⚠️ Unable to find "More options" button for layout configuration`);
+                return;
             }
-            await this.page.waitForTimeout(800);
-            console.log(`[${this.id}] ✅ Captions toggled`);
+
+            await this.page.waitForTimeout(600);         // give the iframe time to mount
+            try {
+                await this.page.keyboard.press('ArrowDown');
+                await this.page.keyboard.press('Space');
+            } catch {}
+
+            await this.page.waitForTimeout(600);         // give the iframe time to mount
+            let layoutSelected = false;
+            try {
+                await this.page.keyboard.press('Tab');
+                for (let i = 0; i < 2; i++) {
+                    await this.page.keyboard.press('ArrowDown');
+                }
+                await this.page.keyboard.down('Enter');
+                await this.page.keyboard.up('Enter');
+                layoutSelected = true; 
+            } catch {}
+            if (!layoutSelected) {
+                console.warn(`[${this.id}] ⚠️ Could not find "Tiled" option in Adjust view dialog`);
+            } else {
+                console.log(`[${this.id}] ✅ Tiled layout selected`);
+            }
+            // 4) Best-effort close dialog/menu
+            await this.page.keyboard.press('Escape').catch(() => {});
         } catch (e) {
-            console.warn(`[${this.id}] ⚠️ Could not enable captions: ${e.message}`);
+            console.warn(`[${this.id}] ⚠️ Failed to configure layout: ${e.message}`);
         }
     }
 
@@ -717,405 +1171,292 @@ class Bot {
     async muteInCall() {
         try {
             console.log(`[${this.id}] 🔇 Muting in-call mic and camera...`);
-            // Click explicit "Turn off" buttons if visible
-            const micSelectors = [
-                'button[aria-label="Turn off microphone"]',
-                'button[aria-label*="Turn off"][aria-label*="microphone"]',
-                'button[aria-label*="Turn off"][aria-label*="Mic"]'
-            ];
-            const camSelectors = [
-                'button[aria-label="Turn off camera"]',
-                'button[aria-label*="Turn off"][aria-label*="camera"]',
-                'button[aria-label*="Turn off"][aria-label*="video"]'
-            ];
-            for (const sel of micSelectors) {
-                const btn = await this.page.$(sel);
-                if (btn) { await btn.click().catch(()=>{}); break; }
+            await this.page.keyboard.down('Control');
+            await this.page.keyboard.press('KeyD'); // toggle mic
+            await this.page.keyboard.press('KeyE'); // toggle camera
+            await this.page.keyboard.up('Control');
+            await this.page.waitForTimeout(500);
+            const recheck = await this.page.evaluate(() => {
+                const res = { audioOff: false, videoOff: false };
+                const btns = Array.from(document.querySelectorAll('button[aria-label]'));
+                for (const b of btns) {
+                    const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                    if (label.includes('turn on microphone') || label.includes('unmute microphone')) res.audioOff = true;
+                    if (label.includes('turn on camera') || label.includes('turn on video')) res.videoOff = true;
+                }
+                return res;
+            });
+            if (recheck.audioOff && recheck.videoOff) {
+                console.log(`[${this.id}] ✅ Mic & camera muted via Keyboard shortcuts`);
             }
-            for (const sel of camSelectors) {
-                const btn = await this.page.$(sel);
-                if (btn) { await btn.click().catch(()=>{}); break; }
+            else{
+                const micSelectors = [
+                    'button[aria-label="Turn off microphone"]',
+                    'button[aria-label*="Turn off"][aria-label*="microphone"]',
+                    'button[aria-label*="Turn off"][aria-label*="Mic"]'
+                ];
+                const camSelectors = [
+                    'button[aria-label="Turn off camera"]',
+                    'button[aria-label*="Turn off"][aria-label*="camera"]',
+                    'button[aria-label*="Turn off"][aria-label*="video"]'
+                ];
+                for (const sel of micSelectors) {
+                    const btn = await this.page.$(sel);
+                    if (btn) { await btn.click().catch(()=>{}); break; }
+                }
+                for (const sel of camSelectors) {
+                    const btn = await this.page.$(sel);
+                    if (btn) { await btn.click().catch(()=>{}); break; }
+                }
             }
-
-            // Verify using labels and track state; if still on, retry via shortcuts
-            await this.verifyMutedState();
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ Could not mute in-call (non-critical): ${e.message}`);
         }
     }
 
     /**
-     * Start full tab recording (UI + audio) to video folder
+     * Start browser-based recording using MediaRecorder API (GoogleMeetBot style)
      */
     async startRecording() {
-        console.log(`[${this.id}] 🎥 Starting video-only recording...`);
-        try {
-            await this.page.waitForTimeout(1200);
-            await this.capture.startTabCapture(this.outputFile, {
-                width: 1280,
-                height: 720,
-                fps: 25,
-                videoBitsPerSecond: 2500000
-            });
-            // ---- Start separate audio capture ----
-            await this.startAudioRecording();
-            this.isCapturing = true;
-            console.log(`[${this.id}] ✅ Recording started`);
-        } catch (e) {
-            console.error(`[${this.id}] ❌ Failed to start recording:`, e.message);
-            this.isCapturing = false;
-        }
-    }
+        console.log(`[${this.id}] 🎥 Starting MediaRecorder browser recording...`);
 
-    /**
-     * Spawn ffmpeg to record system/virtual-cable audio into WAV file
-     */
-    async startAudioRecording() {
-        try {
-            let device = process.env.AUDIO_DEVICE;
-
-            // Auto-detect VB cable friendly name on Windows if not provided
-            if (process.platform === 'win32' && !device) {
-                try {
-                    const probe = spawnSync('ffmpeg', ['-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], { encoding: 'utf8' });
-                    const lines = ((probe.stdout || '') + (probe.stderr || '')).split(/\r?\n/);
-                    const audioLinesStart = lines.findIndex(l => /DirectShow audio devices/i.test(l));
-                    if (audioLinesStart !== -1) {
-                        for (let i = audioLinesStart + 1; i < lines.length; i++) {
-                            const raw = lines[i] || '';
-                            const line = raw.trim();
-                            if (/DirectShow video devices/i.test(line)) break; // end of audio section
-                            if (!line.startsWith('"')) continue; // skip Alternative name lines
-                            if (/VB-Audio|CABLE Output/i.test(line)) {
-                                device = line.replace(/^"|"$/g, '');
-                                break;
-                            }
-                        }
-                    }
-                } catch (e) {
-                    console.warn(`[${this.id}] ⚠️ Device auto-detect failed: ${e.message}`);
-                }
-            }
-
-            // If Windows and still no concrete device, fallback to page-side audio capture
-            if (process.platform === 'win32' && (!device || /^default$/i.test(device))) {
-                console.warn(`[${this.id}] ℹ️ No DirectShow VB device found; using page-side remote audio capture.`);
-                this.audioViaPage = true;
-                this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
-                await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
-                return;
-            }
-
-            const rate = process.env.AUDIO_RATE || '16000';
-            const args = [];
-
-            if (process.platform === 'win32') {
-                args.push('-y', '-f', 'dshow', '-i', `audio=${device}`);
-            } else if (process.platform === 'linux') {
-                // Assume Pulse/ALSA loopback present as env AUDIO_DEVICE else default
-                args.push('-y', '-f', 'alsa', '-i', device);
-            } else if (process.platform === 'darwin') {
-                args.push('-y', '-f', 'avfoundation', '-i', `:${device}`);
-            } else {
-                console.warn(`[${this.id}] ⚠️ Unsupported platform for audio recording`);
-                return;
-            }
-
-            args.push('-ac', '1', '-ar', rate, '-f', 'wav', this.audioFile);
-
-            console.log(`[${this.id}] 🔊 Starting audio capture (${device}) -> ${this.audioFile}`);
-            const startedAt = Date.now();
-            this.audioProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-            // Monitor stderr for immediate failure detection
-            let stderrBuffer = '';
-            let fallbackTriggered = false;
-            const stderrHandler = async (chunk) => {
-                const text = chunk.toString();
-                stderrBuffer += text;
-                // Also output to console for visibility
-                process.stderr.write(text);
-                // Check for device not found errors immediately
-                if (/Could not find audio|Error opening input|I\/O error/i.test(stderrBuffer) && !this.audioViaPage && !fallbackTriggered) {
-                    fallbackTriggered = true;
-                    console.warn(`[${this.id}] ⚠️ FFmpeg device error detected, switching to page-side audio...`);
-                    try {
-                        this.audioViaPage = true;
-                        this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
-                        this.audioProcess.stderr.removeListener('data', stderrHandler);
-                        this.audioProcess.kill('SIGTERM'); // stop failed FFmpeg
-                        await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
-                        console.log(`[${this.id}] ✅ Successfully switched to page-side audio capture (recording remote participants only)`);
-                    } catch (e) {
-                        console.error(`[${this.id}] ❌ Fallback audio start failed: ${e.message}`);
-                        fallbackTriggered = false; // allow retry
-                    }
-                }
-            };
-            this.audioProcess.stderr.on('data', stderrHandler);
-            // Pipe stdout to console
-            this.audioProcess.stdout.pipe(process.stdout);
-
-            this.audioProcess.on('exit', (code, sig) => {
-                console.log(`[${this.id}] 🔊 Audio recorder exited (code=${code}, sig=${sig})`);
-                // Fast failure -> fallback to page-side capture automatically if not already handled
-                const ranMs = Date.now() - startedAt;
-                if (process.platform === 'win32' && code !== 0 && ranMs < 4000 && !this.audioViaPage) {
-                    (async () => {
-                        try {
-                            console.warn(`[${this.id}] ⚠️ FFmpeg audio device failed; switching to page-side remote audio.`);
-                            this.audioViaPage = true;
-                            this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
-                            await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
-                        } catch (e) {
-                            console.error(`[${this.id}] ❌ Fallback audio start failed: ${e.message}`);
-                        }
-                    })();
-                }
-            });
-        } catch (e) {
-            console.error(`[${this.id}] ❌ Failed to start audio recording:`, e.message);
-            try {
-                console.warn(`[${this.id}] ℹ️ Falling back to page-side remote audio capture.`);
-                this.audioViaPage = true;
-                this.audioFallbackFile = this.audioFile.replace(/\.wav$/i, '.webm');
-                await this.capture.startAudioOnlyCapture(this.audioFallbackFile, { remoteOnly: true });
-            } catch {}
-        }
-    }
-
-    /** Stop ffmpeg audio capture */
-    async stopAudioRecording() {
-        if (this.audioViaPage) {
-            await this.capture.stopAudioOnlyCapture();
-            this.audioViaPage = false;
+        if (this.isCapturing) {
+            console.log(`[${this.id}] Recording already started.`);
             return;
         }
-        if (this.audioProcess && !this.audioProcess.killed) {
-            console.log(`[${this.id}] ⏹️ Stopping audio capture...`);
-            try {
-                this.audioProcess.kill('SIGINT');
-            } catch {}
-            await new Promise((resolve) => {
-                this.audioProcess.once('exit', () => resolve());
-                setTimeout(resolve, 3000); // fallback
-            });
-        }
-    }
 
-    async startCaptionsObserver() {
-        try {
-            // Bridge to receive caption lines from the browser
-            await this.page.exposeFunction(`__onCaption_${this.id}`, async (payload) => {
+        this.recordingStartedAt = Date.now();
+
+        // Chunk writing with retry mechanism (GoogleMeetBot style)
+        const writeChunkWithRetry = async (buffer, retries = 3) => {
+            for (let attempt = 1; attempt <= retries; attempt++) {
                 try {
-                    const nowIso = new Date(payload.ts).toISOString();
+                    await fs.promises.appendFile(this.recordingPath, buffer);
+                    return true;
+                } catch (error) {
+                    console.error(`[${this.id}] ❌ Chunk write failed (attempt ${attempt}/${retries}):`, error.message);
+                    if (attempt === retries) {
+                        throw error;
+                    }
+                    // Wait before retry
+                    await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+                }
+            }
+            return false;
+        };
+        
+        // Expose function for receiving recording chunks from browser
+        await this.page.exposeFunction('screenAppSendData', async (slightlySecretId, data) => {
+            if (slightlySecretId !== this.slightlySecretId) return;
 
-                    // Normalize shape: default to final if state missing
-                    const state = payload.state === 'pending' ? 'pending' : 'final';
-                    const speaker = payload.speaker || 'Unknown Speaker';
-                    const text = String(payload.text || '').trim();
-                    const utteranceId = payload.utteranceId || `${speaker}`;
+            try {
+                const buffer = Buffer.from(data, 'base64');
+                // Write chunk with retry mechanism
+                await writeChunkWithRetry(buffer);
+            } catch (error) {
+                console.error(`[${this.id}] ❌ Error saving chunk after retries:`, error.message);
+            }
+        });
 
-                    if (!text) return;
+        // Expose function for meeting end signal from browser
+        await this.page.exposeFunction('screenAppMeetEnd', (slightlySecretId) => {
+            if (slightlySecretId !== this.slightlySecretId) return;
+            try {
+                console.log(`[${this.id}] 🏁 Meeting end signal received from browser`);
+                this.leaveMeet();
+            } catch (error) {
+                console.error(`[${this.id}] ❌ Error processing meeting end:`, error.message);
+            }
+        });
 
-                    if (state === 'pending') {
-                        // Stream live replacement updates only; don't persist
-                        if (this.streamSocket && this.streamSocket.readyState === WebSocket.OPEN) {
-                            const msg = {
-                                type: 'caption_update',
-                                botId: this.id,
-                                speaker,
-                                utteranceId,
-                                text,
-                                prevText: payload.prevText || '',
-                                ts: payload.ts,
-                                iso: nowIso,
-                                state: 'pending'
-                            };
-                            this.streamSocket.send(JSON.stringify(msg));
+        // Inject recording code into browser context
+        await this.page.evaluate(
+            async ({ botId, duration, inactivityLimit, slightlySecretId, activateInactivityAfterMinutes }) => {
+                const durationMs = duration * 60 * 1000;
+                const inactivityLimitMs = inactivityLimit * 60 * 1000;
+                
+                let timeoutId;
+                let inactivityParticipantTimeout;
+                let pageValidityInterval;
+                let modalDismissInterval;
+
+                const sendChunkToServer = async (chunk) => {
+                    try {
+                        function arrayBufferToBase64(buffer) {
+                            let binary = '';
+                            const bytes = new Uint8Array(buffer);
+                            for (let i = 0; i < bytes.byteLength; i++) {
+                                binary += String.fromCharCode(bytes[i]);
+                            }
+                            return btoa(binary);
                         }
-                        // Console hint of replacement
-                        const hhmmss = new Date(payload.ts).toTimeString().split(' ')[0];
-                        console.log(`[${this.id}] ✏️ ${hhmmss} ${speaker}: ${text} [editing]`);
+                        const base64 = arrayBufferToBase64(chunk);
+                        await window.screenAppSendData(slightlySecretId, base64);
+                    } catch (error) {
+                        console.error('[Browser] ❌ Error sending chunk:', error);
+                        throw error; // Re-throw to be caught by caller
+                    }
+                };
+
+                async function startRecording() {
+                    console.log(`[Browser] Starting MediaRecorder capture at ${new Date().toISOString()}`);
+                    console.log(`[Browser] Inactivity detection activates after ${activateInactivityAfterMinutes} minutes`);
+
+                    // Check for mediaDevices API
+                    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+                        console.error('[Browser] MediaDevices or getDisplayMedia not supported');
                         return;
                     }
 
-                    // Node-side dedupe by normalized key per speaker+utterance
-                    const normalizeKey = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                    const dedupeKey = normalizeKey(`${speaker}|${utteranceId}|${text}`);
-                    const prevKey = this._lastSentenceKeyBySpeaker.get(`${speaker}|${utteranceId}`);
-                    if (prevKey === dedupeKey) return;
-                    this._lastSentenceKeyBySpeaker.set(`${speaker}|${utteranceId}`, dedupeKey);
-
-                    const record = {
-                        ts: payload.ts,
-                        iso: nowIso,
-                        botId: this.id,
-                        speaker,
-                        text,
-                        unit: 'sentence',
-                        utteranceId
-                    };
-
-                    // Append only finalized sentences
-                    fs.appendFileSync(this.sentencesFile, JSON.stringify(record) + '\n');
-
-                    // Emit final over WS
-                    if (this.streamSocket && this.streamSocket.readyState === WebSocket.OPEN) {
-                        const msg = { type: 'caption_final', botId: this.id, ...record, state: 'final' };
-                        this.streamSocket.send(JSON.stringify(msg));
-                    }
-
-                    // Log to console
-                        const hhmmss = new Date(payload.ts).toTimeString().split(' ')[0];
-                    console.log(`[${this.id}] 💬 ${hhmmss} ${speaker}: ${text}`);
-
-                } catch (e) {
-                    console.warn(`[${this.id}] ⚠️ Caption pipeline error: ${e.message}`);
-                }
-            });
-
-            // Inject the MutationObserver into the page context
-            await this.page.evaluate((botId) => {
-                const send = window[`__onCaption_${botId}`];
-                if (!send) return;
-
-                // Per-speaker buffering and replacement tracking
-                const buffers = new Map(); // speaker -> { text, lastSentPending, timer, lastTs, utteranceId }
-                const endsWithPunctuation = (t) => /[.!?\u2026]\s*$/.test(String(t || ''));
-                const normalizeText = (t) => String(t || '').replace(/\s+/g, ' ').trim();
-                const isSpeakerEcho = (speaker, text) => normalizeText(text).toLowerCase() === normalizeText(speaker).toLowerCase();
-                const FINAL_IDLE_MS = 2500; // long pause to finalize if no punctuation
-                const PUNCT_STABLE_MS = 900; // short stabilization for punctuated sentences
-                const PENDING_THROTTLE_MS = 150; // limit pending spam
-
-                const scheduleFinalize = (speaker) => {
-                    const st = buffers.get(speaker);
-                    if (!st) return;
-                    const text = normalizeText(st.text);
-                    const delay = endsWithPunctuation(text) ? PUNCT_STABLE_MS : FINAL_IDLE_MS;
-                    if (st.timer) clearTimeout(st.timer);
-                    st.timer = setTimeout(() => {
-                        const latest = normalizeText(buffers.get(speaker)?.text || '');
-                        if (!latest || isSpeakerEcho(speaker, latest)) return;
-                        send({ ts: Date.now(), speaker, text: latest, utteranceId: st.utteranceId, state: 'final' });
-                        // Start a new utterance id for next turn
-                        buffers.delete(speaker);
-                    }, delay);
-                };
-
-                const maybeSendPending = (speaker, prevText, text) => {
-                    const st = buffers.get(speaker);
-                    const now = Date.now();
-                    if (!st) return;
-                    if (st.lastPendingSentAt && (now - st.lastPendingSentAt) < PENDING_THROTTLE_MS) return;
-                    const norm = normalizeText(text);
-                    if (!norm || norm === st.lastSentPending) return;
-                    st.lastSentPending = norm;
-                    st.lastPendingSentAt = now;
-                    send({ ts: now, speaker, text: norm, prevText, utteranceId: st.utteranceId, state: 'pending' });
-                };
-
-                const sameUtteranceHeuristic = (oldText, newText) => {
-                    const a = normalizeText(oldText);
-                    const b = normalizeText(newText);
-                    if (!a) return true;
-                    if (b.startsWith(a)) return true; // continuation
-                    // small edits/replacements treated as same utterance
-                    return Math.abs(b.length - a.length) <= 20;
-                };
-
-                const handleCaptionUpdate = (speaker, text) => {
-                    if (!speaker) speaker = '';
-                    const cleaned = normalizeText(text);
-                    if (!cleaned || cleaned.length < 2) return;
-                    if (isSpeakerEcho(speaker, cleaned)) return;
-                    const now = Date.now();
-                    let st = buffers.get(speaker);
-                    if (!st) {
-                        st = { text: '', lastSentPending: '', lastPendingSentAt: 0, timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
-                        buffers.set(speaker, st);
-                    }
-                    const prevText = st.text || '';
-                    // If new text looks like a new turn and previous existed without finalization, finalize previous
-                    if (prevText && !sameUtteranceHeuristic(prevText, cleaned)) {
-                        if (st.timer) clearTimeout(st.timer);
-                        // Finalize previous before starting new utterance
-                        send({ ts: now - 1, speaker, text: normalizeText(prevText), utteranceId: st.utteranceId, state: 'final' });
-                        // Start new utterance id
-                        st = { text: '', lastSentPending: '', lastPendingSentAt: 0, timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
-                        buffers.set(speaker, st);
-                    }
-                    st.text = cleaned;
-                    st.lastTs = now;
-                    maybeSendPending(speaker, prevText, cleaned);
-                    scheduleFinalize(speaker);
-                };
-
-                const observeRegion = (captionRegion) => {
-                    let lastKnownSpeaker = "Unknown Speaker";
-
-                    const handleNode = (node) => {
-                        if (!(node instanceof HTMLElement)) return;
-
-                        const speakerElem = node.querySelector(".NWpY1d");
-                        let speaker = speakerElem?.textContent?.trim() || lastKnownSpeaker;
-
-                        if (speaker && speaker !== "Unknown Speaker") {
-                            lastKnownSpeaker = speaker;
-                        }
-
-                        const clone = node.cloneNode(true);
-                        const speakerLabelInClone = clone.querySelector(".NWpY1d");
-                        if (speakerLabelInClone) speakerLabelInClone.remove();
-
-                        const caption = clone.textContent?.trim() || "";
-
-                        if (caption) {
-                            handleCaptionUpdate(speaker, caption);
-                        }
-                    };
-
-                    const observer = new MutationObserver((mutations) => {
-                        for (const mutation of mutations) {
-                            const nodes = Array.from(mutation.addedNodes);
-                            if (nodes.length > 0) {
-                                nodes.forEach((node) => {
-                                    if (node instanceof HTMLElement) {
-                                        handleNode(node);
-                                    }
-                                });
-                            } else if (
-                                mutation.type === "characterData" &&
-                                mutation.target.parentElement instanceof HTMLElement
-                            ) {
-                                handleNode(mutation.target.parentElement);
-                        }
-                    }
-                });
-
-                    observer.observe(captionRegion, {
-                        childList: true,
-                        subtree: true,
-                        characterData: true,
+                    const stream = await navigator.mediaDevices.getDisplayMedia({
+                        video: true,
+                        // Request tab/system audio as aggressively as Chrome allows.
+                        // On modern Chrome this hints that we want the tab's own audio
+                        // (other participants) in addition to microphone if available.
+                        audio: {
+                            autoGainControl: false,
+                            channels: 2,
+                            channelCount: 2,
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            // Non-standard but supported in recent Chrome: try to include system/tab audio
+                            // where policy allows it. Browsers that don't know this key will ignore it.
+                            systemAudio: 'include'
+                        },
+                        preferCurrentTab: true,
                     });
-                    window.__captionObserver = observer;
-                };
-                
-                const interval = setInterval(() => {
-                    const region = document.querySelector('[role="region"][aria-label*="Captions"]');
-                    if (region) {
-                        clearInterval(interval);
-                        observeRegion(region);
+
+                    // Determine codec
+                    let options = {};
+                    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+                        console.log('[Browser] Using VP9 codec');
+                        options = { mimeType: 'video/webm;codecs=vp9' };
+                    } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+                        console.log('[Browser] Using VP8 codec (fallback)');
+                        options = { mimeType: 'video/webm;codecs=vp8' };
+                    } else {
+                        console.warn('[Browser] Using default codec');
                     }
-                }, 1000);
 
-            }, this.id);
+                    const mediaRecorder = new MediaRecorder(stream, options);
 
-            console.log(`[${this.id}] ✅ Captions observer started`);
-        } catch (e) {
-            console.warn(`[${this.id}] ⚠️ Could not start captions observer: ${e.message}`);
-        }
+                    let chunksReceived = 0;
+                    let totalBytes = 0;
+
+                    mediaRecorder.ondataavailable = async (event) => {
+                        if (!event.data.size) {
+                            console.warn('[Browser] Received empty chunk');
+                            return;
+                        }
+                        try {
+                            chunksReceived++;
+                            totalBytes += event.data.size;
+                            const arrayBuffer = await event.data.arrayBuffer();
+                            await sendChunkToServer(arrayBuffer);
+                            if (chunksReceived % 30 === 0) { // Log every 30 chunks (~1 minute)
+                                console.log(`[Browser] 📊 ${chunksReceived} chunks sent, ${(totalBytes / 1024 / 1024).toFixed(2)}MB total`);
+                            }
+                        } catch (error) {
+                            console.error('[Browser] ❌ Error sending chunk:', error);
+                        }
+                    };
+
+                    mediaRecorder.onstart = () => {
+                        console.log('[Browser] 🎬 MediaRecorder started recording');
+                    };
+
+                    mediaRecorder.onstop = () => {
+                        console.log(`[Browser] ⏹️ MediaRecorder stopped. Total: ${chunksReceived} chunks, ${(totalBytes / 1024 / 1024).toFixed(2)}MB`);
+                    };
+
+                    mediaRecorder.onerror = (event) => {
+                        console.error('[Browser] ❌ MediaRecorder error:', event.error);
+                    };
+
+                    // Start recording with 2-second chunks
+                    mediaRecorder.start(2000);
+                    console.log('[Browser] ✅ MediaRecorder initialized');
+
+                    const stopRecording = async () => {
+                        console.log('[Browser] 🛑 Stopping recording...');
+                        mediaRecorder.stop();
+                        stream.getTracks().forEach(track => track.stop());
+
+                        // Cleanup timers
+                        if (timeoutId) clearTimeout(timeoutId);
+                        if (inactivityParticipantTimeout) clearTimeout(inactivityParticipantTimeout);
+                        if (pageValidityInterval) clearInterval(pageValidityInterval);
+                        if (modalDismissInterval) clearInterval(modalDismissInterval);
+
+                        // Signal meeting end
+                        window.screenAppMeetEnd(slightlySecretId);
+                    };
+
+                    // Modal dismissal
+                    modalDismissInterval = setInterval(() => {
+                        try {
+                            const buttons = document.querySelectorAll('button');
+                            const gotItButtons = Array.from(buttons).filter(
+                                btn => btn.offsetParent !== null && btn.innerText?.includes('Got it')
+                            );
+                            if (gotItButtons.length > 0) {
+                                console.log('[Browser] ✖️ Dismissing modal');
+                                gotItButtons[0].click();
+                            }
+                        } catch (error) {
+                            console.error('[Browser] Modal dismiss error:', error);
+                        }
+                    }, 2000);
+
+                    // Page validity check
+                    pageValidityInterval = setInterval(() => {
+                        try {
+                            const url = window.location.href;
+                            if (!url.includes('meet.google.com')) {
+                                console.warn('[Browser] ⚠️ No longer on Meet page');
+                                stopRecording();
+                                return;
+                            }
+
+                            const bodyText = document.body.innerText || '';
+                            if (bodyText.includes('You\'ve been removed') || bodyText.includes('No one responded')) {
+                                console.warn('[Browser] ⚠️ Removed or denied');
+                                stopRecording();
+                                return;
+                            }
+
+                            const hasMeetUI = document.querySelector('button[aria-label*="People"]') !== null ||
+                                            document.querySelector('button[aria-label*="Leave call"]') !== null;
+                            if (!hasMeetUI) {
+                                console.warn('[Browser] ⚠️ Meet UI not found');
+                                stopRecording();
+                            }
+                        } catch (error) {
+                            console.error('[Browser] Page validity error:', error);
+                        }
+                    }, 10000);
+
+                    // Max duration timeout
+                    timeoutId = setTimeout(() => {
+                        console.log('[Browser] ⏱️ Max duration reached');
+                        stopRecording();
+                    }, durationMs);
+                }
+
+                // Start recording
+                await startRecording();
+            },
+            {
+                botId: this.id,
+                duration: this.maxRecordingDuration,
+                inactivityLimit: this.inactivityLimit,
+                slightlySecretId: this.slightlySecretId,
+                activateInactivityAfterMinutes: this.activateInactivityAfter,
+            }
+        );
+
+        this.isCapturing = true;
+        console.log(`[${this.id}] ✅ Recording started (max ${this.maxRecordingDuration}min, inactivity after ${this.activateInactivityAfter}min)`);
     }
 
     /**
@@ -1123,21 +1464,30 @@ class Bot {
      */
     async hideSelfView() {
         try {
-            console.log(`[${this.id}] 👤 Hiding self view...`);
-            
-            await this.page.waitForTimeout(3000);
-            
+            console.log(`[${this.id}] 👤 Hiding self view via CSS...`);
+
+            await this.page.waitForTimeout(2000);
+
             await this.page.evaluate((botName) => {
-                const style = document.createElement('style');
-                style.textContent = `
-                    [data-self-name*="${botName}"],
-                    [aria-label*="${botName}"] {
-                        display: none !important;
-                    }
-                `;
-                document.head.appendChild(style);
-            }, this.botName);
-            
+                try {
+                    const style = document.createElement('style');
+                    style.textContent = `
+                        /* By explicit bot name if present on the tile */
+                        [data-self-name*="${botName}"],
+                        [aria-label*="${botName}" i],
+                        /* Generic self-view labels commonly used by Meet */
+                        [aria-label*="you" i],
+                        [aria-label*="your video" i],
+                        [aria-label*="self view" i] {
+                            display: none !important;
+                        }
+                    `;
+                    document.head.appendChild(style);
+                } catch {
+                    // Ignore failures; self view visibility is non-critical
+                }
+            }, this.botName || '');
+
             console.log(`[${this.id}] ✅ Self view hidden`);
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ Could not hide self view`);
@@ -1145,67 +1495,553 @@ class Bot {
     }
 
     /**
-     * Monitor participants and auto-leave when empty
+     * Perpetual modal dismissal (GoogleMeetBot style)
+     * Continuously checks for and dismisses "Got it" modals during recording
+     */
+    startModalDismissal() {
+        console.log(`[${this.id}] 🔔 Starting perpetual modal dismissal...`);
+        
+        let dismissCount = 0;
+        let errorCount = 0;
+        const maxErrors = 10;
+
+        this.modalDismissInterval = setInterval(async () => {
+            try {
+                const dismissed = await this.page.evaluate(() => {
+                    try {
+                        const buttons = document.querySelectorAll('button');
+                        const gotItButtons = Array.from(buttons).filter(
+                            button => button.offsetParent !== null && 
+                                     button.innerText && 
+                                     button.innerText.includes('Got it')
+                        );
+                        
+                        if (gotItButtons.length > 0) {
+                            gotItButtons[0].click();
+                            return true;
+                        }
+                        return false;
+                    } catch {
+                        return false;
+                    }
+                });
+                
+                if (dismissed) {
+                    dismissCount++;
+                    console.log(`[${this.id}] ✖️ Dismissed "Got it" modal #${dismissCount}`);
+                }
+                
+                errorCount = 0; // Reset on success
+            } catch (error) {
+                errorCount++;
+                if (errorCount >= maxErrors) {
+                    console.error(`[${this.id}] ❌ Too many modal dismissal errors (${maxErrors}), stopping...`);
+                    this.stopModalDismissal();
+                }
+            }
+        }, 2000);
+    }
+
+    /**
+     * Stop modal dismissal interval
+     */
+    stopModalDismissal() {
+        if (this.modalDismissInterval) {
+            clearInterval(this.modalDismissInterval);
+            this.modalDismissInterval = null;
+        }
+    }
+
+    /**
+     * Page validity check (GoogleMeetBot style)
+     * Ensures bot is still on a valid Google Meet page during recording
+     */
+    startPageValidityCheck() {
+        console.log(`[${this.id}] 🔍 Starting page validity monitoring...`);
+        
+        this.pageValidityInterval = setInterval(async () => {
+            try {
+                // If page/browser already closed, stop monitoring
+                if (!this.page || (this.page.isClosed && this.page.isClosed())) {
+                    this.stopPageValidityCheck();
+                    return;
+                }
+
+                const isValid = await this.page.evaluate((constants) => {
+                    try {
+                        // Check URL
+                        const currentUrl = window.location.href;
+                        if (!currentUrl.includes('meet.google.com')) {
+                            return { valid: false, reason: `URL changed to: ${currentUrl}` };
+                        }
+
+                        const bodyText = document.body.innerText || '';
+
+                        // Check for removal/kicked messages
+                        if (bodyText.includes(constants.REMOVED)) {
+                            return { valid: false, reason: 'Bot was removed from the meeting' };
+                        }
+
+                        if (bodyText.includes(constants.NO_RESPONSE)) {
+                            return { valid: false, reason: 'Bot was not admitted to the meeting' };
+                        }
+
+                        // Check for basic Meet UI elements
+                        const hasMeetElements = document.querySelector('button[aria-label*="People"]') !== null ||
+                                              document.querySelector('button[aria-label*="Leave call"]') !== null;
+
+                        if (!hasMeetElements) {
+                            return { valid: false, reason: 'Google Meet UI elements not found' };
+                        }
+
+                        return { valid: true, reason: null };
+                    } catch (error) {
+                        return { valid: false, reason: `Check error: ${error.message}` };
+                    }
+                }, {
+                    REMOVED: GOOGLE_REMOVED_FROM_MEETING,
+                    NO_RESPONSE: GOOGLE_NO_RESPONSE
+                });
+
+                if (!isValid.valid) {
+                    console.warn(`[${this.id}] ⚠️ Page validity check failed: ${isValid.reason}`);
+                    console.log(`[${this.id}] 🚪 Ending recording due to invalid page state`);
+                    this.leaveMeet();
+                }
+            } catch (error) {
+                // If target is already closed, quietly stop monitoring to avoid noisy logs
+                if (error && typeof error.message === 'string' && error.message.includes('Target closed')) {
+                    this.stopPageValidityCheck();
+                    return;
+                }
+                console.error(`[${this.id}] ❌ Page validity check error:`, error.message);
+            }
+        }, 10000); // Check every 10 seconds
+    }
+
+    /**
+     * Stop page validity check interval
+     */
+    stopPageValidityCheck() {
+        if (this.pageValidityInterval) {
+            clearInterval(this.pageValidityInterval);
+            this.pageValidityInterval = null;
+        }
+    }
+
+    /**
+     * Sample currently active speaker names from the Google Meet UI and
+     * register activity timestamps per speaker.
+     *
+     * This uses heuristic DOM checks on aria-labels such as
+     * "<Name> is speaking" or "Speaking now", as well as data-speaking flags
+     * where available. It does not rely on any server-side audio pipeline.
+     */
+    registerSpeakerActivity(name, timestampMs) {
+        // Clean the provided display name so we avoid suffixes like "is speaking" or self-view markers
+        const cleaned = this._cleanName(name);
+        if (!cleaned) return; // Skip if name cannot be determined or is self-view
+        const ts = typeof timestampMs === 'number' ? timestampMs : Date.now();
+        this.lastActivity = ts;
+
+        if (!this.registeredActivityTimestamps[cleaned]) {
+            this.registeredActivityTimestamps[cleaned] = [];
+        }
+        this.registeredActivityTimestamps[cleaned].push(ts);
+
+        if (!this.participants.includes(cleaned)) {
+            this.participants.push(cleaned);
+        }
+    }
+
+    async sampleActiveSpeakers() {
+        if (!this.page || (this.page.isClosed && this.page.isClosed())) return;
+
+        const now = Date.now();
+        const activeNames = await this.page.evaluate(() => {
+            const names = new Set();
+            const SELF_VIEW_LABELS = ['you', 'your video', 'self view'];
+            const clean = (raw) => {
+                if (!raw) return null;
+                let first = String(raw).split(/[,(]/)[0].trim();
+                const lower = first.toLowerCase();
+                if (SELF_VIEW_LABELS.includes(lower)) return null;
+                return first;
+            };
+            try {
+                const nodes = Array.from(document.querySelectorAll('[aria-label]'));
+                for (const el of nodes) {
+                    const labelRaw = el.getAttribute('aria-label') || '';
+                    const label = labelRaw.trim();
+                    if (!label) continue;
+                    const lower = label.toLowerCase();
+
+                    const markers = [
+                        ' is speaking',
+                        ' is presenting',
+                        ' speaking now',
+                    ];
+
+                    let matched = false;
+                    for (const m of markers) {
+                        if (lower.endsWith(m)) {
+                            const base = label.substring(0, label.length - m.length).trim();
+                            const c = clean(base);
+                            if (c) names.add(c);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (matched) continue;
+
+                    // Fallback: Tiles may have role=presentation and aria-label="<name> (presenting)"
+                    if (lower.endsWith('(presenting)')) {
+                        const base = label.replace(/\(presenting\)$/i, '').trim();
+                        const c = clean(base);
+                        if (c) names.add(c);
+                        continue;
+                    }
+
+                    // Generic speaking detection class
+                    if (el.getAttribute('data-speaking') === 'true') {
+                        const c = clean(label);
+                        if (c) names.add(c);
+                    }
+                }
+            } catch {}
+            return Array.from(names);
+        });
+
+        if (!Array.isArray(activeNames) || activeNames.length === 0) return;
+
+        for (const name of activeNames) {
+            this.registerSpeakerActivity(name, now);
+        }
+    }
+
+    /**
+     * Monitor participants and auto-leave when empty (enhanced with MeetsBot + GoogleMeetBot logic)
      */
     startParticipantMonitoring() {
-        console.log(`[${this.id}] 👥 Starting participant monitoring...`);
+        console.log(`[${this.id}] 👥 Starting comprehensive monitoring...`);
+        
+        // Start modal dismissal (GoogleMeetBot style)
+        this.startModalDismissal();
+        
+        // Start page validity checks (GoogleMeetBot style)
+        this.startPageValidityCheck();
         
         let lastLoggedCount = null;
         let emptyStreak = 0;
-        const leaveThreshold = 3; // require 3 consecutive empty readings before leaving
+        const leaveThreshold = 3; // require 3 consecutive empty readings before leaving (reserved for future use)
+
+        // Start speaker activity sampling (best-effort active speaker detection)
+        if (this.speakerActivityInterval) {
+            try { clearInterval(this.speakerActivityInterval); } catch {}
+        }
+        this.speakerActivityInterval = setInterval(async () => {
+            try {
+                await this.sampleActiveSpeakers();
+            } catch (e) {
+                // Non-fatal: just log once in a while
+                console.warn(`[${this.id}] ⚠️ Speaker sampling error:`, e.message || e);
+            }
+        }, 1000); // 1s resolution for speaker activity timeframes
 
         this.participantCheckInterval = setInterval(async () => {
             try {
+                if (!this.page || (this.page.isClosed && this.page.isClosed())) {
+                    if (this.participantCheckInterval) {
+                        clearInterval(this.participantCheckInterval);
+                        this.participantCheckInterval = null;
+                    }
+                    return;
+                }
                 const participantCount = await this.getParticipantCount();
+                
                 // Log only on change to reduce noise/flicker
                 if (participantCount !== lastLoggedCount) {
                     console.log(`[${this.id}] 👥 Participants (including bot): ${participantCount}`);
                     lastLoggedCount = participantCount;
                 }
 
-                // Leave immediately if bot is alone in the room
+                // Track when bot is alone (MeetsBot style)
                 if (participantCount <= 1) {
+                    if (this.timeAloneStarted === Infinity) {
+                        this.timeAloneStarted = Date.now();
+                        console.log(`[${this.id}] ⏱️ Bot is now alone in meeting`);
+                    }
+                    
                     emptyStreak++;
-                    if (emptyStreak >= leaveThreshold) {
-                        console.log(`[${this.id}] 🚪 Meeting empty for ${emptyStreak} checks, leaving...`);
+                    const aloneMs = Date.now() - this.timeAloneStarted;
+                    const leaveAfterMs = 5000; // 5 seconds alone threshold
+                    
+                    if (aloneMs > leaveAfterMs) {
+                        console.log(`[${this.id}] 🚪 Alone for ${(aloneMs/1000).toFixed(0)}s (>${leaveAfterMs/1000}s), leaving...`);
                         this.leaveMeet();
+                        return;
                     }
                 } else {
                     emptyStreak = 0;
+                    this.timeAloneStarted = Infinity;
+                }
+
+                // Check if kicked (MeetsBot 3-condition check)
+                if (await this.checkKicked()) {
+                    console.log(`[${this.id}] 🚫 Detected kicked from meeting`);
+                    this.leaveMeet();
+                    return;
+                }
+
+                // Check for inactivity timeout (MeetsBot style)
+                const inactivityTimeout = 300000; // 5 minutes
+                if (
+                    participantCount > 1 &&
+                    this.lastActivity &&
+                    Date.now() - this.lastActivity > inactivityTimeout
+                ) {
+                    console.log(`[${this.id}] ⏰ No activity for ${inactivityTimeout/60000} minutes, leaving...`);
+                    this.leaveMeet();
+                    return;
                 }
 
             } catch (error) {
+                if (error && typeof error.message === 'string' && error.message.includes('Target closed')) {
+                    if (this.participantCheckInterval) {
+                        clearInterval(this.participantCheckInterval);
+                        this.participantCheckInterval = null;
+                    }
+                    return;
+                }
                 console.warn(`[${this.id}] ⚠️ Participant check error:`, error.message);
             }
         }, 5000);
     }
 
     /**
-     * Leave meeting and cleanup
+     * Stop recording (GoogleMeetBot style - browser handles stopping)
+     */
+    async stopRecording() {
+        if (!this.isCapturing) return;
+
+        console.log(`[${this.id}] ⏹️ Stopping recording...`);
+        this.isCapturing = false;
+        
+        // Recording is stopped from browser side, file is already written
+        console.log(`[${this.id}] ✅ Recording stopped - file saved to ${this.recordingPath}`);
+    }
+
+    /**
+     * Get speaker timeframes (MeetsBot style)
+     */
+    getSpeakerTimeframes() {
+        const processedTimeframes = [];
+        const utteranceThresholdMs = 3000;
+
+        for (const [speakerName, timeframesArray] of Object.entries(this.registeredActivityTimestamps)) {
+            let start = timeframesArray[0];
+            let end = timeframesArray[0];
+
+            for (let i = 1; i < timeframesArray.length; i++) {
+                const currentTimeframe = timeframesArray[i];
+                if (currentTimeframe - end < utteranceThresholdMs) {
+                    end = currentTimeframe;
+                } else {
+                    if (end - start > 500) {
+                        processedTimeframes.push({ speakerName, start, end });
+                    }
+                    start = currentTimeframe;
+                    end = currentTimeframe;
+                }
+            }
+            processedTimeframes.push({ speakerName, start, end });
+        }
+
+        processedTimeframes.sort((a, b) => a.start - b.start || a.end - b.end);
+        return processedTimeframes;
+    }
+
+    /**
+     * Persist computed speaker timeframes to file for this bot.
+     * File path: runtime/<botId>/SpeakerTimeframes.json
+     */
+    async saveSpeakerTimeframesToFile() {
+        if (!this.speakerTimeframesFile) return;
+        const timeframes = this.getSpeakerTimeframes();
+        try {
+            await fs.promises.writeFile(this.speakerTimeframesFile, JSON.stringify(timeframes, null, 2), 'utf8');
+            console.log(`[${this.id}] 💾 SpeakerTimeframes saved to ${this.speakerTimeframesFile}`);
+        } catch (e) {
+            console.error(`[${this.id}] ❌ Failed to write SpeakerTimeframes file:`, e.message || e);
+        }
+    }
+
+    /**
+     * Persist captured captions to a JSON file for this bot.
+     * File path: runtime/<botId>/transcripts/captions.json
+     */
+    async saveCaptionsToFile() {
+        if (!this.captionsFile) return;
+        try {
+            await fs.promises.writeFile(this.captionsFile, JSON.stringify(this.captions || [], null, 2), 'utf8');
+            console.log(`[${this.id}] 💾 Captions saved to ${this.captionsFile}`);
+        } catch (e) {
+            console.error(`[${this.id}] ❌ Failed to write captions file:`, e.message || e);
+        }
+    }
+
+    /**
+     * Check if bot was kicked (MeetsBot + GoogleMeetBot enhanced)
+     */
+    async checkKicked() {
+        try {
+            // Kick condition 1: "Return to home screen" button
+            const gotKickedDetector = '//button[.//span[text()="Return to home screen"]]';
+            const returnButtons = await this.page.$x(gotKickedDetector);
+            if (returnButtons.length > 0) {
+                return true;
+            }
+
+            // Kick condition 2: Leave button is hidden or doesn't exist
+            const leaveButton = await this.page.$('button[aria-label*="Leave call"], button[aria-label*="End call"]');
+            if (!leaveButton) {
+                return true;
+            }
+
+            // Check if leave button is actually visible
+            const isVisible = await leaveButton.boundingBox().then(box => box !== null).catch(() => false);
+            if (!isVisible) {
+                return true;
+            }
+
+            // Kick condition 3: Check for removal/denial text (GoogleMeetBot style)
+            const removedText = await this.page.evaluate((constants) => {
+                const bodyText = document.body.innerText || '';
+                return bodyText.includes(constants.REMOVED) || 
+                       bodyText.includes(constants.DENIED) ||
+                       bodyText.includes("You left the meeting");
+            }, {
+                REMOVED: GOOGLE_REMOVED_FROM_MEETING,
+                DENIED: GOOGLE_REQUEST_DENIED
+            });
+            
+            if (removedText) {
+                return true;
+            }
+
+            return false;
+        } catch (error) {
+            // If page is closed or navigation happened, consider it kicked
+            return false;
+        }
+    }
+
+    /**
+     * Leave meeting and cleanup (enhanced with GoogleMeetBot cleanup)
      */
     async leaveMeet() {
         if (this.isLeaving) return;
         this.isLeaving = true;
 
-		console.log(`[${this.id}] 📴 Leaving meeting...`);
-		try { if (this.isCapturing) await this.stopRecording(); } catch {}
-		try { if (this.participantCheckInterval) clearInterval(this.participantCheckInterval); } catch {}
-		this.participantCheckInterval = null;
-		try { await this.stopKeepAlive(); } catch {}
-		try { await this.page?.close?.(); } catch {}
-		try { await this.browser?.close?.(); } catch {}
-		try { if (typeof this.onLeave === 'function') this.onLeave(); } catch {}
-		this.isLeaving = false;
-	}
+        console.log(`[${this.id}] 📴 Leaving meeting...`);
+        
+        // Stop recording first
+        try { 
+            if (this.isCapturing) await this.stopRecording(); 
+        } catch (e) {
+            console.error(`[${this.id}] Error stopping recording:`, e);
+        }
+        
+        // Stop all monitoring intervals (GoogleMeetBot enhanced)
+        try { 
+            if (this.participantCheckInterval) clearInterval(this.participantCheckInterval); 
+        } catch {}
+        this.participantCheckInterval = null;
+        try {
+            if (this.speakerActivityInterval) clearInterval(this.speakerActivityInterval);
+        } catch {}
+        this.speakerActivityInterval = null;
+        
+        try { this.stopModalDismissal(); } catch {}
+        try { this.stopPageValidityCheck(); } catch {}
+        try { await this.stopKeepAlive(); } catch {}
+        
+        // Click leave button if not kicked
+        if (!await this.checkKicked()) {
+            const leaveButton = '//button[@aria-label="Leave call"]';
+            try {
+                await this.page.click(leaveButton, { timeout: 1000 });
+                console.log(`[${this.id}] ✅ Left call`);
+            } catch (e) {
+                console.log(`[${this.id}] Attempted to leave call - couldn't (probably already left)`);
+            }
+        }
+        
+        // Persist speaker timeframes to runtime/<botId>/SpeakerTimeframes.json
+        try {
+            await this.saveSpeakerTimeframesToFile();
+        } catch (e) {
+            console.error(`[${this.id}] Error saving SpeakerTimeframes:`, e);
+        }
+
+        // Persist live captions (if any) to runtime/<botId>/transcripts/captions.json
+        try {
+            await this.saveCaptionsToFile();
+        } catch (e) {
+            console.error(`[${this.id}] Error saving captions:`, e);
+        }
+
+        // Cleanup browser
+        try { await this.page?.close?.(); } catch {}
+        try { await this.browser?.close?.(); } catch {}
+
+        // Best-effort hard kill of Chrome by PID in case it did not exit cleanly
+        try {
+            if (this.browserPid && Number.isInteger(this.browserPid)) {
+                try { process.kill(this.browserPid, 'SIGTERM'); } catch {}
+                try { process.kill(this.browserPid, 'SIGKILL'); } catch {}
+            }
+        } catch {}
+
+        // Remove stored PID file
+        try { fs.removeSync(this.browserPidFile); } catch {}
+        
+        console.log(`[${this.id}] ✅ Bot finished`);
+        
+        // Trigger callback
+        try { 
+            if (typeof this.onLeave === 'function') this.onLeave(); 
+        } catch {}
+        
+        this.isLeaving = false;
+    }
 
 	/**
-	 * Bot status for API
+	 * Bot status for API (GoogleMeetBot style)
 	 */
 	getStats() {
+        let speakerTimeframes = [];
+        // Prefer persisted SpeakerTimeframes.json created after offline transcription
+        try {
+            if (this.speakerTimeframesFile && fs.existsSync(this.speakerTimeframesFile)) {
+                const raw = fs.readFileSync(this.speakerTimeframesFile, 'utf8');
+                speakerTimeframes = JSON.parse(raw);
+            } else {
+                speakerTimeframes = this.getSpeakerTimeframes();
+            }
+        } catch {}
+
 		return {
 			isCapturing: this.isCapturing,
-			videoFile: this.outputFile,
-			audioFile: this.audioViaPage ? (this.audioFallbackFile || null) : this.audioFile
+			recordingPath: this.recordingPath,
+			recordingFile: this.recordingPath, // WebM recording file
+			participants: this.participants,
+			speakerTimeframes,
+			hasSeenParticipants: this.hasSeenParticipants,
+			recordingFormat: 'webm', // MediaRecorder output
+			recordingDuration: this.recordingStartedAt ? Date.now() - this.recordingStartedAt : 0,
+            captionsFile: this.captionsFile,
+            captionsCount: Array.isArray(this.captions) ? this.captions.length : 0
 		};
 	}
 
@@ -1229,6 +2065,22 @@ class Bot {
 		const total = await this.getParticipantCount().catch(() => null);
 		return { ...counts, totalIncludingBot: total };
 	}
+
+    /**
+     * Return a cleaned participant display name.
+     * – Trim whitespace
+     * – Drop everything after the first comma or parenthesis
+     * – Ignore generic self-view labels ("You", "Your video", etc.)
+     * The function is deliberately lenient to avoid throwing inside page.evaluate.
+     * @private
+     */
+    _cleanName(raw) {
+        if (!raw) return null;
+        let candidate = String(raw).split(/[,(]/)[0].trim();
+        const lower = candidate.toLowerCase();
+        if (this._SELF_VIEW_LABELS.includes(lower)) return null;
+        return candidate;
+    }
 }
 
 module.exports = { Bot };
