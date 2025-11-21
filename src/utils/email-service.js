@@ -406,40 +406,32 @@ async function sendVerificationEmail(options) {
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Poppins', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f4f7f6; }
-        .container { background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1); }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 40px 30px; text-align: center; }
-        .success-badge { background: rgba(255, 255, 255, 0.2); display: inline-block; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: 500; margin-bottom: 15px; }
+        .container { background: white; overflow: hidden; }
+        .header { background-color: #667eea; color: white; padding: 40px 30px; text-align: center; }
+        .success-badge { background-color: #8b9cf7; display: inline-block; padding: 8px 16px; font-size: 14px; font-weight: 500; margin-bottom: 15px; }
         .header h1 { margin: 0; font-size: 28px; font-weight: 600; }
-        .header p { margin: 15px 0 0 0; opacity: 0.9; font-size: 16px; }
+        .header p { margin: 15px 0 0 0; color: #e6e9ff; font-size: 16px; }
         .content { padding: 40px 30px; }
         .welcome-section { text-align: center; margin-bottom: 35px; }
         .welcome-section h2 { color: #1f2937; margin: 0 0 15px 0; font-size: 24px; }
         .welcome-section p { color: #4b5563; font-size: 16px; margin: 0; }
         .steps-container { margin: 30px 0; }
-        .step { display: flex; align-items: flex-start; margin: 25px 0; padding: 20px; background: #f8fafc; border-radius: 12px; border-left: 4px solid #667eea; }
-        .step-number { background: #667eea; color: white; width: 35px; height: 35px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 600; margin-right: 15px; flex-shrink: 0; font-size: 16px; }
-        .step-content h3 { margin: 0 0 8px 0; color: #1f2937; font-size: 18px; font-weight: 600; }
-        .step-content p { margin: 0; color: #4b5563; font-size: 15px; }
-        .verification-box { background: #f0f9ff; border: 2px solid #3b82f6; border-radius: 12px; padding: 25px; text-align: center; margin: 30px 0; }
+        .step { margin: 25px 0; }
+        .step-number { background-color: #667eea; color: white; width: 35px; height: 35px; text-align: center; line-height: 35px; font-weight: 600; font-size: 16px; }
+        .step-title { margin: 0 0 8px 0; color: #1f2937; font-size: 18px; font-weight: 600; }
+        .step-text { margin: 0; color: #4b5563; font-size: 15px; }
+        .verification-box { background: #f0f9ff; border: 2px solid #3b82f6; padding: 25px; text-align: center; margin: 30px 0; }
         .verification-box h3 { color: #1e40af; margin: 0 0 15px 0; font-size: 20px; }
-        .button { display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: 600; margin: 15px 0; font-size: 16px; }
+        .button { display: inline-block; background: #667eea; color: white; padding: 15px 30px; text-decoration: none; font-weight: 600; margin: 15px 0; font-size: 16px; }
         .button:hover { opacity: 0.9; }
-        .features-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin: 25px 0; }
-        .feature { background: #f0f9ff; padding: 15px; border-radius: 8px; text-align: center; }
+        .feature { background-color: #f0f9ff; padding: 15px; text-align: center; width: 100%; }
         .feature-icon { font-size: 24px; margin-bottom: 8px; }
         .feature-text { font-size: 14px; font-weight: 500; color: #1e40af; }
-        .warning-box { background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 15px; margin: 25px 0; text-align: center; }
+        .warning-box { background: #fef3c7; border: 1px solid #f59e0b; padding: 15px; margin: 25px 0; text-align: center; }
         .warning-box p { margin: 0; color: #92400e; font-size: 14px; }
         .footer { background: #f4f7f6; padding: 25px; text-align: center; font-size: 12px; color: #777; border-top: 1px solid #e5e7eb; }
         .logo { width: 28px; height: 28px; vertical-align: middle; margin-right: 10px; }
-        .divider { height: 1px; background: linear-gradient(to right, transparent, #e5e7eb, transparent); margin: 30px 0; }
-        @media (max-width: 600px) {
-            .features-grid { grid-template-columns: 1fr; }
-            .step { flex-direction: column; text-align: center; }
-            .step-number { margin: 0 auto 15px auto; }
-            .header { padding: 30px 20px; }
-            .content { padding: 30px 20px; }
-        }
+        .divider { height: 1px; background-color: #e5e7eb; margin: 30px 0; }
     </style>
 </head>
 <body>
@@ -457,29 +449,41 @@ async function sendVerificationEmail(options) {
             </div>
             
             <div class="steps-container">
-                <div class="step">
-                    <div class="step-number">1</div>
-                    <div class="step-content">
-                        <h3>📧 Verify Your Email</h3>
-                        <p>Click the verification button below to confirm your email address and secure your account.</p>
-                    </div>
-                </div>
+                <table width="100%" cellpadding="0" cellspacing="0" class="step">
+                    <tr>
+                        <td width="50" style="padding: 20px 15px 20px 20px; background-color: #f8fafc; border-left: 4px solid #667eea;">
+                            <div class="step-number">1</div>
+                        </td>
+                        <td style="padding: 20px; background-color: #f8fafc;">
+                            <h3 class="step-title">📧 Verify Your Email</h3>
+                            <p class="step-text">Click the button to confirm and activate your account.</p>
+                        </td>
+                    </tr>
+                </table>
                 
-                <div class="step">
-                    <div class="step-number">2</div>
-                    <div class="step-content">
-                        <h3>🔐 Sign In to Your Account</h3>
-                        <p>After verification, sign in with your credentials to access your personalized dashboard.</p>
-                    </div>
-                </div>
+                <table width="100%" cellpadding="0" cellspacing="0" class="step">
+                    <tr>
+                        <td width="50" style="padding: 20px 15px 20px 20px; background-color: #f8fafc; border-left: 4px solid #667eea;">
+                            <div class="step-number">2</div>
+                        </td>
+                        <td style="padding: 20px; background-color: #f8fafc;">
+                            <h3 class="step-title">🔐 Sign In</h3>
+                            <p class="step-text">Log in to access your dashboard.</p>
+                        </td>
+                    </tr>
+                </table>
                 
-                <div class="step">
-                    <div class="step-number">3</div>
-                    <div class="step-content">
-                        <h3>🤖 Create Your First Bot</h3>
-                        <p>Start by creating a meeting bot for your next Google Meet session and experience the magic!</p>
-                    </div>
-                </div>
+                <table width="100%" cellpadding="0" cellspacing="0" class="step">
+                    <tr>
+                        <td width="50" style="padding: 20px 15px 20px 20px; background-color: #f8fafc; border-left: 4px solid #667eea;">
+                            <div class="step-number">3</div>
+                        </td>
+                        <td style="padding: 20px; background-color: #f8fafc;">
+                            <h3 class="step-title">🤖 Create Your First Bot</h3>
+                            <p class="step-text">Build your bot for your next Google Meet.</p>
+                        </td>
+                    </tr>
+                </table>
             </div>
             
             <div class="verification-box">
@@ -495,24 +499,36 @@ async function sendVerificationEmail(options) {
             <div class="divider"></div>
             
             <h3 style="text-align: center; color: #1f2937; margin-bottom: 20px;">What You'll Get Access To:</h3>
-            <div class="features-grid">
-                <div class="feature">
-                    <div class="feature-icon">🤖</div>
-                    <div class="feature-text">Smart Meeting Bots</div>
-                </div>
-                <div class="feature">
-                    <div class="feature-icon">📊</div>
-                    <div class="feature-text">AI-Powered Summaries</div>
-                </div>
-                <div class="feature">
-                    <div class="feature-icon">📝</div>
-                    <div class="feature-text">Real-time Transcripts</div>
-                </div>
-                <div class="feature">
-                    <div class="feature-icon">📧</div>
-                    <div class="feature-text">Email Sharing</div>
-                </div>
-            </div>
+            <table width="100%" cellpadding="0" cellspacing="0" style="margin: 25px 0;">
+                <tr>
+                    <td width="50%" style="padding: 5px;">
+                        <div class="feature">
+                            <div class="feature-icon">🤖</div>
+                            <div class="feature-text">Smart Meeting Bots</div>
+                        </div>
+                    </td>
+                    <td width="50%" style="padding: 5px;">
+                        <div class="feature">
+                            <div class="feature-icon">📊</div>
+                            <div class="feature-text">AI-Powered Summaries</div>
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td width="50%" style="padding: 5px;">
+                        <div class="feature">
+                            <div class="feature-icon">📝</div>
+                            <div class="feature-text">Real-time Transcripts</div>
+                        </div>
+                    </td>
+                    <td width="50%" style="padding: 5px;">
+                        <div class="feature">
+                            <div class="feature-icon">📧</div>
+                            <div class="feature-text">Email Sharing</div>
+                        </div>
+                    </td>
+                </tr>
+            </table>
             
             <div class="warning-box">
                 <p>
@@ -601,8 +617,8 @@ async function sendPasswordResetEmail(email, resetToken, baseUrl = 'http://local
             font-family: 'Poppins', Arial, sans-serif;
             line-height: 1.6;
             color: #333;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 40px 20px;
+            background-color: #f4f7f6;
+            padding: 20px;
         }
         
         .email-container {
@@ -621,18 +637,24 @@ async function sendPasswordResetEmail(email, resetToken, baseUrl = 'http://local
             color: white;
         }
         
+        .logo-container {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        
         .logo {
             width: 80px;
             height: 80px;
             background: white;
             border-radius: 50%;
-            margin: 0 auto 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            margin: 0 auto;
+            display: inline-block;
+            text-align: center;
+            line-height: 80px;
             font-size: 32px;
             font-weight: 700;
             color: #667eea;
+            vertical-align: middle;
         }
         
         .email-header h1 {
@@ -743,7 +765,9 @@ async function sendPasswordResetEmail(email, resetToken, baseUrl = 'http://local
 <body>
     <div class="email-container">
         <div class="email-header">
-            <div class="logo">CX</div>
+            <div class="logo-container">
+                <div class="logo">CX</div>
+            </div>
             <h1>Reset Your Password</h1>
             <p>We received a request to reset your password</p>
         </div>

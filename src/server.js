@@ -569,7 +569,7 @@ app.post('/api/share-via-email', async (req, res) => {
             const token = authHeader.split(' ')[1];
             try {
                 const decoded = jwt.verify(token, JWT_SECRET);
-                req.user = { id: decoded.id };
+                req.user = { id: decoded.userId };
             } catch (error) {
                 return res.status(401).json({ error: 'Invalid or expired token' });
             }
@@ -1037,6 +1037,103 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 }
             }
 
+             // Generate summary from transcript
+             try {
+                console.log(`📝 Bot ${botId}: generating meeting summary...`);
+                await generateAndSaveSummary(botId, RUNTIME_ROOT);
+                console.log(`✅ Bot ${botId}: summary generated successfully`);
+            } catch (e) {
+                console.error(`❌ Error generating summary for bot ${botId}:`, e && e.message ? e.message : e);
+            }
+
+            // Update metadata and database with meeting title from extension (if available)
+
+            try {
+                const botInstance = botData?.bot;
+                if (botInstance && botInstance.meetingTitle && botInstance.meetingTitle.trim()) {
+                    const meetingTitle = botInstance.meetingTitle.trim();
+                    
+                    // Update metadata file
+                    const botDir = path.join(RUNTIME_ROOT, botId);
+                    const metadataPath = path.join(botDir, 'bot_metadata.json');
+                    
+                    if (await fs.pathExists(metadataPath)) {
+                        const metadata = await fs.readJson(metadataPath);
+                        metadata.title = meetingTitle;
+                        await fs.writeJson(metadataPath, metadata);
+                        console.log(`📝 Bot ${botId}: updated metadata with meeting title: ${meetingTitle}`);
+                    }
+                    
+                    // Update database title
+                    try {
+                        botOps.update(botId, { title: meetingTitle });
+                        console.log(`📝 Bot ${botId}: updated database title to: ${meetingTitle}`);
+                    } catch (dbError) {
+                        console.warn(`⚠️  Could not update database title for ${botId}:`, dbError.message);
+                    }
+                }
+            } catch (e) {
+                console.warn(`⚠️  Could not update meeting title for ${botId}:`, e.message);
+            }
+
+            // Send email summary to bot creator (after summary is generated)
+            try {
+                // Get bot from database to find the user who created it
+                const bot = botOps.findById(botId);
+                if (bot && bot.user_id) {
+                    // Get user email
+                    const user = userOps.findById(bot.user_id);
+                    if (user && user.email && user.email_verified) {
+                        const { sendMeetingSummaryEmail } = require('./utils/email-service');
+                        console.log(`📧 Bot ${botId}: sending meeting summary email to bot creator: ${user.email}...`);
+                        
+                        const emailResult = await sendMeetingSummaryEmail({
+                            botId: botId,
+                            meetUrl: bot.meet_url,
+                            recipients: user.email,
+                            runtimeRoot: RUNTIME_ROOT
+                        });
+                        
+                        if (emailResult.success) {
+                            console.log(`✅ Bot ${botId}: summary email sent successfully to ${user.email} (${emailResult.attachments} attachments)`);
+                        } else {
+                            console.log(`⚠️ Bot ${botId}: email sending failed - ${emailResult.message || emailResult.error}`);
+                        }
+                    } else if (user && !user.email_verified) {
+                        console.log(`⚠️ Bot ${botId}: user email not verified, skipping summary email`);
+                    } else {
+                        console.log(`⚠️ Bot ${botId}: user not found or no email, skipping summary email`);
+                    }
+                } else {
+                    console.log(`⚠️ Bot ${botId}: bot not found in database, skipping summary email`);
+                }
+            } catch (e) {
+                console.error(`❌ Error sending summary email for bot ${botId}:`, e && e.message ? e.message : e);
+            }
+
+             // Also send to additional recipients if configured (legacy functionality)
+             if (botData && botData.emailRecipients) {
+                try {
+                    const { sendMeetingSummaryEmail } = require('./utils/email-service');
+                    console.log(`📧 Bot ${botId}: sending meeting summary email to additional recipients: ${botData.emailRecipients}...`);
+                    
+                    const emailResult = await sendMeetingSummaryEmail({
+                        botId: botId,
+                        meetUrl: botData.meetingUrl,
+                        recipients: botData.emailRecipients,
+                        runtimeRoot: RUNTIME_ROOT
+                    });
+                    
+                    if (emailResult.success) {
+                        console.log(`✅ Bot ${botId}: additional email sent successfully (${emailResult.attachments} attachments)`);
+                    } else {
+                        console.log(`⚠️ Bot ${botId}: additional email sending failed - ${emailResult.message || emailResult.error}`);
+                    }
+                } catch (e) {
+                    console.error(`❌ Error sending additional email for bot ${botId}:`, e && e.message ? e.message : e);
+                }
+            }
+
             // If a recording file exists, compress and extract audio
             try {
                 const botInstance = botData?.bot;
@@ -1045,11 +1142,16 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                     const recordingFile = stats.recordingFile || stats.recordingPath;
                     if (recordingFile && fs.existsSync(recordingFile)) {
                         // Compress video to reduce file size (enabled by default for optimization)
-                        // Can be disabled by setting ENABLE_VIDEO_COMPRESSION=false
+                        // Can be disabled by setting ENABLE_VIDEO_COMPRESSION=false for maximum speed
                         const enableCompression = process.env.ENABLE_VIDEO_COMPRESSION !== 'false';
-                        if (enableCompression) {
+                        
+                        // Fast mode: skip compression for files under 100MB for maximum speed
+                        const fastMode = process.env.FAST_VIDEO_MODE === 'true';
+                        const stats = fs.statSync(recordingFile);
+                        const sizeMB = stats.size / 1024 / 1024;
+                        if (enableCompression && !(fastMode && sizeMB < 50)) {
                             try {
-                                console.log(`🗜️  Bot ${botId}: compressing video...`);
+                                console.log(`🗜️  Bot ${botId}: compressing video (${sizeMB.toFixed(1)} MB)...`);
                                 const { compressVideoInPlace, getCompressionRecommendations } = require('./utils/video-compression');
                                 
                                 // Get compression recommendations
@@ -1125,102 +1227,6 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 }
             } catch (e) {
                 console.error(`❌ Error processing recording for bot ${botId}:`, e && e.message ? e.message : e);
-            }
-
-            // Update metadata and database with meeting title from extension (if available)
-            try {
-                const botInstance = botData?.bot;
-                if (botInstance && botInstance.meetingTitle && botInstance.meetingTitle.trim()) {
-                    const meetingTitle = botInstance.meetingTitle.trim();
-                    
-                    // Update metadata file
-                    const botDir = path.join(RUNTIME_ROOT, botId);
-                    const metadataPath = path.join(botDir, 'bot_metadata.json');
-                    
-                    if (await fs.pathExists(metadataPath)) {
-                        const metadata = await fs.readJson(metadataPath);
-                        metadata.title = meetingTitle;
-                        await fs.writeJson(metadataPath, metadata);
-                        console.log(`📝 Bot ${botId}: updated metadata with meeting title: ${meetingTitle}`);
-                    }
-                    
-                    // Update database title
-                    try {
-                        botOps.update(botId, { title: meetingTitle });
-                        console.log(`📝 Bot ${botId}: updated database title to: ${meetingTitle}`);
-                    } catch (dbError) {
-                        console.warn(`⚠️  Could not update database title for ${botId}:`, dbError.message);
-                    }
-                }
-            } catch (e) {
-                console.warn(`⚠️  Could not update meeting title for ${botId}:`, e.message);
-            }
-
-            // Generate summary from transcript
-            try {
-                console.log(`📝 Bot ${botId}: generating meeting summary...`);
-                await generateAndSaveSummary(botId, RUNTIME_ROOT);
-                console.log(`✅ Bot ${botId}: summary generated successfully`);
-            } catch (e) {
-                console.error(`❌ Error generating summary for bot ${botId}:`, e && e.message ? e.message : e);
-            }
-
-            // Send email summary to bot creator (after summary is generated)
-            try {
-                // Get bot from database to find the user who created it
-                const bot = botOps.findById(botId);
-                if (bot && bot.user_id) {
-                    // Get user email
-                    const user = userOps.findById(bot.user_id);
-                    if (user && user.email && user.email_verified) {
-                        const { sendMeetingSummaryEmail } = require('./utils/email-service');
-                        console.log(`📧 Bot ${botId}: sending meeting summary email to bot creator: ${user.email}...`);
-                        
-                        const emailResult = await sendMeetingSummaryEmail({
-                            botId: botId,
-                            meetUrl: bot.meet_url,
-                            recipients: user.email,
-                            runtimeRoot: RUNTIME_ROOT
-                        });
-                        
-                        if (emailResult.success) {
-                            console.log(`✅ Bot ${botId}: summary email sent successfully to ${user.email} (${emailResult.attachments} attachments)`);
-                        } else {
-                            console.log(`⚠️ Bot ${botId}: email sending failed - ${emailResult.message || emailResult.error}`);
-                        }
-                    } else if (user && !user.email_verified) {
-                        console.log(`⚠️ Bot ${botId}: user email not verified, skipping summary email`);
-                    } else {
-                        console.log(`⚠️ Bot ${botId}: user not found or no email, skipping summary email`);
-                    }
-                } else {
-                    console.log(`⚠️ Bot ${botId}: bot not found in database, skipping summary email`);
-                }
-            } catch (e) {
-                console.error(`❌ Error sending summary email for bot ${botId}:`, e && e.message ? e.message : e);
-            }
-
-            // Also send to additional recipients if configured (legacy functionality)
-            if (botData && botData.emailRecipients) {
-                try {
-                    const { sendMeetingSummaryEmail } = require('./utils/email-service');
-                    console.log(`📧 Bot ${botId}: sending meeting summary email to additional recipients: ${botData.emailRecipients}...`);
-                    
-                    const emailResult = await sendMeetingSummaryEmail({
-                        botId: botId,
-                        meetUrl: botData.meetingUrl,
-                        recipients: botData.emailRecipients,
-                        runtimeRoot: RUNTIME_ROOT
-                    });
-                    
-                    if (emailResult.success) {
-                        console.log(`✅ Bot ${botId}: additional email sent successfully (${emailResult.attachments} attachments)`);
-                    } else {
-                        console.log(`⚠️ Bot ${botId}: additional email sending failed - ${emailResult.message || emailResult.error}`);
-                    }
-                } catch (e) {
-                    console.error(`❌ Error sending additional email for bot ${botId}:`, e && e.message ? e.message : e);
-                }
             }
 
             // Remove bot instance to free memory and cleanup references

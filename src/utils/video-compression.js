@@ -21,9 +21,9 @@ async function compressVideo(inputPath, outputPath, options = {}) {
     const {
         videoBitrate = null,          // If null, use CRF mode (better quality at same size)
         audioBitrate = '64k',         // Lower audio bitrate (voice doesn't need much)
-        preset = 'medium',            // Encoding speed vs compression (ultrafast, fast, medium, slow, veryslow)
-        crf = 30,                     // Constant Rate Factor (18-31, higher = smaller file, VP9: 30-32 is good)
-        codec = 'libvpx-vp9',         // VP9 codec for WebM (best compression)
+        preset = 'ultrafast',         // Encoding speed vs compression (ultrafast for maximum speed)
+        crf = 35,                     // Constant Rate Factor (higher = faster encoding, still acceptable quality)
+        codec = 'libx264',            // H.264 codec (much faster than VP9)
         twoPass = false,              // Two-pass encoding for better quality
         removeOriginal = false        // Remove original file after compression
     } = options;
@@ -60,17 +60,15 @@ async function compressVideo(inputPath, outputPath, options = {}) {
             args.push('-crf', String(crf), '-b:v', '0');
         }
         
-        // Add remaining options
+        // Add remaining options optimized for speed
         args.push(
-            '-c:a', 'libopus',        // Opus for better audio compression
+            '-c:a', 'aac',            // AAC audio (faster than Opus)
             '-b:a', audioBitrate,
-            '-cpu-used', '1',          // VP9 encoder speed (0-5, lower = better quality, 1 is good balance)
-            '-row-mt', '1',            // Enable row-based multithreading
-            '-threads', '0',           // Use all available threads (0 = auto)
-            '-deadline', 'good',       // Quality/speed trade-off (good = balance)
-            '-auto-alt-ref', '1',      // Enable automatic alternate reference frames (better compression)
-            '-lag-in-frames', '16',    // Look-ahead frames for better compression
-            '-y',                      // Overwrite output
+            '-preset', 'ultrafast',   // H.264 ultrafast preset for maximum speed
+            '-tune', 'zerolatency',   // Optimize for speed over compression
+            '-threads', '0',          // Use all available threads (0 = auto)
+            '-movflags', '+faststart', // Enable fast start for web playback
+            '-y',                     // Overwrite output
             outputPath
         );
 
@@ -251,46 +249,50 @@ async function getCompressionRecommendations(filePath) {
         const info = await getVideoInfo(filePath);
         const durationMinutes = info.duration ? (info.duration / 60) : 0;
 
-        // Use CRF mode (quality-based) for better compression
+        // Use fast compression settings optimized for speed
         if (sizeMB > 100) {
-            // Large file - aggressive compression with CRF
+            // Large file - fast compression with higher CRF
             recommendations.shouldCompress = true;
-            recommendations.reason = `Large file size (${sizeMB.toFixed(1)} MB) - aggressive compression recommended`;
+            recommendations.reason = `Large file size (${sizeMB.toFixed(1)} MB) - fast compression recommended`;
             recommendations.settings = {
                 videoBitrate: null,  // Use CRF mode
-                crf: 32,             // Higher CRF = smaller file (still good quality for VP9)
-                preset: 'medium',
-                audioBitrate: '64k'
+                crf: 38,             // Higher CRF = much faster encoding
+                preset: 'ultrafast',
+                audioBitrate: '64k',
+                codec: 'libx264'     // H.264 for speed
             };
         } else if (sizeMB > 50) {
-            // Medium file - moderate compression with CRF
+            // Medium file - moderate fast compression
             recommendations.shouldCompress = true;
-            recommendations.reason = `Medium file size (${sizeMB.toFixed(1)} MB) - moderate compression recommended`;
+            recommendations.reason = `Medium file size (${sizeMB.toFixed(1)} MB) - fast compression recommended`;
             recommendations.settings = {
                 videoBitrate: null,  // Use CRF mode
-                crf: 30,             // Good balance for VP9
-                preset: 'medium',
-                audioBitrate: '64k'
+                crf: 35,             // Fast encoding with acceptable quality
+                preset: 'ultrafast',
+                audioBitrate: '64k',
+                codec: 'libx264'     // H.264 for speed
             };
         } else if (durationMinutes > 30 && sizeMB > 30) {
             // Long duration - light compression with CRF
             recommendations.shouldCompress = true;
-            recommendations.reason = `Long meeting (${durationMinutes.toFixed(1)} min) - light compression recommended`;
+            recommendations.reason = `Long meeting (${durationMinutes.toFixed(1)} min) - fast compression recommended`;
             recommendations.settings = {
                 videoBitrate: null,  // Use CRF mode
-                crf: 28,             // Lower CRF = better quality
-                preset: 'fast',
-                audioBitrate: '64k'
+                crf: 33,             // Fast encoding
+                preset: 'ultrafast',
+                audioBitrate: '64k',
+                codec: 'libx264'     // H.264 for speed
             };
         } else if (sizeMB > 20) {
             // Small but could be optimized
             recommendations.shouldCompress = true;
-            recommendations.reason = `File size (${sizeMB.toFixed(1)} MB) - light optimization recommended`;
+            recommendations.reason = `File size (${sizeMB.toFixed(1)} MB) - fast optimization recommended`;
             recommendations.settings = {
                 videoBitrate: null,  // Use CRF mode
-                crf: 28,
-                preset: 'fast',
-                audioBitrate: '64k'
+                crf: 32,             // Fast encoding
+                preset: 'ultrafast',
+                audioBitrate: '64k',
+                codec: 'libx264'     // H.264 for speed
             };
         } else {
             recommendations.reason = `File size acceptable (${sizeMB.toFixed(1)} MB)`;
