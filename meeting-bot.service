@@ -1,0 +1,60 @@
+# ============================================
+# Systemd Service File for CXFlow Meeting Bot
+# ============================================
+# This is an alternative to PM2 for running the application as a system service
+#
+# Installation:
+#   1. sudo cp meeting-bot.service /etc/systemd/system/
+#   2. Edit the file and replace USER and /path/to with your actual values
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable meeting-bot
+#   5. sudo systemctl start meeting-bot
+#
+# Commands:
+#   sudo systemctl status meeting-bot   - Check status
+#   sudo systemctl start meeting-bot    - Start service
+#   sudo systemctl stop meeting-bot     - Stop service
+#   sudo systemctl restart meeting-bot  - Restart service
+#   sudo journalctl -u meeting-bot -f   - View logs
+
+[Unit]
+Description=CXFlow Meeting Bot - Google Meet Recording Service
+Documentation=https://github.com/yourusername/g-meet-node
+After=network.target xvfb.service
+Wants=xvfb.service
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/g-meet-bot
+Environment="NODE_ENV=production"
+Environment="PATH=/usr/bin:/usr/local/bin"
+Environment="DISPLAY=:99"
+
+# Main process - use existing Xvfb service on :99
+ExecStart=/usr/bin/node /home/ec2-user/g-meet-bot/src/server.js
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Resource limits (adjust based on your instance size)
+LimitNOFILE=65536
+MemoryLimit=2G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meeting-bot
+
+# Security hardening (optional, uncomment if needed)
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=strict
+# ProtectHome=read-only
+# ReadWritePaths=/home/ec2-user/g-meet-bot/runtime
+# ReadWritePaths=/home/ec2-user/g-meet-bot/database.sqlite
+
+[Install]
+WantedBy=multi-user.target

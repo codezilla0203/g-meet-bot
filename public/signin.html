@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign In - CXFlow Meeting Bot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        [data-typography="poppins"] {
+            font-family: 'Poppins', sans-serif;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .auth-container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            width: 100%;
+            max-width: 420px;
+            padding: 40px;
+            animation: slideUp 0.4s ease-out;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .logo {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .logo-icon {
+            font-size: 48px;
+            margin-bottom: 8px;
+        }
+
+        .logo h1 {
+            font-size: 28px;
+            color: #1a202c;
+            margin-bottom: 8px;
+        }
+
+        .logo p {
+            color: #718096;
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #4a5568;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 15px;
+            font-family: 'Poppins', sans-serif;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+
+        .form-group input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .form-group input::placeholder {
+            color: #cbd5e0;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            font-family: 'Poppins', sans-serif;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 8px;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Hidden class for forms */
+        .hidden {
+            display: none !important;
+        }
+
+        /* Forgot password container transitions */
+        #forgotPasswordContainer {
+            transform: translateY(20px);
+            opacity: 0;
+            transition: all 0.3s ease;
+        }
+
+        #forgotPasswordContainer:not(.hidden) {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        /* Verification Prompt Styles */
+        .verification-prompt {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            box-sizing: border-box;
+            z-index: 1000;
+            animation: fadeIn 0.4s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .verification-content {
+            background: white;
+            border-radius: 20px;
+            padding: 50px 40px 40px;
+            text-align: center;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 25px 80px rgba(0, 0, 0, 0.3);
+            animation: slideInUp 0.5s ease-out;
+            position: relative;
+        }
+
+        @keyframes slideInUp {
+            from {
+                transform: translateY(50px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .verification-icon {
+            width: 100px;
+            height: 100px;
+            margin: 0 auto 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            box-shadow: 0 15px 40px rgba(102, 126, 234, 0.4);
+            position: relative;
+        }
+
+        .verification-icon::before {
+            content: '';
+            position: absolute;
+            width: 120px;
+            height: 120px;
+            border: 2px solid rgba(102, 126, 234, 0.2);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            100% { transform: scale(1.1); opacity: 0; }
+        }
+
+        .verification-content h3 {
+            margin: 0 0 20px 0;
+            font-size: 28px;
+            font-weight: 700;
+            color: #1e293b;
+            font-family: 'Poppins', sans-serif;
+        }
+
+        .verification-content p {
+            margin: 0 0 15px 0;
+            color: #64748b;
+            font-size: 16px;
+            line-height: 1.6;
+        }
+
+        .email-display {
+            background: #f1f5f9;
+            color: #667eea !important;
+            font-weight: 600 !important;
+            padding: 12px 20px;
+            border-radius: 12px;
+            font-size: 16px !important;
+            margin: 20px 0 !important;
+            border: 2px solid #e2e8f0;
+        }
+
+        .help-text {
+            font-size: 15px !important;
+            color: #94a3b8 !important;
+            margin: 25px 0 30px 0 !important;
+            line-height: 1.5;
+        }
+
+        .verification-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            margin: 30px 0 25px 0;
+        }
+
+        .btn-resend {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 16px 32px;
+            border-radius: 14px;
+            font-size: 16px;
+            font-weight: 600;
+            font-family: 'Poppins', sans-serif;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn-resend:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 15px 35px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-resend:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-back {
+            background: transparent;
+            color: #64748b;
+            border: 2px solid #e2e8f0;
+            padding: 14px 32px;
+            border-radius: 14px;
+            font-size: 15px;
+            font-weight: 500;
+            font-family: 'Poppins', sans-serif;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .btn-back:hover {
+            background: #f8fafc;
+            border-color: #cbd5e1;
+            color: #475569;
+            transform: translateY(-1px);
+        }
+
+        .verification-tips {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 25px;
+            text-align: left;
+        }
+
+        .verification-tips h4 {
+            margin: 0 0 12px 0;
+            font-size: 16px;
+            font-weight: 600;
+            color: #374151;
+            font-family: 'Poppins', sans-serif;
+        }
+
+        .verification-tips ul {
+            margin: 0;
+            padding-left: 20px;
+            color: #64748b;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+
+        .verification-tips li {
+            margin-bottom: 6px;
+        }
+
+        .spinning {
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            .verification-prompt {
+                padding: 15px;
+            }
+            
+            .verification-content {
+                padding: 40px 30px 30px;
+                border-radius: 16px;
+            }
+            
+            .verification-icon {
+                width: 80px;
+                height: 80px;
+                margin-bottom: 25px;
+            }
+            
+            .verification-icon::before {
+                width: 100px;
+                height: 100px;
+            }
+            
+            .verification-content h3 {
+                font-size: 24px;
+            }
+            
+            .verification-content p {
+                font-size: 15px;
+            }
+            
+            .email-display {
+                font-size: 15px !important;
+                padding: 10px 16px;
+            }
+            
+            .btn-resend, .btn-back {
+                padding: 14px 24px;
+                font-size: 15px;
+            }
+            
+            .verification-tips {
+                padding: 16px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .verification-prompt {
+                padding: 10px;
+            }
+            
+            .verification-content {
+                padding: 30px 20px 25px;
+            }
+            
+            .verification-icon {
+                width: 70px;
+                height: 70px;
+            }
+            
+            .verification-content h3 {
+                font-size: 22px;
+            }
+            
+            .verification-actions {
+                gap: 12px;
+            }
+            
+            .btn-resend, .btn-back {
+                padding: 12px 20px;
+                font-size: 14px;
+            }
+        }
+
+        .divider {
+            text-align: center;
+            margin: 24px 0;
+            position: relative;
+        }
+
+        .divider::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: #e2e8f0;
+        }
+
+        .divider span {
+            background: white;
+            padding: 0 16px;
+            color: #a0aec0;
+            font-size: 14px;
+            position: relative;
+        }
+
+        .auth-links {
+            text-align: center;
+            margin: 20px 0 10px 0;
+        }
+
+        .forgot-password-link {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+
+        .forgot-password-link:hover {
+            color: #5a67d8;
+            text-decoration: underline;
+        }
+
+        .back-link {
+            color: #64748b;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.3s ease;
+        }
+
+        .back-link:hover {
+            color: #475569;
+            transform: translateX(-2px);
+        }
+
+        .switch-auth {
+            text-align: center;
+            margin-top: 24px;
+            color: #718096;
+            font-size: 14px;
+        }
+
+        .switch-auth a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .switch-auth a:hover {
+            text-decoration: underline;
+        }
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            display: none;
+        }
+
+        .alert.show {
+            display: block;
+            animation: slideDown 0.3s ease-out;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .alert-error {
+            background: #fed7d7;
+            color: #c53030;
+            border: 1px solid #fc8181;
+        }
+
+        .alert-success {
+            background: #c6f6d5;
+            color: #276749;
+            border: 1px solid #9ae6b4;
+        }
+
+        .password-toggle {
+            position: relative;
+        }
+
+        .password-toggle-btn {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            color: #a0aec0;
+            cursor: pointer;
+            padding: 4px;
+            font-size: 18px;
+        }
+
+        .password-toggle-btn:hover {
+            color: #667eea;
+        }
+    </style>
+</head>
+<body data-typography="poppins">
+    <div class="auth-container">
+        <div class="logo">
+            <div class="logo-icon">
+                <img src="https://www.cxflow.io/app/images/logo.png" alt="CXFlow Logo" style="width: 40px; height: 40px;">
+            </div>
+            <h1>Welcome Back</h1>
+            <p>Sign in to continue to CXFlow Meeting Bot</p>
+        </div>
+
+        <div id="alertBox" class="alert"></div>
+
+        <form id="signinForm">
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="text" id="email" name="email" placeholder="you@example.com" autocomplete="email">
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <div class="password-toggle">
+                    <input type="password" id="password" name="password" placeholder="Enter your password" autocomplete="current-password">
+                    <button type="button" class="password-toggle-btn" id="togglePassword">👁️</button>
+                </div>
+            </div>
+
+            <button type="submit" class="btn" id="submitBtn">Sign In</button>
+        </form>
+
+        <div class="auth-links">
+            <a href="#" id="forgotPasswordLink" class="forgot-password-link">Forgot your password?</a>
+        </div>
+
+        <div class="switch-auth">
+            Don't have an account? <a href="signup.html">Sign up</a>
+        </div>
+    </div>
+
+    <!-- Forgot Password Form -->
+    <div id="forgotPasswordContainer" class="auth-container hidden">
+        <div class="auth-header">
+            <h2>Reset Password</h2>
+            <p>Enter your email address and we'll send you a link to reset your password.</p>
+        </div>
+        
+        <form id="forgotPasswordForm">
+            <div class="form-group">
+                <label for="resetEmail">Email Address</label>
+                <input type="email" id="resetEmail" name="email" required placeholder="Enter your email address">
+            </div>
+            
+            <button type="submit" class="btn" id="resetSubmitBtn">Send Reset Link</button>
+        </form>
+        
+        <div class="auth-links">
+            <a href="#" id="backToSigninLink" class="back-link">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="m12 19-7-7 7-7"></path>
+                    <path d="M19 12H5"></path>
+                </svg>
+                Back to Sign In
+            </a>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('signinForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const alertBox = document.getElementById('alertBox');
+        const togglePassword = document.getElementById('togglePassword');
+        const passwordInput = document.getElementById('password');
+        const emailInput = document.getElementById('email');
+
+        // Password toggle
+        togglePassword.addEventListener('click', () => {
+            const type = passwordInput.type === 'password' ? 'text' : 'password';
+            passwordInput.type = type;
+            togglePassword.textContent = type === 'password' ? '👁️' : '🙈';
+        });
+
+        function showAlert(message, type = 'error') {
+            alertBox.textContent = message;
+            alertBox.className = `alert alert-${type} show`;
+            setTimeout(() => {
+                alertBox.classList.remove('show');
+            }, 5000);
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const email = document.getElementById('email').value.trim();
+            const password = document.getElementById('password').value;
+
+            if (!email || !password) {
+                showAlert('Please fill in all fields');
+                return;
+            }
+
+            // Additional email format validation
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                showAlert('Please enter a valid email address (e.g., user@example.com)');
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Signing in...';
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+
+                let data;
+                try {
+                    data = await response.json();
+                } catch (e) {
+                    data = { error: 'Server error - invalid response format' };
+                }
+
+                if (response.ok && data.token) {
+                    localStorage.setItem('token', data.token);
+                    localStorage.setItem('userEmail', email);
+                    showAlert('Sign in successful! Redirecting...', 'success');
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 1000);
+                } else {
+                    // Show error message from server
+                    const errorMessage = data.error || data.message || 'Sign in failed. Please try again.';
+                    showAlert(errorMessage);
+                    
+                    // Show resend verification option if email not verified
+                    if (data.emailNotVerified) {
+                        showResendVerificationOption(email);
+                    }
+                    
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Sign In';
+                }
+            } catch (error) {
+                console.error('Login error:', error);
+                showAlert('Network error. Please check your connection and try again.');
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Sign In';
+            }
+        });
+
+        function showResendVerificationOption(email) {
+            // Hide the signin container
+            const authContainer = document.querySelector('.auth-container');
+            authContainer.style.transform = 'translateY(-20px)';
+            authContainer.style.opacity = '0';
+            
+            setTimeout(() => {
+                authContainer.style.display = 'none';
+                
+                // Remove existing resend container if any
+                const existing = document.getElementById('resendContainer');
+                if (existing) existing.remove();
+                
+                const resendContainer = document.createElement('div');
+                resendContainer.id = 'resendContainer';
+                resendContainer.className = 'verification-prompt';
+                resendContainer.innerHTML = `
+                    <div class="verification-content">
+                        <div class="verification-icon">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path>
+                                <polyline points="22,6 12,13 2,6"></polyline>
+                            </svg>
+                        </div>
+                        <h3>Check Your Email</h3>
+                        <p>We sent a verification link to</p>
+                        <p class="email-display">${email}</p>
+                        <p class="help-text">Click the link in the email to verify your account. Don't forget to check your spam folder!</p>
+                        <div class="verification-actions">
+                            <button id="resendBtn" class="btn-resend">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="23 4 23 10 17 10"></polyline>
+                                    <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                                </svg>
+                                Resend Email
+                            </button>
+                            <button id="backToSigninBtn" class="btn-back">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="m12 19-7-7 7-7"></path>
+                                    <path d="M19 12H5"></path>
+                                </svg>
+                                Back to Sign In
+                            </button>
+                        </div>
+                        <div class="verification-tips">
+                            <h4>💡 Tips:</h4>
+                            <ul>
+                                <li>Check your spam/junk folder</li>
+                                <li>Add our email to your contacts</li>
+                                <li>The link expires in 24 hours</li>
+                            </ul>
+                        </div>
+                    </div>
+                `;
+                
+                // Add to the page
+                document.body.appendChild(resendContainer);
+                
+                // Add click handlers
+                document.getElementById('resendBtn').addEventListener('click', async () => {
+                    const resendBtn = document.getElementById('resendBtn');
+                    const originalHTML = resendBtn.innerHTML;
+                    resendBtn.disabled = true;
+                    resendBtn.innerHTML = `
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spinning">
+                            <path d="M21 12a9 9 0 11-6.219-8.56"></path>
+                        </svg>
+                        Sending...
+                    `;
+                    
+                    try {
+                        const response = await fetch('/api/resend-verification', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ email })
+                        });
+                        
+                        const data = await response.json();
+                        
+                        if (response.ok && data.success) {
+                            showAlert('New verification email sent! Please check your inbox.', 'success');
+                            resendBtn.innerHTML = `
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M20 6L9 17l-5-5"></path>
+                                </svg>
+                                Email Sent!
+                            `;
+                            setTimeout(() => {
+                                resendBtn.disabled = false;
+                                resendBtn.innerHTML = originalHTML;
+                            }, 3000);
+                        } else {
+                            showAlert(data.error || 'Failed to send verification email');
+                            resendBtn.disabled = false;
+                            resendBtn.innerHTML = originalHTML;
+                        }
+                    } catch (error) {
+                        showAlert('Network error. Please try again.');
+                        resendBtn.disabled = false;
+                        resendBtn.innerHTML = originalHTML;
+                    }
+                });
+                
+                document.getElementById('backToSigninBtn').addEventListener('click', () => {
+                    // Hide verification panel
+                    resendContainer.style.transform = 'translateY(20px)';
+                    resendContainer.style.opacity = '0';
+                    
+                    setTimeout(() => {
+                        resendContainer.remove();
+                        // Show signin container again
+                        authContainer.style.display = 'block';
+                        authContainer.style.transform = 'translateY(0)';
+                        authContainer.style.opacity = '1';
+                    }, 300);
+                });
+            }, 300);
+        }
+
+        // Forgot Password functionality
+        const forgotPasswordLink = document.getElementById('forgotPasswordLink');
+        const forgotPasswordContainer = document.getElementById('forgotPasswordContainer');
+        const forgotPasswordForm = document.getElementById('forgotPasswordForm');
+        const backToSigninLink = document.getElementById('backToSigninLink');
+        const resetSubmitBtn = document.getElementById('resetSubmitBtn');
+        const signinContainer = document.querySelector('.auth-container:not(#forgotPasswordContainer)');
+
+        forgotPasswordLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            // Hide signin form
+            signinContainer.style.transform = 'translateY(-20px)';
+            signinContainer.style.opacity = '0';
+            
+            setTimeout(() => {
+                signinContainer.style.display = 'none';
+                forgotPasswordContainer.style.display = 'block';
+                forgotPasswordContainer.classList.remove('hidden');
+                setTimeout(() => {
+                    forgotPasswordContainer.style.transform = 'translateY(0)';
+                    forgotPasswordContainer.style.opacity = '1';
+                }, 50);
+            }, 300);
+        });
+
+        backToSigninLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            // Hide forgot password form
+            forgotPasswordContainer.style.transform = 'translateY(-20px)';
+            forgotPasswordContainer.style.opacity = '0';
+            
+            setTimeout(() => {
+                forgotPasswordContainer.style.display = 'none';
+                forgotPasswordContainer.classList.add('hidden');
+                signinContainer.style.display = 'block';
+                setTimeout(() => {
+                    signinContainer.style.transform = 'translateY(0)';
+                    signinContainer.style.opacity = '1';
+                }, 50);
+            }, 300);
+        });
+
+        forgotPasswordForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const email = document.getElementById('resetEmail').value;
+            const originalHTML = resetSubmitBtn.innerHTML;
+            
+            resetSubmitBtn.disabled = true;
+            resetSubmitBtn.innerHTML = `
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spinning">
+                    <path d="M21 12a9 9 0 11-6.219-8.56"></path>
+                </svg>
+                Sending...
+            `;
+            
+            try {
+                const response = await fetch('/api/forgot-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    showAlert('Password reset link sent! Please check your email.', 'success');
+                    // Clear form
+                    document.getElementById('resetEmail').value = '';
+                    // Go back to signin after success
+                    setTimeout(() => {
+                        backToSigninLink.click();
+                    }, 2000);
+                } else {
+                    showAlert(data.error || 'Failed to send reset link. Please try again.');
+                }
+            } catch (error) {
+                console.error('Forgot password error:', error);
+                showAlert('Network error. Please try again.');
+            } finally {
+                resetSubmitBtn.disabled = false;
+                resetSubmitBtn.innerHTML = originalHTML;
+            }
+        });
+
+        // Check if already logged in
+        if (localStorage.getItem('token')) {
+            window.location.href = '/';
+        }
+    </script>
+</body>
+</html>
+

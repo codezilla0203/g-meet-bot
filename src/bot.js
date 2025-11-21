@@ -6,6 +6,9 @@ const { spawn, execSync, spawnSync } = require('child_process');
 const { WebRTCCapture } = require('./modules/webrtc-capture');
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const { getCurrentTimestamp, formatDate, formatDateLong } = require('./utils/timezone');
+// ADD EXTENSION_PATH constant to point to the built-in Chrome extension.
+const EXTENSION_PATH = path.resolve(__dirname, '..', 'transcript_extension');
 
 puppeteer.use(StealthPlugin());
 
@@ -27,10 +30,14 @@ const GOOGLE_NO_RESPONSE = 'No one responded to your request to join the call';
  * - High-quality recording output
  */
 class Bot {
-    constructor(id, botName = "AI Notetaker", onLeaveCallback = null) {
+    constructor(id, botName = "CXFlow Meeting Bot", onLeaveCallback = null, captionLanguage = "es", emailRecipients = null) {
         this.id = id;
         this.botName = botName;
         this.onLeave = onLeaveCallback;
+        this.captionLanguage = captionLanguage;  // Caption language preference (ISO code)
+        this.emailRecipients = emailRecipients;  // Email addresses to send summary to
+        this.meetUrl = null;  // Will be set when joining meeting
+        this.meetingTitle = null;  // Will be set from extension when available
         
         // Security ID for browser<->node communication
         this.slightlySecretId = crypto.randomBytes(16).toString('hex');
@@ -56,12 +63,13 @@ class Bot {
         this.transcriptsDir = path.join(this.botDir, 'transcripts');
         this.videoDir = path.join(this.botDir, 'video');
         this.speakerTimeframesFile = path.join(this.botDir, 'SpeakerTimeframes.json');
+        this.metricsFile = path.join(this.botDir, 'MeetingMetrics.json');
         this.botsPidDir = path.join(runtimeRoot, 'bots');
         try {
-            fs.ensureDirSync(this.botsPidDir);
             fs.ensureDirSync(this.botDir);
             fs.ensureDirSync(this.transcriptsDir);
             fs.ensureDirSync(this.videoDir);
+            // Don't create botsPidDir here - only create when actually writing PID file
         } catch {}
         // Live captions (Google Meet native captions)
         this.captions = [];
@@ -90,6 +98,25 @@ class Bot {
             'your video',
             'self view'
         ];
+
+        // Meeting metrics tracking
+        this.meetingStartTime = null;
+        this.meetingEndTime = null;
+        this.maxParticipantsSeen = 0; // Track maximum number of participants seen during monitoring
+        this.keywordsList = [
+            // Common meeting keywords - can be customized via environment variable
+            'action item', 'follow up', 'deadline', 'decision', 'agreement',
+            'task', 'assign', 'responsible', 'next steps', 'priority',
+            'budget', 'timeline', 'milestone', 'risk', 'issue', 'blocker'
+        ];
+        // Load custom keywords from environment if provided
+        if (process.env.MEETING_KEYWORDS) {
+            try {
+                this.keywordsList = JSON.parse(process.env.MEETING_KEYWORDS);
+            } catch (e) {
+                console.warn(`[${this.id}] ⚠️ Failed to parse MEETING_KEYWORDS, using defaults`);
+            }
+        }
     }
 
     // Helper: click selector if visible within timeout
@@ -139,18 +166,94 @@ class Bot {
     }
 
     /**
+     * Perform random mouse movements to simulate human behavior and avoid bot detection
+     * @param {number} durationSeconds - Duration in seconds to perform random movements (default: 8)
+     */
+    async performRandomMouseMovements(durationSeconds = 8) {
+        if (!this.page) return;
+        
+        try {
+            console.log(`[${this.id}] 🖱️ Starting random mouse movements for ${durationSeconds} seconds...`);
+            
+            await this.page.evaluate(async (duration) => {
+                const endTime = Date.now() + (duration * 1000);
+                const margin = 100;
+                
+                const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+                
+                const getRandomPosition = () => {
+                    const width = window.innerWidth;
+                    const height = window.innerHeight;
+                    return {
+                        x: Math.floor(Math.random() * (width - 2 * margin)) + margin,
+                        y: Math.floor(Math.random() * (height - 2 * margin)) + margin
+                    };
+                };
+                
+                while (Date.now() < endTime) {
+                    try {
+                        const pos = getRandomPosition();
+                        
+                        // Get element at position and dispatch mouse events
+                        const element = document.elementFromPoint(pos.x, pos.y);
+                        
+                        if (element) {
+                            // Dispatch mousemove event
+                            const moveEvent = new MouseEvent('mousemove', {
+                                view: window,
+                                bubbles: true,
+                                cancelable: true,
+                                clientX: pos.x,
+                                clientY: pos.y
+                            });
+                            element.dispatchEvent(moveEvent);
+                        }
+                        
+                        // Random pause between movements (100-300ms)
+                        const pauseMs = Math.random() * 200 + 100;
+                        await sleep(pauseMs);
+                        
+                        // Occasionally pause longer (10% chance)
+                        if (Math.random() < 0.1) {
+                            const longPauseMs = Math.random() * 500 + 500;
+                            await sleep(longPauseMs);
+                        }
+                        
+                    } catch (e) {
+                        // Silently continue on error
+                        await sleep(100);
+                    }
+                }
+            }, durationSeconds);
+            
+            console.log(`[${this.id}] ✅ Completed random mouse movements`);
+        } catch (error) {
+            console.warn(`[${this.id}] ⚠️ Error during random mouse movements:`, error.message);
+        }
+    }
+
+    /**
      * Orchestrate full join + record flow
      */
     async joinMeet(meetUrl) {
         await this.launchBrowser();
         await this.dismissInitialModals();
         await this.navigateAndJoin(meetUrl);
-        await this.waitForAdmission();
         
+        // Perform random mouse movements on the Meet lobby page to simulate human behavior
+        await this.performRandomMouseMovements(8);
+        
+        await this.waitForAdmission();
+
+        // Mark admission in page context so the extension can start captions only
+        // after we are actually inside the meeting (not just in the waiting room).
+        
+        
+        // Quick modal dismissal after admission
         try {
-            for (let i = 0; i < 5; i++) {
+            for (let i = 0; i < 3; i++) {
                 await this.page.keyboard.press('Escape').catch(() => {});
-                await this.page.waitForTimeout(200).catch(() => {});
+                await this.page.waitForTimeout(50).catch(() => {});
             }
         } catch {}
         
@@ -177,12 +280,27 @@ class Bot {
         this.hasSeenParticipants = true;
 
         // Enable and start collecting Google Meet live captions (best-effort, non-fatal on failure)
+        /*
         try {
+            this.page.waitForTimeout(3000);
             await this.enableCaptions();
-            // await this.ensureTiledLayout(); // This is needed to ensure the tiled layout is selected
             await this.startCaptionsCollector();
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ Could not start captions collector:`, e && e.message ? e.message : e);
+        }
+        */
+
+        try {
+            await this.page.evaluate(() => {
+                try {
+                    localStorage.setItem('botAdmitted', '1');
+                    console.log('[CXFlow Bot] ✅ botAdmitted flag set');
+                } catch (e) {
+                    console.warn('[CXFlow Bot] ⚠️ Failed to set botAdmitted flag:', e);
+                }
+            });
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Could not set botAdmitted flag:`, e && e.message ? e.message : e);
         }
 
         await this.startRecording();
@@ -213,22 +331,25 @@ class Bot {
      */
     async enableCaptions() {
         try {
-            await this.dismissOverlays();
             console.log(`[${this.id}] 💬 Enabling captions...`);
             // Attempt clicking captions button via common selectors
             const sels = [
                 'button[aria-label*="Turn on captions" i]',
                 'button[aria-label*="captions" i]',
             ];
-            await this.page.waitForTimeout(1000);
+            await this.page.waitForTimeout(500);
             let clicked = false;
             for (const sel of sels) {
                 const btn = await this.page.$(sel);
                 if (btn) {
-                    try { await btn.click({ delay: 20 }); clicked = true; break; } catch {}
+                    try { 
+                        await btn.click({ delay: 20 }); 
+                        clicked = true; 
+                        console.log(`[${this.id}] ✅ Captions toggled by button`);
+                        break; 
+                    } catch {}
                 }
             }
-            if(console.log(`[${this.id}] ✅ Captions toggled by button`))
             if (!clicked) {
                 // Fallback: Try keyboard shortcut 'Shift+c'
                 try {
@@ -494,7 +615,12 @@ class Bot {
         // Upload server not needed for video-only tab capture
 
         const headlessEnv = process.env.BOT_HEADLESS || process.env.HEADLESS || '';
-        const headlessMode = headlessEnv === '1' || /^true$/i.test(headlessEnv);
+        let headlessMode = headlessEnv === '1' || /^true$/i.test(headlessEnv);
+        // Extensions are not supported in Chrome headless; disable headless when we load transcript_extension
+        if (headlessMode && EXTENSION_PATH) {
+            console.log('[Bot] Forcing headless=false because extension needs UI context');
+            headlessMode = false;
+        }
 
         // IMPORTANT:
         // - Puppeteer adds `--mute-audio` by default which can result in recordings with no audio.
@@ -527,16 +653,42 @@ class Bot {
                 '--no-default-browser-check',
                 '--disable-features=BackForwardCache,OptimizationHints',
                 '--window-size=1920,1080',
-                '--start-maximized'
+                '--start-maximized',
+                // Load custom transcript extension instead of using caption collector
+                `--disable-extensions-except=${EXTENSION_PATH}`,
+                `--load-extension=${EXTENSION_PATH}`,
             ]
         });
 
         // Handle browser disconnection
         this.browser.on('disconnected', () => {
-            console.warn(`[${this.id}] ⚠️ Browser disconnected`);
+            console.warn(`[${this.id}] ⚠️ Browser disconnected unexpectedly`);
+            
+            // Immediately stop all intervals to prevent errors
+            try {
+                if (this.participantCheckInterval) {
+                    clearInterval(this.participantCheckInterval);
+                    this.participantCheckInterval = null;
+                }
+                if (this.speakerActivityInterval) {
+                    clearInterval(this.speakerActivityInterval);
+                    this.speakerActivityInterval = null;
+                }
+                if (this.modalDismissInterval) {
+                    clearInterval(this.modalDismissInterval);
+                    this.modalDismissInterval = null;
+                }
+                if (this.pageValidityInterval) {
+                    clearInterval(this.pageValidityInterval);
+                    this.pageValidityInterval = null;
+                }
+            } catch {}
+            
+            // Trigger cleanup if not already leaving
             if (!this.isLeaving) {
                 this.leaveMeet();
             }
+            
             // Best-effort: remove pid file on disconnect
             try { fs.removeSync(this.browserPidFile); } catch {}
         });
@@ -593,6 +745,40 @@ class Bot {
                 } catch {}
             });
         } catch {}
+        
+        // Set caption language preference in localStorage before navigation
+        try {
+            const captionLang = this.captionLanguage;
+            await this.page.evaluateOnNewDocument((lang) => {
+                try {
+                    localStorage.setItem('captionLanguage', lang);
+                    console.log(`Caption language preference set to: ${lang}`);
+                } catch (e) {
+                    console.error('Error setting caption language in localStorage:', e);
+                }
+            }, captionLang);
+            console.log(`[${this.id}] 🌐 Caption language preference: ${captionLang}`);
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Could not set caption language:`, e && e.message ? e.message : e);
+        }
+
+        // Set timezone and locale preferences in localStorage for extension
+        try {
+            const { DEFAULT_TIMEZONE, DEFAULT_LOCALE } = require('./utils/timezone');
+            await this.page.evaluateOnNewDocument((tz, loc) => {
+                try {
+                    localStorage.setItem('timezone', tz);
+                    localStorage.setItem('locale', loc);
+                    console.log(`Timezone set to: ${tz}, Locale: ${loc}`);
+                } catch (e) {
+                    console.error('Error setting timezone/locale in localStorage:', e);
+                }
+            }, DEFAULT_TIMEZONE, DEFAULT_LOCALE);
+            console.log(`[${this.id}] 📅 Timezone: ${DEFAULT_TIMEZONE}, Locale: ${DEFAULT_LOCALE}`);
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Could not set timezone/locale:`, e && e.message ? e.message : e);
+        }
+        
         await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
 
         // Prepare capture helper and inject interceptors
@@ -608,7 +794,8 @@ class Bot {
             const pid = proc?.pid;
             if (pid && Number.isInteger(pid)) {
                 this.browserPid = pid;
-                fs.ensureDirSync(this.runtimeDir);
+                // Only create botsPidDir when actually writing PID file
+                fs.ensureDirSync(this.botsPidDir);
                 fs.writeFileSync(this.browserPidFile, String(pid));
             }
         } catch {}
@@ -644,6 +831,7 @@ class Bot {
      */
     async navigateAndJoin(meetUrl) {
         console.log(`[${this.id}] 📞 Joining: ${meetUrl}`);
+        this.meetUrl = meetUrl;  // Store meeting URL for email
 
         try {
             // Navigate to meeting
@@ -755,8 +943,8 @@ class Bot {
                 console.warn(`[${this.id}] ⚠️ Name input not found; continuing`);
             }
 
-            // Allow dynamic validation overlays to settle
-            await this.page.waitForTimeout(800);
+            // Allow dynamic validation overlays to settle (optimized)
+            await this.page.waitForTimeout(300);
             // Final verification loop (UI can sometimes revert the name) up to 3 attempts
             for (let i = 0; i < 3 && nameInputFound; i++) {
                 const nameOk = await this.page.evaluate((expected) => {
@@ -774,7 +962,7 @@ class Bot {
                         break;
                     }
                 }
-                await this.page.waitForTimeout(400);
+                await this.page.waitForTimeout(200);
             }
 
             // Candidate XPath expressions for join/ask buttons (include variations)
@@ -785,7 +973,7 @@ class Bot {
                 "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'join now')]"
             ];
 
-            // Attempt clicking with retries + backoff
+            // Attempt clicking with retries + optimized backoff
             const maxAttempts = 5;
             let attempt = 0;
             let joined = false;
@@ -802,7 +990,7 @@ class Bot {
                         const disabled = await this.page.evaluate(el => el.getAttribute('aria-disabled') === 'true', btn);
                         if (disabled) continue;
                         await btn.hover();
-                        await this.page.waitForTimeout(100);
+                        await this.page.waitForTimeout(50);
                         await btn.click({ delay: 20 });
                         joined = true;
                         break;
@@ -814,14 +1002,14 @@ class Bot {
                 if (!joined) {
                     // Try pressing Enter as a fallback (often triggers default action)
                     await this.page.keyboard.press('Enter');
-                    await this.page.waitForTimeout(600);
+                    await this.page.waitForTimeout(400);
                     // Check if we are in-call (leave button present) then treat as joined
                     const inCall = await this.page.$('button[aria-label*="Leave call"], button[aria-label*="End call"]');
                     if (inCall) {
                         joined = true;
                         break;
                     }
-                    await this.page.waitForTimeout(attempt * 400); // backoff
+                    await this.page.waitForTimeout(attempt * 200); // optimized backoff
                 }
             }
 
@@ -899,8 +1087,8 @@ class Bot {
                             if (typeof window.__resetMeetingState === 'function') window.__resetMeetingState(); 
                         });
                     } catch {}
-                    // Give a short grace period for real remote media to flow
-                    await this.page.waitForTimeout(1500);
+                    // Brief grace period for real remote media to flow (optimized for speed)
+                    await this.page.waitForTimeout(500);
                     console.log(`[${this.id}] ✅ Admitted to meeting & state reset`);
 
                     // Dismiss any blocking onboarding/self-view modals (e.g. "Others may see your video differently")
@@ -924,11 +1112,11 @@ class Bot {
      * Best-effort dismissal of blocking modals (e.g. "Got it", self-view tips)
      * that can appear immediately after admission and block UI interactions.
      */
-    async dismissInitialModals(maxRounds = 5) {
+    async dismissInitialModals(maxRounds = 3) {
         console.log(`[${this.id}] 🔔 Dismissing initial modals if present...`);
         for (let i = 0; i < maxRounds; i++) {
             await this.page.keyboard.press('Escape').catch(() => {});
-            await this.page.waitForTimeout(100);
+            await this.page.waitForTimeout(50);
         }
     }
 
@@ -961,60 +1149,12 @@ class Bot {
                 console.log(`[${this.id}] 👥 Fallback participant count: ${count}`);
                 if (count >= 2) return true;
 
-                // Open people panel occasionally to force DOM population
-                if ((Date.now() - start) % 10000 < 2100) {
-                    await this.openPeoplePanel();
-                }
             } catch (e) {
                 // ignore transient errors
             }
             await this.page.waitForTimeout(2000);
         }
         return false;
-    }
-
-    async openPeoplePanel() {
-        try {
-            // If already open (panel at right), skip
-            const isOpen = await this.page.evaluate(() => {
-                // Heuristics for right-side panel presence
-                const panel = document.querySelector('aside[role="complementary"], div[role="dialog"], div[aria-label*="People" i]');
-                if (!panel) return false;
-                const hasAddPeople = panel.querySelector('button[aria-label*="Add people" i], button:has(svg)');
-                return !!panel && !!panel.innerText && panel.innerText.toLowerCase().includes('in the meeting');
-            });
-            if (isOpen) return;
-
-            // Attempt to open participants/people panel (varies by UI / locale)
-            const xpaths = [
-                "//button[@aria-label and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show everyone')]",
-                "//button[@aria-label and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'people')]",
-                "//button[contains(@aria-label,'Participants')]",
-                "//button[.//span[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'people')]]"
-            ];
-            let clicked = false;
-            for (const xp of xpaths) {
-                const btns = await this.page.$x(xp);
-                if (btns.length) {
-                    await btns[0].click().catch(()=>{});
-                    clicked = true;
-                    break;
-                }
-            }
-            if (!clicked) {
-                // Try with common selectors
-                const sels = [
-                    'button[aria-label*="People" i]',
-                    'button[aria-label*="Everyone" i]',
-                    'button[aria-label*="Participants" i]'
-                ];
-                for (const sel of sels) {
-                    const btn = await this.page.$(sel);
-                    if (btn) { await btn.click().catch(()=>{}); break; }
-                }
-            }
-            await this.page.waitForTimeout(600);
-        } catch {}
     }
 
     async getParticipantCount() {
@@ -1111,7 +1251,6 @@ class Bot {
      */
     async ensureTiledLayout() {
         try {
-            await this.dismissOverlays();
             console.log(`[${this.id}] 🎛️ Configuring layout to Tiled...`);
 
             // 1) Click the "More options" button in the bottom bar
@@ -1124,7 +1263,7 @@ class Bot {
                         return label === 'more options';
                     });
                     if (!cand) return false;
-                    await cand.click().catch(()=>{});
+                    await cand.click({ delay: 50 }).catch(()=>{});
                     return true;
                 } catch {
                     return false;
@@ -1136,13 +1275,13 @@ class Bot {
                 return;
             }
 
-            await this.page.waitForTimeout(600);         // give the iframe time to mount
+            await this.page.waitForTimeout(300);         // give the iframe time to mount (optimized)
             try {
                 await this.page.keyboard.press('ArrowDown');
                 await this.page.keyboard.press('Space');
             } catch {}
 
-            await this.page.waitForTimeout(600);         // give the iframe time to mount
+            await this.page.waitForTimeout(300);         // give the iframe time to mount (optimized)
             let layoutSelected = false;
             try {
                 await this.page.keyboard.press('Tab');
@@ -1226,6 +1365,10 @@ class Bot {
         }
 
         this.recordingStartedAt = Date.now();
+        const startTimestamp = getCurrentTimestamp();
+        this.meetingStartTime = startTimestamp.iso;
+        this.meetingStartTimeFormatted = startTimestamp.formatted;
+        console.log(`[${this.id}] 📅 Meeting started at: ${startTimestamp.formatted} (${startTimestamp.timezone})`);
 
         // Chunk writing with retry mechanism (GoogleMeetBot style)
         const writeChunkWithRetry = async (buffer, retries = 3) => {
@@ -1255,6 +1398,9 @@ class Bot {
                 await writeChunkWithRetry(buffer);
             } catch (error) {
                 console.error(`[${this.id}] ❌ Error saving chunk after retries:`, error.message);
+                // Log additional context for debugging
+                console.error(`[${this.id}] 🔍 Chunk data length: ${data ? data.length : 'null'}`);
+                console.error(`[${this.id}] 🔍 Buffer creation failed:`, error.stack);
             }
         });
 
@@ -1326,19 +1472,36 @@ class Bot {
                         preferCurrentTab: true,
                     });
 
-                    // Determine codec
-                    let options = {};
+                    // Store stream in global for cleanup
+                    window.__recordingStream = stream;
+
+                    // Determine codec and compression settings
+                    // Optimized for smaller files with good quality (VP9 is efficient)
+                    // Reduced from 2.5 Mbps to 1.8 Mbps - VP9 maintains quality at lower bitrates
+                    const videoBitsPerSecond = 1800000; // 1.8 Mbps (optimized for size/quality balance)
+                    const audioBitsPerSecond = 96000;    // 96 kbps (sufficient for voice)
+                    
+                    let options = {
+                        videoBitsPerSecond,
+                        audioBitsPerSecond
+                    };
+                    
                     if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
-                        console.log('[Browser] Using VP9 codec');
-                        options = { mimeType: 'video/webm;codecs=vp9' };
+                        console.log('[Browser] Using VP9 codec with compression');
+                        options.mimeType = 'video/webm;codecs=vp9';
                     } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
-                        console.log('[Browser] Using VP8 codec (fallback)');
-                        options = { mimeType: 'video/webm;codecs=vp8' };
+                        console.log('[Browser] Using VP8 codec with compression (fallback)');
+                        options.mimeType = 'video/webm;codecs=vp8';
                     } else {
-                        console.warn('[Browser] Using default codec');
+                        console.warn('[Browser] Using default codec with compression');
                     }
+                    
+                    console.log('[Browser] Video bitrate: ' + (videoBitsPerSecond / 1000000).toFixed(2) + ' Mbps, Audio: ' + (audioBitsPerSecond / 1000).toFixed(0) + ' kbps');
 
                     const mediaRecorder = new MediaRecorder(stream, options);
+                    
+                    // Store MediaRecorder in global for cleanup
+                    window.__mediaRecorder = mediaRecorder;
 
                     let chunksReceived = 0;
                     let totalBytes = 0;
@@ -1379,20 +1542,71 @@ class Bot {
 
                     const stopRecording = async () => {
                         console.log('[Browser] 🛑 Stopping recording...');
-                        mediaRecorder.stop();
-                        stream.getTracks().forEach(track => track.stop());
+                        
+                        // Wait for MediaRecorder to properly finalize
+                        const finalizePromise = new Promise((resolve) => {
+                            if (mediaRecorder.state === 'inactive') {
+                                resolve();
+                                return;
+                            }
+                            
+                            // Set up one-time stop handler
+                            const onStopHandler = () => {
+                                console.log('[Browser] 📦 MediaRecorder finalized');
+                                resolve();
+                            };
+                            
+                            mediaRecorder.addEventListener('stop', onStopHandler, { once: true });
+                            
+                            // Stop recording with timeout fallback
+                            try {
+                                mediaRecorder.stop();
+                                console.log('[Browser] ⏹️ MediaRecorder stop requested');
+                            } catch (e) {
+                                console.error('[Browser] Error stopping MediaRecorder:', e);
+                                resolve(); // Resolve anyway to prevent hanging
+                            }
+                            
+                            // Timeout fallback (max 2 seconds)
+                            setTimeout(() => {
+                                console.warn('[Browser] ⚠️ MediaRecorder finalization timeout');
+                                resolve();
+                            }, 2000);
+                        });
+                        
+                        // Wait for finalization
+                        await finalizePromise;
+                        
+                        // Now stop the streams
+                        try {
+                            stream.getTracks().forEach(track => {
+                                try { track.stop(); } catch {}
+                            });
+                        } catch {}
 
                         // Cleanup timers
-                        if (timeoutId) clearTimeout(timeoutId);
-                        if (inactivityParticipantTimeout) clearTimeout(inactivityParticipantTimeout);
-                        if (pageValidityInterval) clearInterval(pageValidityInterval);
-                        if (modalDismissInterval) clearInterval(modalDismissInterval);
+                        if (timeoutId) {
+                            clearTimeout(timeoutId);
+                            window.__recordingTimeoutId = null;
+                        }
+                        if (inactivityParticipantTimeout) {
+                            clearTimeout(inactivityParticipantTimeout);
+                            window.__inactivityParticipantTimeout = null;
+                        }
+                        if (pageValidityInterval) {
+                            clearInterval(pageValidityInterval);
+                            window.__pageValidityInterval = null;
+                        }
+                        if (modalDismissInterval) {
+                            clearInterval(modalDismissInterval);
+                            window.__modalDismissInterval = null;
+                        }
 
                         // Signal meeting end
                         window.screenAppMeetEnd(slightlySecretId);
                     };
 
-                    // Modal dismissal
+                    // Modal dismissal (optimized frequency)
                     modalDismissInterval = setInterval(() => {
                         try {
                             const buttons = document.querySelectorAll('button');
@@ -1406,7 +1620,10 @@ class Bot {
                         } catch (error) {
                             console.error('[Browser] Modal dismiss error:', error);
                         }
-                    }, 2000);
+                    }, 3000);
+                    
+                    // Store in window global for cleanup
+                    window.__modalDismissInterval = modalDismissInterval;
 
                     // Page validity check
                     pageValidityInterval = setInterval(() => {
@@ -1435,12 +1652,18 @@ class Bot {
                             console.error('[Browser] Page validity error:', error);
                         }
                     }, 10000);
+                    
+                    // Store in window global for cleanup
+                    window.__pageValidityInterval = pageValidityInterval;
 
                     // Max duration timeout
                     timeoutId = setTimeout(() => {
                         console.log('[Browser] ⏱️ Max duration reached');
                         stopRecording();
                     }, durationMs);
+                    
+                    // Store in window global for cleanup
+                    window.__recordingTimeoutId = timeoutId;
                 }
 
                 // Start recording
@@ -1465,8 +1688,6 @@ class Bot {
     async hideSelfView() {
         try {
             console.log(`[${this.id}] 👤 Hiding self view via CSS...`);
-
-            await this.page.waitForTimeout(2000);
 
             await this.page.evaluate((botName) => {
                 try {
@@ -1539,7 +1760,7 @@ class Bot {
                     this.stopModalDismissal();
                 }
             }
-        }, 2000);
+        }, 3000); // Optimized frequency
     }
 
     /**
@@ -1658,7 +1879,10 @@ class Bot {
         if (!this.page || (this.page.isClosed && this.page.isClosed())) return;
 
         const now = Date.now();
-        const activeNames = await this.page.evaluate(() => {
+        let activeNames = [];
+        
+        try {
+            activeNames = await this.page.evaluate(() => {
             const names = new Set();
             const SELF_VIEW_LABELS = ['you', 'your video', 'self view'];
             const clean = (raw) => {
@@ -1711,6 +1935,14 @@ class Bot {
             } catch {}
             return Array.from(names);
         });
+        } catch (e) {
+            // Silently handle target closed errors during speaker sampling
+            const msg = e.message || String(e);
+            if (!msg.includes('Target closed') && !msg.includes('Session closed')) {
+                console.warn(`[${this.id}] ⚠️ Speaker sampling error:`, msg);
+            }
+            return;
+        }
 
         if (!Array.isArray(activeNames) || activeNames.length === 0) return;
 
@@ -1746,7 +1978,33 @@ class Bot {
                 // Non-fatal: just log once in a while
                 console.warn(`[${this.id}] ⚠️ Speaker sampling error:`, e.message || e);
             }
-        }, 1000); // 1s resolution for speaker activity timeframes
+        }, 2000); // 2s resolution for speaker activity (optimized)
+        
+        // Periodically fetch meeting title from extension (every 30 seconds)
+        const titleCheckInterval = setInterval(async () => {
+            try {
+                if (!this.page || (this.page.isClosed && this.page.isClosed())) {
+                    clearInterval(titleCheckInterval);
+                    return;
+                }
+                
+                // Only fetch if we don't have a title yet, or check for updates
+                if (!this.meetingTitle) {
+                    const { meetingTitle } = await this.fetchTranscriptFromPage();
+                    if (meetingTitle && meetingTitle.trim()) {
+                        this.meetingTitle = meetingTitle.trim();
+                        console.log(`[${this.id}] 📝 Meeting title captured: ${this.meetingTitle}`);
+                        // Clear interval once we have the title
+                        clearInterval(titleCheckInterval);
+                    }
+                }
+            } catch (e) {
+                // Non-fatal: just log once in a while
+                if (Math.random() < 0.1) { // Log only 10% of errors to reduce noise
+                    console.warn(`[${this.id}] ⚠️ Title fetch error:`, e.message || e);
+                }
+            }
+        }, 30000); // Check every 30 seconds
 
         this.participantCheckInterval = setInterval(async () => {
             try {
@@ -1758,6 +2016,13 @@ class Bot {
                     return;
                 }
                 const participantCount = await this.getParticipantCount();
+                
+                // Track maximum participants seen (excluding bot, so subtract 1)
+                const actualParticipants = Math.max(0, participantCount - 1);
+                if (actualParticipants > this.maxParticipantsSeen) {
+                    this.maxParticipantsSeen = actualParticipants;
+                    console.log(`[${this.id}] 📊 New maximum participants: ${this.maxParticipantsSeen}`);
+                }
                 
                 // Log only on change to reduce noise/flicker
                 if (participantCount !== lastLoggedCount) {
@@ -1862,12 +2127,86 @@ class Bot {
     }
 
     /**
+     * Generate speaker timeframes from transcript captions
+     * This is more reliable than DOM-based speaker detection
+     */
+    getSpeakerTimeframesFromCaptions(captions) {
+        if (!captions || !Array.isArray(captions) || captions.length === 0) {
+            return [];
+        }
+        
+        const timeframes = [];
+        let currentSpeaker = null;
+        let currentStart = null;
+        let currentEnd = null;
+        
+        for (const caption of captions) {
+            const speaker = caption.speaker;
+            const timestamp = caption.timestampMs || (caption.offsetSeconds * 1000);
+            
+            if (!speaker || !timestamp) continue;
+            
+            if (currentSpeaker === speaker) {
+                // Same speaker continuing - extend timeframe
+                currentEnd = timestamp;
+            } else {
+                // New speaker - save previous timeframe
+                if (currentSpeaker && currentStart && currentEnd) {
+                    timeframes.push({
+                        speakerName: currentSpeaker,
+                        start: currentStart,
+                        end: currentEnd
+                    });
+                }
+                // Start new timeframe
+                currentSpeaker = speaker;
+                currentStart = timestamp;
+                currentEnd = timestamp;
+            }
+        }
+        
+        // Save last timeframe
+        if (currentSpeaker && currentStart && currentEnd) {
+            timeframes.push({
+                speakerName: currentSpeaker,
+                start: currentStart,
+                end: currentEnd
+            });
+        }
+        
+        return timeframes;
+    }
+
+    /**
      * Persist computed speaker timeframes to file for this bot.
      * File path: runtime/<botId>/SpeakerTimeframes.json
      */
     async saveSpeakerTimeframesToFile() {
         if (!this.speakerTimeframesFile) return;
-        const timeframes = this.getSpeakerTimeframes();
+        
+        // Try to get timeframes from DOM-based detection first
+        let timeframes = this.getSpeakerTimeframes();
+        
+        // If empty, try to generate from captions (more reliable)
+        if (!timeframes || timeframes.length === 0) {
+            console.log(`[${this.id}] ℹ️ DOM-based speaker detection found no data, generating from captions...`);
+            
+            // Read captions file if it exists
+            try {
+                if (fs.existsSync(this.captionsFile)) {
+                    const captionsData = await fs.promises.readFile(this.captionsFile, 'utf8');
+                    const captions = JSON.parse(captionsData);
+                    timeframes = this.getSpeakerTimeframesFromCaptions(captions);
+                    
+                    if (timeframes && timeframes.length > 0) {
+                        console.log(`[${this.id}] ✅ Generated ${timeframes.length} timeframes from captions`);
+                    }
+                }
+            } catch (e) {
+                console.warn(`[${this.id}] ⚠️ Could not generate timeframes from captions:`, e.message);
+            }
+        }
+        
         try {
             await fs.promises.writeFile(this.speakerTimeframesFile, JSON.stringify(timeframes, null, 2), 'utf8');
             console.log(`[${this.id}] 💾 SpeakerTimeframes saved to ${this.speakerTimeframesFile}`);
@@ -1877,16 +2216,507 @@ class Bot {
     }
 
     /**
+     * Calculate comprehensive meeting metrics
+     * Returns metrics including duration, talk time, interruptions, silence, and keywords
+     */
+    async calculateMeetingMetrics() {
+        const { DEFAULT_TIMEZONE, DEFAULT_LOCALE, getTimezoneInfo, formatTime } = require('./utils/timezone');
+        const tzInfo = getTimezoneInfo();
+        
+        const metrics = {
+            timezone: {
+                name: DEFAULT_TIMEZONE,
+                locale: DEFAULT_LOCALE,
+                displayName: tzInfo.timeZoneName,
+                offset: tzInfo.offset
+            },
+            duration: {
+                totalMs: 0,
+                totalSeconds: 0,
+                totalMinutes: 0,
+                startTime: this.meetingStartTime,
+                startTimeFormatted: this.meetingStartTimeFormatted,
+                endTime: this.meetingEndTime,
+                endTimeFormatted: this.meetingEndTimeFormatted
+            },
+            talkTime: {
+                totalMs: 0,
+                totalSeconds: 0,
+                totalMinutes: 0,
+                byParticipant: {}
+            },
+            interruptions: {
+                total: 0,
+                details: []
+            },
+            silence: {
+                totalMs: 0,
+                totalSeconds: 0,
+                totalMinutes: 0,
+                periods: []
+            },
+            keywords: {
+                total: 0,
+                byKeyword: {},
+                occurrences: []
+            },
+            participation: {
+                totalParticipants: 0,
+                speakers: [],
+                speakerStats: {}
+            }
+        };
+
+        try {
+            // Load captions
+            let captions = [];
+            if (fs.existsSync(this.captionsFile)) {
+                const captionsData = await fs.promises.readFile(this.captionsFile, 'utf8');
+                captions = JSON.parse(captionsData);
+            } else if (Array.isArray(this.captions)) {
+                captions = this.captions;
+            }
+
+            // Calculate duration - use actual meeting times if available, otherwise use caption timestamps
+            // (Do this even if no captions, so we can still show meeting duration)
+            let durationMs = 0;
+            
+            if (this.meetingStartTime) {
+                const startDate = new Date(this.meetingStartTime);
+                let endDate;
+                
+                if (this.meetingEndTime) {
+                    // Meeting has ended - use actual end time
+                    endDate = new Date(this.meetingEndTime);
+                } else {
+                    // Meeting still ongoing - use current time
+                    endDate = new Date();
+                }
+                
+                durationMs = endDate.getTime() - startDate.getTime();
+            } else if (captions.length > 0) {
+                // Fallback to caption timestamps
+                const firstCaption = captions[0];
+                const lastCaption = captions[captions.length - 1];
+                
+                if (firstCaption && lastCaption) {
+                    const startMs = firstCaption.timestampMs || 0;
+                    const endMs = lastCaption.timestampMs || 0;
+                    durationMs = endMs - startMs;
+                }
+            }
+            
+            if (durationMs > 0) {
+                metrics.duration.totalMs = durationMs;
+                metrics.duration.totalSeconds = Math.floor(durationMs / 1000);
+                metrics.duration.totalMinutes = Math.max(1, Math.floor(durationMs / 60000)); // At least 1 min if meeting happened
+            }
+
+            // If no captions, still return metrics with duration (if available)
+            if (!captions || captions.length === 0) {
+                console.log(`[${this.id}] ⚠️ No captions available for metrics calculation`);
+                // Duration already calculated above, return what we have
+                return metrics;
+            }
+
+            // Track speakers and their talk time
+            const speakerSegments = {};
+            let currentSpeaker = null;
+            let segmentStart = null;
+            const lastCaption = captions.length > 0 ? captions[captions.length - 1] : null;
+            
+            for (let i = 0; i < captions.length; i++) {
+                const caption = captions[i];
+                const speaker = (caption.speaker || 'Unknown Speaker').trim();
+                const timestampMs = caption.timestampMs || 0;
+                
+                if (!speakerSegments[speaker]) {
+                    speakerSegments[speaker] = [];
+                }
+                
+                if (currentSpeaker !== speaker) {
+                    // Save previous segment
+                    if (currentSpeaker && segmentStart !== null) {
+                        speakerSegments[currentSpeaker].push({
+                            start: segmentStart,
+                            end: timestampMs,
+                            duration: timestampMs - segmentStart
+                        });
+                    }
+                    // Start new segment
+                    currentSpeaker = speaker;
+                    segmentStart = timestampMs;
+                }
+            }
+            
+            // Save last segment
+            if (currentSpeaker && segmentStart !== null && lastCaption) {
+                const endMs = lastCaption.timestampMs || 0;
+                speakerSegments[currentSpeaker].push({
+                    start: segmentStart,
+                    end: endMs,
+                    duration: endMs - segmentStart
+                });
+            }
+
+            // Calculate talk time per participant
+            let totalTalkTimeMs = 0;
+            for (const [speaker, segments] of Object.entries(speakerSegments)) {
+                const speakerTalkTime = segments.reduce((sum, seg) => sum + seg.duration, 0);
+                totalTalkTimeMs += speakerTalkTime;
+                
+                metrics.talkTime.byParticipant[speaker] = {
+                    totalMs: speakerTalkTime,
+                    totalSeconds: Math.floor(speakerTalkTime / 1000),
+                    totalMinutes: Math.floor(speakerTalkTime / 60000),
+                    percentage: 0, // Will calculate after we have total
+                    segmentCount: segments.length
+                };
+            }
+            
+            metrics.talkTime.totalMs = totalTalkTimeMs;
+            metrics.talkTime.totalSeconds = Math.floor(totalTalkTimeMs / 1000);
+            metrics.talkTime.totalMinutes = Math.floor(totalTalkTimeMs / 60000);
+            
+            // Calculate percentages
+            for (const speaker in metrics.talkTime.byParticipant) {
+                if (totalTalkTimeMs > 0) {
+                    const speakerTime = metrics.talkTime.byParticipant[speaker].totalMs;
+                    metrics.talkTime.byParticipant[speaker].percentage = 
+                        Math.round((speakerTime / totalTalkTimeMs) * 10000) / 100;
+                }
+            }
+
+            // Detect interruptions (speaker changes within short time window)
+            const INTERRUPTION_THRESHOLD_MS = 2000; // 2 seconds
+            for (let i = 1; i < captions.length; i++) {
+                const prev = captions[i - 1];
+                const curr = captions[i];
+                
+                // Skip if either caption is missing speaker or text
+                const prevSpeaker = (prev.speaker || '').trim();
+                const currSpeaker = (curr.speaker || '').trim();
+                if (!prevSpeaker || !currSpeaker || prevSpeaker === 'Unknown Speaker' || currSpeaker === 'Unknown Speaker') {
+                    continue;
+                }
+                
+                // Skip if same speaker (not an interruption)
+                if (prevSpeaker === currSpeaker) {
+                    continue;
+                }
+                
+                // Calculate time difference
+                const prevTime = prev.timestampMs || prev.offsetSeconds * 1000 || 0;
+                const currTime = curr.timestampMs || curr.offsetSeconds * 1000 || 0;
+                const timeDiff = currTime - prevTime;
+                
+                // Only count as interruption if time difference is positive and within threshold
+                if (timeDiff > 0 && timeDiff < INTERRUPTION_THRESHOLD_MS) {
+                    metrics.interruptions.total++;
+                    const interruptionTime = currTime || Date.now();
+                    metrics.interruptions.details.push({
+                        timestamp: interruptionTime,
+                        timestampFormatted: formatTime(new Date(interruptionTime)),
+                        from: prevSpeaker,
+                        to: currSpeaker,
+                        gapMs: timeDiff
+                    });
+                }
+            }
+
+            // Detect silence periods (gaps between captions)
+            const SILENCE_THRESHOLD_MS = 5000; // 5 seconds
+            for (let i = 1; i < captions.length; i++) {
+                const prev = captions[i - 1];
+                const curr = captions[i];
+                
+                const gapMs = (curr.timestampMs || 0) - (prev.timestampMs || 0);
+                
+                if (gapMs >= SILENCE_THRESHOLD_MS) {
+                    metrics.silence.totalMs += gapMs;
+                    metrics.silence.periods.push({
+                        start: prev.timestampMs,
+                        startFormatted: formatTime(new Date(prev.timestampMs)),
+                        end: curr.timestampMs,
+                        endFormatted: formatTime(new Date(curr.timestampMs)),
+                        durationMs: gapMs,
+                        durationSeconds: Math.floor(gapMs / 1000)
+                    });
+                }
+            }
+            
+            metrics.silence.totalSeconds = Math.floor(metrics.silence.totalMs / 1000);
+            metrics.silence.totalMinutes = Math.floor(metrics.silence.totalMs / 60000);
+
+            // Load OpenAI-generated keywords from keywords.json (if available)
+            // OpenAI keywords are generated along with the summary
+            const keywordsPath = path.join(this.botDir, 'keywords.json');
+            if (fs.existsSync(keywordsPath)) {
+                try {
+                    const openAIKeywords = JSON.parse(await fs.promises.readFile(keywordsPath, 'utf8'));
+                    if (Array.isArray(openAIKeywords) && openAIKeywords.length > 0) {
+                        // Format OpenAI keywords into metrics structure
+                        metrics.keywords.total = openAIKeywords.length;
+                        openAIKeywords.forEach(keyword => {
+                            if (keyword && typeof keyword === 'string' && keyword.trim().length > 0) {
+                                const keywordTrimmed = keyword.trim();
+                                // Count occurrences in captions for each keyword
+                                let count = 0;
+                                const keywordLower = keywordTrimmed.toLowerCase();
+                                const keywordRegex = new RegExp(`\\b${keywordLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+                                
+                                for (const caption of captions) {
+                                    const text = (caption.text || '').trim();
+                                    if (text && keywordRegex.test(text.toLowerCase())) {
+                                        count++;
+                                        const speaker = (caption.speaker || 'Unknown Speaker').trim();
+                                        const timestamp = caption.timestampMs || (caption.offsetSeconds ? caption.offsetSeconds * 1000 : 0);
+                                        metrics.keywords.occurrences.push({
+                                            keyword: keywordTrimmed,
+                                            speaker,
+                                            timestamp,
+                                            timestampFormatted: timestamp > 0 ? formatTime(new Date(timestamp)) : 'N/A',
+                                            text: text
+                                        });
+                                    }
+                                }
+                                
+                                if (count > 0) {
+                                    metrics.keywords.byKeyword[keywordTrimmed] = count;
+                                } else {
+                                    // Even if no occurrences found, include the keyword (count = 1)
+                                    metrics.keywords.byKeyword[keywordTrimmed] = 1;
+                                }
+                            }
+                        });
+                        console.log(`[${this.id}] ✅ Loaded ${openAIKeywords.length} OpenAI-generated keywords into metrics`);
+                    }
+                } catch (e) {
+                    console.warn(`[${this.id}] ⚠️  Could not load OpenAI keywords: ${e.message}`);
+                }
+            } else {
+                console.log(`[${this.id}] ℹ️  OpenAI keywords not yet generated (keywords.json not found)`);
+            }
+
+            // Participation stats - use maximum participants seen during monitoring (most accurate)
+            // This represents the peak number of participants in the meeting (excluding bot)
+            // maxParticipantsSeen already excludes the bot (we subtract 1 in monitoring)
+            if (this.maxParticipantsSeen > 0) {
+                metrics.participation.totalParticipants = this.maxParticipantsSeen; // Already excludes bot
+                // Also collect unique speakers from captions for the speakers list
+                const uniqueSpeakers = new Set();
+                for (const caption of captions) {
+                    const speaker = (caption.speaker || '').trim();
+                    if (speaker && speaker !== 'Unknown Speaker' && speaker.length > 0) {
+                        uniqueSpeakers.add(speaker);
+                    }
+                }
+                if (uniqueSpeakers.size > 0) {
+                    metrics.participation.speakers = Array.from(uniqueSpeakers);
+                } else {
+                    // Fallback to talkTime.byParticipant for speaker names
+                    const speakers = Object.keys(metrics.talkTime.byParticipant).filter(s => s && s !== 'Unknown Speaker' && s.trim().length > 0);
+                    if (speakers.length > 0) {
+                        metrics.participation.speakers = speakers;
+                    } else {
+                        metrics.participation.speakers = [];
+                    }
+                }
+            } else {
+                // Fallback: count unique speakers from captions if maxParticipantsSeen not available
+                const uniqueSpeakers = new Set();
+                for (const caption of captions) {
+                    const speaker = (caption.speaker || '').trim();
+                    if (speaker && speaker !== 'Unknown Speaker' && speaker.length > 0) {
+                        uniqueSpeakers.add(speaker);
+                    }
+                }
+                
+                if (uniqueSpeakers.size > 0) {
+                    metrics.participation.totalParticipants = uniqueSpeakers.size;
+                    metrics.participation.speakers = Array.from(uniqueSpeakers);
+                } else {
+                    // Fallback to talkTime.byParticipant (filter out Unknown Speaker)
+                    const speakers = Object.keys(metrics.talkTime.byParticipant).filter(s => s && s !== 'Unknown Speaker' && s.trim().length > 0);
+                    if (speakers.length > 0) {
+                        metrics.participation.totalParticipants = speakers.length;
+                        metrics.participation.speakers = speakers;
+                    } else {
+                        // Fallback to speakerSegments if talkTime wasn't calculated (filter out Unknown Speaker)
+                        const speakerSegmentsKeys = Object.keys(speakerSegments).filter(s => s && s !== 'Unknown Speaker' && s.trim().length > 0);
+                        if (speakerSegmentsKeys.length > 0) {
+                            metrics.participation.totalParticipants = speakerSegmentsKeys.length;
+                            metrics.participation.speakers = speakerSegmentsKeys;
+                        } else if (Array.isArray(this.participants) && this.participants.length > 0) {
+                            // Fallback to bot's participant tracking if no speakers in captions
+                            const validParticipants = this.participants.filter(p => p && p !== 'Unknown Speaker' && p.trim().length > 0);
+                            if (validParticipants.length > 0) {
+                                metrics.participation.totalParticipants = validParticipants.length;
+                                metrics.participation.speakers = validParticipants;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Build speaker stats from talk time data
+            const finalSpeakers = metrics.participation.speakers || [];
+            for (const speaker of finalSpeakers) {
+                const talkData = metrics.talkTime.byParticipant[speaker];
+                if (talkData) {
+                    metrics.participation.speakerStats[speaker] = {
+                        talkTimeMs: talkData.totalMs,
+                        talkPercentage: talkData.percentage,
+                        utterances: talkData.segmentCount
+                    };
+                } else {
+                    // If not in talkTime, try to get from speakerSegments
+                    const segments = speakerSegments[speaker];
+                    if (segments && segments.length > 0) {
+                        const talkTimeMs = segments.reduce((sum, seg) => sum + seg.duration, 0);
+                        metrics.participation.speakerStats[speaker] = {
+                            talkTimeMs: talkTimeMs,
+                            talkPercentage: totalTalkTimeMs > 0 ? Math.round((talkTimeMs / totalTalkTimeMs) * 10000) / 100 : 0,
+                            utterances: segments.length
+                        };
+                    } else {
+                        // Fallback: count occurrences in captions
+                        const captionCount = captions.filter(c => (c.speaker || '').trim() === speaker).length;
+                        metrics.participation.speakerStats[speaker] = {
+                            talkTimeMs: 0,
+                            talkPercentage: 0,
+                            utterances: captionCount
+                        };
+                    }
+                }
+            }
+
+            console.log(`[${this.id}] ✅ Metrics calculated: ${metrics.duration.totalMinutes}min, ${metrics.participation.totalParticipants} participants, ${metrics.interruptions.total} interruptions, ${metrics.keywords.total} keywords`);
+            console.log(`[${this.id}] 📊 Metrics details: ${metrics.participation.speakers.length} speakers (${metrics.participation.speakers.join(', ')}), ${captions.length} captions processed`);
+
+        } catch (e) {
+            console.error(`[${this.id}] ❌ Error calculating meeting metrics:`, e.message || e);
+        }
+
+        return metrics;
+    }
+
+    /**
+     * Save meeting metrics to file
+     */
+    async saveMeetingMetrics() {
+        if (!this.metricsFile) return;
+        
+        try {
+            const metrics = await this.calculateMeetingMetrics();
+            await fs.promises.writeFile(this.metricsFile, JSON.stringify(metrics, null, 2), 'utf8');
+            console.log(`[${this.id}] 💾 Meeting metrics saved to ${this.metricsFile}`);
+            return metrics;
+        } catch (e) {
+            console.error(`[${this.id}] ❌ Failed to save meeting metrics:`, e.message || e);
+            return null;
+        }
+    }
+
+    async fetchTranscriptFromPage() {
+        // Check if page is valid and accessible
+        if (!this.page || (this.page.isClosed && this.page.isClosed())) {
+            return { transcript: [], meetingStartTimeStamp: null, meetingTitle: null };
+        }
+        
+        try {
+            const data = await this.page.evaluate(() => {
+                try {
+                    const transcript = JSON.parse(localStorage.getItem('transcript') || '[]');
+                    const rawStart = localStorage.getItem('meetingStartTimeStamp');
+                    let meetingStartTimeStamp = null;
+                    if (rawStart) {
+                        try {
+                            meetingStartTimeStamp = JSON.parse(rawStart);
+                        } catch {
+                            meetingStartTimeStamp = rawStart;
+                        }
+                    }
+                    // Also fetch meeting title from extension
+                    const meetingTitle = localStorage.getItem('meetingTitle') || null;
+                    return { transcript, meetingStartTimeStamp, meetingTitle };
+                } catch {
+                    return { transcript: [], meetingStartTimeStamp: null, meetingTitle: null };
+                }
+            });
+            if (!data || !Array.isArray(data.transcript)) {
+                return { transcript: [], meetingStartTimeStamp: null, meetingTitle: null };
+            }
+            return data;
+        } catch (e) {
+            // Silently handle common page-closing errors
+            const msg = e.message || String(e);
+            if (msg.includes('Requesting main frame too early') || 
+                msg.includes('Session closed') || 
+                msg.includes('Target closed')) {
+                console.log(`[${this.id}] ℹ️ Page closing - transcript fetch skipped`);
+            } else {
+                console.warn(`[${this.id}] ⚠️ Could not fetch transcript from page:`, msg);
+            }
+            return { transcript: [], meetingStartTimeStamp: null };
+        }
+    }
+
+    /**
      * Persist captured captions to a JSON file for this bot.
      * File path: runtime/<botId>/transcripts/captions.json
      */
     async saveCaptionsToFile() {
+        // Fetch transcript collected by extension instead of internal captions logic
+        const { transcript, meetingStartTimeStamp, meetingTitle } = await this.fetchTranscriptFromPage();
+        if (!transcript || transcript.length === 0) {
+            console.log(`[${this.id}] ⚠️ No transcript found in page storage.`);
+            return;
+        }
+        
+        // Update meeting title if found from extension
+        if (meetingTitle && meetingTitle.trim()) {
+            this.meetingTitle = meetingTitle.trim();
+            console.log(`[${this.id}] 📝 Meeting title from extension: ${this.meetingTitle}`);
+        }
+
+        // Convert extension format -> generic captions format expected by frontend
+        let startMs = null;
+        if (meetingStartTimeStamp) {
+            const parsed = Date.parse(meetingStartTimeStamp);
+            if (!Number.isNaN(parsed)) startMs = parsed;
+        }
+
+        const mapped = transcript.map((t) => {
+            const speaker = (t.personName || '').trim() || 'Unknown Speaker';
+            const text = (t.personTranscript || '').trim();
+            let tsMs = null;
+            if (t.timeStamp) {
+                const parsed = Date.parse(t.timeStamp);
+                if (!Number.isNaN(parsed)) tsMs = parsed;
+            }
+            const offsetSeconds =
+                startMs !== null && tsMs !== null ? Math.max(0, Math.round((tsMs - startMs) / 1000)) : 0;
+
+            return {
+                speaker,
+                text,
+                offsetSeconds,
+                timestampMs: tsMs !== null ? tsMs : undefined,
+            };
+        }).filter(c => c.text);
+
+        if (!mapped.length) {
+            console.log(`[${this.id}] ⚠️ Transcript from extension had no usable entries.`);
+            return;
+        }
+
         if (!this.captionsFile) return;
         try {
-            await fs.promises.writeFile(this.captionsFile, JSON.stringify(this.captions || [], null, 2), 'utf8');
-            console.log(`[${this.id}] 💾 Captions saved to ${this.captionsFile}`);
+            await fs.promises.writeFile(this.captionsFile, JSON.stringify(mapped, null, 2), 'utf8');
+            console.log(`[${this.id}] 💾 Transcript saved to ${this.captionsFile}`);
         } catch (e) {
-            console.error(`[${this.id}] ❌ Failed to write captions file:`, e.message || e);
+            console.error(`[${this.id}] ❌ Failed to write transcript file:`, e.message || e);
         }
     }
 
@@ -1945,28 +2775,130 @@ class Bot {
 
         console.log(`[${this.id}] 📴 Leaving meeting...`);
         
-        // Stop recording first
+        // STEP 1: Stop ALL Node-side intervals FIRST to prevent race conditions
+        console.log(`[${this.id}] 🧹 Stopping all intervals...`);
+        try { 
+            if (this.participantCheckInterval) {
+                clearInterval(this.participantCheckInterval);
+                this.participantCheckInterval = null;
+            }
+        } catch {}
+        
+        try {
+            if (this.speakerActivityInterval) {
+                clearInterval(this.speakerActivityInterval);
+                this.speakerActivityInterval = null;
+            }
+        } catch {}
+        
+        try { this.stopModalDismissal(); } catch {}
+        try { this.stopPageValidityCheck(); } catch {}
+        try { await this.stopKeepAlive(); } catch {}
+        
+        // STEP 2: Fetch transcript and timeframes (page must be in valid state)
+        console.log(`[${this.id}] 💾 Saving transcript and timeframes...`);
+        
+        // Save captions FIRST (timeframes depend on captions)
+        try {
+            await this.saveCaptionsToFile();
+        } catch (e) {
+            console.error(`[${this.id}] Error saving captions:`, e);
+        }
+        
+        // Then save timeframes (generated from captions if DOM detection fails)
+        try {
+            await this.saveSpeakerTimeframesToFile();
+        } catch (e) {
+            console.error(`[${this.id}] Error saving SpeakerTimeframes:`, e);
+        }
+        
+        // Save meeting metrics
+        try {
+            const endTimestamp = getCurrentTimestamp();
+            this.meetingEndTime = endTimestamp.iso;
+            this.meetingEndTimeFormatted = endTimestamp.formatted;
+            console.log(`[${this.id}] 📅 Meeting ended at: ${endTimestamp.formatted} (${endTimestamp.timezone})`);
+            await this.saveMeetingMetrics();
+        } catch (e) {
+            console.error(`[${this.id}] Error saving meeting metrics:`, e);
+        }
+        
+        
+        // STEP 3: Stop browser-side recording and cleanup browser-side intervals
+        try {
+            if (this.page && !this.page.isClosed()) {
+                console.log(`[${this.id}] 🛑 Stopping browser-side recording and cleaning up intervals...`);
+                await this.page.evaluate(() => {
+                    try {
+                        // Stop MediaRecorder and all streams
+                        if (window.__mediaRecorder) {
+                            try {
+                                if (window.__mediaRecorder.state !== 'inactive') {
+                                    window.__mediaRecorder.stop();
+                                }
+                            } catch {}
+                        }
+                        if (window.__recordingStream) {
+                            try {
+                                window.__recordingStream.getTracks().forEach(track => {
+                                    try { track.stop(); } catch {}
+                                });
+                            } catch {}
+                        }
+                        
+                        // Clear ALL browser-side intervals and timeouts
+                        if (window.__recordingTimeoutId) {
+                            clearTimeout(window.__recordingTimeoutId);
+                            window.__recordingTimeoutId = null;
+                        }
+                        if (window.__inactivityParticipantTimeout) {
+                            clearTimeout(window.__inactivityParticipantTimeout);
+                            window.__inactivityParticipantTimeout = null;
+                        }
+                        if (window.__pageValidityInterval) {
+                            clearInterval(window.__pageValidityInterval);
+                            window.__pageValidityInterval = null;
+                        }
+                        if (window.__modalDismissInterval) {
+                            clearInterval(window.__modalDismissInterval);
+                            window.__modalDismissInterval = null;
+                        }
+                        
+                        // Stop captions observer
+                        if (window.__captionsObserver) {
+                            try {
+                                window.__captionsObserver.disconnect();
+                                window.__captionsObserver = null;
+                            } catch {}
+                        }
+                        
+                        console.log('[Browser] ✅ All browser-side resources cleaned up');
+                    } catch (e) {
+                        console.error('[Browser] ❌ Error during browser cleanup:', e);
+                    }
+                }).catch(e => {
+                    console.warn(`[${this.id}] ⚠️ Error during browser-side cleanup:`, e.message);
+                });
+                
+                // Critical delay to ensure MediaRecorder finalizes and sends last chunk
+                await this.page.waitForTimeout(500).catch(() => {});
+            }
+        } catch (e) {
+            // Silently handle target closed errors during cleanup
+            const msg = e.message || String(e);
+            if (!msg.includes('Target closed') && !msg.includes('Session closed')) {
+                console.error(`[${this.id}] ❌ Error stopping browser-side recording:`, e);
+            }
+        }
+        
+        // STEP 4: Stop recording (Node-side flag)
         try { 
             if (this.isCapturing) await this.stopRecording(); 
         } catch (e) {
             console.error(`[${this.id}] Error stopping recording:`, e);
         }
         
-        // Stop all monitoring intervals (GoogleMeetBot enhanced)
-        try { 
-            if (this.participantCheckInterval) clearInterval(this.participantCheckInterval); 
-        } catch {}
-        this.participantCheckInterval = null;
-        try {
-            if (this.speakerActivityInterval) clearInterval(this.speakerActivityInterval);
-        } catch {}
-        this.speakerActivityInterval = null;
-        
-        try { this.stopModalDismissal(); } catch {}
-        try { this.stopPageValidityCheck(); } catch {}
-        try { await this.stopKeepAlive(); } catch {}
-        
-        // Click leave button if not kicked
+        // STEP 5: Click leave button if not kicked (before closing page)
         if (!await this.checkKicked()) {
             const leaveButton = '//button[@aria-label="Leave call"]';
             try {
@@ -1977,36 +2909,73 @@ class Bot {
             }
         }
         
-        // Persist speaker timeframes to runtime/<botId>/SpeakerTimeframes.json
-        try {
-            await this.saveSpeakerTimeframesToFile();
-        } catch (e) {
-            console.error(`[${this.id}] Error saving SpeakerTimeframes:`, e);
-        }
-
-        // Persist live captions (if any) to runtime/<botId>/transcripts/captions.json
-        try {
-            await this.saveCaptionsToFile();
-        } catch (e) {
-            console.error(`[${this.id}] Error saving captions:`, e);
-        }
-
-        // Cleanup browser
-        try { await this.page?.close?.(); } catch {}
-        try { await this.browser?.close?.(); } catch {}
-
-        // Best-effort hard kill of Chrome by PID in case it did not exit cleanly
-        try {
-            if (this.browserPid && Number.isInteger(this.browserPid)) {
-                try { process.kill(this.browserPid, 'SIGTERM'); } catch {}
-                try { process.kill(this.browserPid, 'SIGKILL'); } catch {}
+        // STEP 6: Cleanup browser and page
+        console.log(`[${this.id}] 🌐 Closing browser...`);
+        try { 
+            if (this.page && !this.page.isClosed()) {
+                await this.page.close().catch(() => {}); 
             }
         } catch {}
+        
+        try { 
+            if (this.browser && this.browser.isConnected()) {
+                await this.browser.close().catch(() => {}); 
+            }
+        } catch {}
+        
+        // Brief delay for browser to exit gracefully (optimized)
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        // STEP 7: Force kill Chrome process if still running (platform-specific)
+        console.log(`[${this.id}] 🔪 Force killing browser process...`);
+        try {
+            if (this.browserPid && Number.isInteger(this.browserPid)) {
+                const isWindows = process.platform === 'win32';
+                
+                if (isWindows) {
+                    // Windows: use taskkill to kill process tree
+                    try {
+                        const { execSync } = require('child_process');
+                        // /F = force, /T = kill process tree, /PID = process ID
+                        execSync(`taskkill /F /T /PID ${this.browserPid}`, { 
+                            stdio: 'ignore',
+                            timeout: 5000 
+                        });
+                        console.log(`[${this.id}] ✅ Killed Chrome process tree (Windows) PID: ${this.browserPid}`);
+                    } catch (e) {
+                        // Process might already be dead, ignore
+                    }
+                } else {
+                    // Unix: use SIGTERM then SIGKILL
+                    try { 
+                        process.kill(this.browserPid, 'SIGTERM'); 
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    } catch {}
+                    try { 
+                        process.kill(this.browserPid, 'SIGKILL'); 
+                    } catch {}
+                    console.log(`[${this.id}] ✅ Killed Chrome process (Unix) PID: ${this.browserPid}`);
+                }
+            }
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Error killing browser process:`, e.message);
+        }
 
         // Remove stored PID file
-        try { fs.removeSync(this.browserPidFile); } catch {}
+        try { 
+            if (fs.existsSync(this.browserPidFile)) {
+                fs.removeSync(this.browserPidFile); 
+                console.log(`[${this.id}] ✅ Removed PID file`);
+            }
+        } catch {}
         
-        console.log(`[${this.id}] ✅ Bot finished`);
+        // Final cleanup of any remaining references
+        this.page = null;
+        this.browser = null;
+        this.capture = null;
+        this._cdp = null;
+        
+        console.log(`[${this.id}] ✅ Bot finished and all resources cleaned up`);
         
         // Trigger callback
         try { 
@@ -2031,6 +3000,15 @@ class Bot {
             }
         } catch {}
 
+        // Load meeting metrics if available
+        let meetingMetrics = null;
+        try {
+            if (this.metricsFile && fs.existsSync(this.metricsFile)) {
+                const raw = fs.readFileSync(this.metricsFile, 'utf8');
+                meetingMetrics = JSON.parse(raw);
+            }
+        } catch {}
+
 		return {
 			isCapturing: this.isCapturing,
 			recordingPath: this.recordingPath,
@@ -2041,7 +3019,8 @@ class Bot {
 			recordingFormat: 'webm', // MediaRecorder output
 			recordingDuration: this.recordingStartedAt ? Date.now() - this.recordingStartedAt : 0,
             captionsFile: this.captionsFile,
-            captionsCount: Array.isArray(this.captions) ? this.captions.length : 0
+            captionsCount: Array.isArray(this.captions) ? this.captions.length : 0,
+            meetingMetrics
 		};
 	}
 
