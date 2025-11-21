@@ -129,6 +129,78 @@
 		}
 	}
 
+	/**
+	 * Show welcome message for first-time users in the main app
+	 */
+	function showMainAppWelcome(email) {
+		// Create a simple welcome notification
+		const welcomeAlert = document.createElement('div');
+		welcomeAlert.style.cssText = `
+			position: fixed;
+			top: 20px;
+			right: 20px;
+			background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+			color: white;
+			padding: 20px 25px;
+			border-radius: 12px;
+			box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+			z-index: 10000;
+			max-width: 350px;
+			font-family: 'Poppins', sans-serif;
+			animation: slideInRight 0.4s ease-out;
+		`;
+		
+		welcomeAlert.innerHTML = `
+			<div style="display: flex; align-items: center; margin-bottom: 10px;">
+				<div style="font-size: 24px; margin-right: 10px;">🎉</div>
+				<div>
+					<div style="font-weight: 600; font-size: 16px;">Welcome to CXFlow!</div>
+					<div style="font-size: 14px; opacity: 0.9;">Hello, ${email.split('@')[0]}!</div>
+				</div>
+			</div>
+			<div style="font-size: 14px; line-height: 1.4; margin-bottom: 15px;">
+				You're all set! Start by creating your first meeting bot to experience AI-powered meeting transcription and summaries.
+			</div>
+			<button onclick="this.parentElement.remove()" style="
+				background: rgba(255, 255, 255, 0.2);
+				border: none;
+				color: white;
+				padding: 8px 16px;
+				border-radius: 6px;
+				cursor: pointer;
+				font-size: 14px;
+				font-weight: 500;
+				font-family: 'Poppins', sans-serif;
+			">Got it!</button>
+		`;
+		
+		// Add animation styles
+		const style = document.createElement('style');
+		style.textContent = `
+			@keyframes slideInRight {
+				from {
+					opacity: 0;
+					transform: translateX(100px);
+				}
+				to {
+					opacity: 1;
+					transform: translateX(0);
+				}
+			}
+		`;
+		document.head.appendChild(style);
+		
+		document.body.appendChild(welcomeAlert);
+		
+		// Auto-remove after 8 seconds
+		setTimeout(() => {
+			if (welcomeAlert.parentElement) {
+				welcomeAlert.style.animation = 'slideInRight 0.3s ease-out reverse';
+				setTimeout(() => welcomeAlert.remove(), 300);
+			}
+		}, 8000);
+	}
+
 	function initAuth() {
 		const token = getAuthToken();
 		const email = getUserEmail();
