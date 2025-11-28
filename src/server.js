@@ -1,22 +1,78 @@
 const express = require('express');
+const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const { Bot } = require('./bot');
 const path = require('path');
 const fs = require('fs-extra');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const { spawn } = require('child_process');
+const { remuxWebmToMp4 } = require('./utils/remux');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { userOps, botOps, closeDatabase } = require('./database');
-const { generateAndSaveSummary, getModelInfo } = require('./openai-service');
+const { userOps, botOps, configOps, closeDatabase } = require('./database');
+const { generateAndSaveSummary, getModelInfo, getDefaultSummaryTemplate } = require('./openai-service');
 
 const app = express();
-app.use(express.json());
-// Serve static frontend
-app.use(express.static(path.join(__dirname, '../public')));
 
-const PORT = process.env.PORT || 3000;
+// CORS configuration for frontend
+// Allow origins from environment variable or use default allowed origins
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+  : [
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'https://biometrictesting.fiscoclic.mx',
+      'https://www.biometrictesting.fiscoclic.mx'
+    ];
+
+// CORS middleware with origin callback
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps, Postman, curl, server-to-server)
+    if (!origin) {
+      return callback(null, true);
+    }
+    
+    // Log CORS requests for debugging (remove in production if not needed)
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[CORS] Request from origin: ${origin}`);
+      console.log(`[CORS] Allowed origins:`, allowedOrigins);
+    }
+    
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Log rejected origins
+    console.warn(`[CORS] Rejected origin: ${origin}`);
+    return callback(new Error(`Not allowed by CORS. Origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Origin', 'X-Requested-With', 'Accept'],
+    // Expose range-related headers so the frontend can inspect them via fetch/HEAD
+exposedHeaders: ['Content-Length', 'Content-Type', 'Accept-Ranges', 'Content-Range'],
+  maxAge: 86400, // 24 hours
+}));
+
+// Optional: handle OPTIONS explicitly for all routes
+app.options('*', cors());
+
+app.use(express.json());
+// Static frontend serving is disabled by default because this project
+// uses a Next.js frontend served separately. To enable serving the
+// legacy `public/` folder from this backend, set
+// `SERVE_STATIC_FRONTEND=true` in your environment.
+if (process.env.SERVE_STATIC_FRONTEND === 'true') {
+    app.use(express.static(path.join(__dirname, '../public')));
+} else {
+    console.log('ℹ️  Static public serving is disabled (use NEXT frontend). To enable, set SERVE_STATIC_FRONTEND=true');
+}
+
+const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_in_production';
+// URL of the Next.js frontend (used for redirects instead of serving HTML)
+const FRONTEND_URL = process.env.FRONTEND_URL || process.env.BASE_URL || 'http://localhost:3000';
 const RUNTIME_DIR = path.join(__dirname, '../runtime/bots');
 const RUNTIME_ROOT = path.join(__dirname, '../runtime');
 fs.ensureDirSync(RUNTIME_ROOT);
@@ -28,6 +84,52 @@ const BOT_MAX_LIFETIME_MINUTES = Number(process.env.BOT_MAX_LIFETIME_MINUTES || 
 const BOT_MAX_LIFETIME_MS = BOT_MAX_LIFETIME_MINUTES * 60 * 1000;
 // In-memory storage for active bots
 const activeBots = new Map();
+
+// Cache recording storage location to avoid repeated S3 checks for every range request
+// Values: 'local' | 's3' ; stored with timestamp for optional TTL
+const recordingStorageCache = new Map();
+
+// TTL for recordingStorageCache entries (ms). Default 10 minutes, override with env var
+const RECORDING_STORAGE_CACHE_TTL_MS = Number(process.env.RECORDING_STORAGE_CACHE_TTL_MS || 10 * 60 * 1000);
+
+/**
+ * Get cache entry for a recording, evicting it if TTL expired.
+ * @param {string} recordingId
+ * @returns {{where:string,ts:number}|null}
+ */
+function getRecordingStorageCacheEntry(recordingId) {
+    try {
+        const entry = recordingStorageCache.get(recordingId);
+        if (!entry) return null;
+        if (Date.now() - (entry.ts || 0) > RECORDING_STORAGE_CACHE_TTL_MS) {
+            recordingStorageCache.delete(recordingId);
+            return null;
+        }
+        return entry;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Find video file for a bot (checks both .webm and .mp4 extensions)
+ * @param {string} botId - Bot ID
+ * @param {string} videoDir - Video directory path
+ * @returns {Promise<string|null>} Path to video file or null if not found
+ */
+async function findVideoFile(botId, videoDir) {
+    // Check for .mp4 first (compressed files), then .webm (original)
+    const mp4Path = path.join(videoDir, `${botId}.mp4`);
+    const webmPath = path.join(videoDir, `${botId}.webm`);
+    
+    if (await fs.pathExists(mp4Path)) {
+        return mp4Path;
+    }
+    if (await fs.pathExists(webmPath)) {
+        return webmPath;
+    }
+    return null;
+}
 
 // Authentication middleware
 function authMiddleware(req, res, next) {
@@ -186,6 +288,25 @@ app.post('/api/signup', async (req, res) => {
         const userId = uuidv4();
         userOps.create(userId, email, hash);
         
+        // Create default configuration for new user
+        try {
+            const DEFAULT_BOT_LOGO_URL = "https://www.cxflow.io/app/images/logo.png";
+            const defaultSummaryTemplate = getDefaultSummaryTemplate();
+            configOps.upsert(userId, {
+                botName: "CXFlow Meeting Bot",
+                // Set the default webhook_url requested for new users
+                webhookUrl: null,
+                summaryTemplate: defaultSummaryTemplate,
+                botLogoUrl: DEFAULT_BOT_LOGO_URL,
+                maxRecordingTime: 60,
+                totalRecordingMinutes: 0
+            });
+            console.log(`✅ Default configuration created for user ${userId}`);
+        } catch (configError) {
+            console.warn(`⚠️  Could not create default configuration for user ${userId}:`, configError.message);
+            // Don't fail signup if config creation fails
+        }
+        
         // Generate verification token and send email
         const verificationToken = uuidv4();
         const expires = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
@@ -328,98 +449,24 @@ app.post('/api/verify-email-manual', async (req, res) => {
 app.get('/api/verify-email', async (req, res) => {
     try {
         const { token } = req.query;
-        
+        // If no token provided, redirect to frontend verification page
         if (!token) {
-            return res.status(400).send(`
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Email Verification - CXFlow</title>
-                    <style>
-                        body { font-family: 'Poppins', Arial, sans-serif; text-align: center; padding: 50px; background: #f3f4f6; }
-                        .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-                        .error { color: #dc2626; }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1 class="error">❌ Invalid Verification Link</h1>
-                        <p>The verification link is invalid or missing.</p>
-                        <a href="/signup.html">Sign up again</a>
-                    </div>
-                </body>
-                </html>
-            `);
+            return res.redirect(`${FRONTEND_URL}/verify-email?status=invalid`);
         }
-        
+
+        // Verify the token and redirect to frontend pages instead of serving HTML
         const user = userOps.verifyEmail(token);
-        
+
         if (user) {
-            res.send(`
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Email Verified - CXFlow</title>
-                    <style>
-                        body { font-family: 'Poppins', Arial, sans-serif; text-align: center; padding: 50px; background: #f3f4f6; }
-                        .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-                        .success { color: #059669; }
-                        .button { display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: 600; margin-top: 20px; }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1 class="success">✅ Email Verified Successfully!</h1>
-                        <p>Your email address has been verified. You can now sign in to your CXFlow account.</p>
-                        <a href="/signin.html" class="button">Sign In Now</a>
-                    </div>
-                </body>
-                </html>
-            `);
+            // Successful verification -> redirect to frontend sign-in or confirmation page
+            return res.redirect(`${FRONTEND_URL}/signin?verified=1`);
         } else {
-            res.status(400).send(`
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Email Verification - CXFlow</title>
-                    <style>
-                        body { font-family: 'Poppins', Arial, sans-serif; text-align: center; padding: 50px; background: #f3f4f6; }
-                        .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-                        .error { color: #dc2626; }
-                        .button { display: inline-block; background: #6b7280; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: 600; margin-top: 20px; }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1 class="error">❌ Verification Failed</h1>
-                        <p>The verification link is invalid or has expired. Please sign up again to receive a new verification email.</p>
-                        <a href="/signup.html" class="button">Sign Up Again</a>
-                    </div>
-                </body>
-                </html>
-            `);
+            // Verification failed or expired
+            return res.redirect(`${FRONTEND_URL}/verify-email?status=failed`);
         }
     } catch (error) {
         console.error('Email verification error:', error);
-        res.status(500).send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Email Verification Error - CXFlow</title>
-                <style>
-                    body { font-family: 'Poppins', Arial, sans-serif; text-align: center; padding: 50px; background: #f3f4f6; }
-                    .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-                    .error { color: #dc2626; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1 class="error">❌ Server Error</h1>
-                    <p>An error occurred during email verification. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        `);
+        return res.redirect(`${FRONTEND_URL}/verify-email?status=error`);
     }
 });
 
@@ -484,8 +531,8 @@ app.post('/api/forgot-password', async (req, res) => {
         // Check if user exists
         const user = userOps.findByEmail(email);
         if (!user) {
-            // Don't reveal if email exists or not for security
-            return res.json({ success: true, message: 'If an account with that email exists, we sent a reset link.' });
+            // Explicit error when email not found (caller requested this behavior)
+            return res.status(404).json({ error: 'No account found with this email address' });
         }
         
         // Generate reset token (valid for 1 hour)
@@ -494,13 +541,17 @@ app.post('/api/forgot-password', async (req, res) => {
         
         // Save reset token to database
         userOps.setResetToken(email, resetToken, resetExpires);
-        
-        // Send reset email
+
+        // Send reset email and honor helper result
         const { sendPasswordResetEmail } = require('./utils/email-service');
         const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
-        
-        await sendPasswordResetEmail(email, resetToken, baseUrl);
-        
+
+        const emailResult = await sendPasswordResetEmail(email, resetToken, baseUrl);
+        if (!emailResult || emailResult.success === false) {
+            console.error(`❌ Failed to send password reset email to ${email}:`, emailResult && emailResult.error ? emailResult.error : 'unknown');
+            return res.status(500).json({ error: 'Failed to send reset email. Please try again later.' });
+        }
+
         console.log(`✅ Password reset email sent to: ${email}`);
         res.json({ success: true, message: 'Password reset email sent successfully.' });
         
@@ -553,7 +604,7 @@ app.post('/api/reset-password', async (req, res) => {
  */
 app.post('/api/share-via-email', async (req, res) => {
     try {
-        const { botId, shareUrl, isPublicShare } = req.body;
+        const { botId, shareUrl, isPublicShare, email } = req.body;
         
         if (!botId) {
             return res.status(400).json({ error: 'Bot ID is required' });
@@ -593,15 +644,22 @@ app.post('/api/share-via-email', async (req, res) => {
                 return res.status(404).json({ error: 'Meeting not found in database' });
             }
             
-            // Get the bot owner's email
-            user = userOps.findById(bot.user_id);
-            if (!user || !user.email || !user.email_verified) {
-                return res.status(400).json({ 
-                    error: 'Cannot send email - bot owner email not available or not verified' 
-                });
+            // If a specific recipient email was provided in the public share request, honor it
+            if (email && typeof email === 'string' && email.trim()) {
+                // Use the provided email address directly (no verification of owner required)
+                const providedEmail = email.trim();
+                user = { email: providedEmail };
+                console.log(`📧 Public share: sending bot ${botId} summary to provided email: ${providedEmail}...`);
+            } else {
+                // Get the bot owner's email
+                user = userOps.findById(bot.user_id);
+                if (!user || !user.email || !user.email_verified) {
+                    return res.status(400).json({ 
+                        error: 'Cannot send email - bot owner email not available or not verified' 
+                    });
+                }
+                console.log(`📧 Public share: sending bot ${botId} summary to owner: ${user.email}...`);
             }
-            
-            console.log(`📧 Public share: sending bot ${botId} summary to owner: ${user.email}...`);
         } else {
             // For authenticated users (original functionality)
             if (!req.user || !req.user.id) {
@@ -614,13 +672,21 @@ app.post('/api/share-via-email', async (req, res) => {
                 return res.status(403).json({ error: 'Bot not found or access denied' });
             }
             
-            // Get user email
+            // Get user email (default recipient when no explicit email provided)
             user = userOps.findById(req.user.id);
             if (!user || !user.email || !user.email_verified) {
                 return res.status(400).json({ error: 'User email not found or not verified' });
             }
-            
-            console.log(`📧 Authenticated share: sending bot ${botId} to: ${user.email}...`);
+
+            // If an explicit email was provided in the authenticated request, prefer that
+            if (email && typeof email === 'string' && email.trim()) {
+                const providedEmail = email.trim();
+                // Use provided email as recipient (do not change account ownership)
+                user = { email: providedEmail };
+                console.log(`📧 Authenticated share: sending bot ${botId} to provided email: ${providedEmail}...`);
+            } else {
+                console.log(`📧 Authenticated share: sending bot ${botId} to: ${user.email}...`);
+            }
         }
         
         // Send email with meeting summary
@@ -657,6 +723,119 @@ app.post('/api/share-via-email', async (req, res) => {
 });
 
 /**
+ * Get user configuration (authenticated)
+ */
+app.get('/api/config', authMiddleware, async (req, res) => {
+    try {
+        let config = configOps.getByUserId(req.user.id);
+        
+        // If no configuration exists, create default configuration
+        if (!config) {
+            const DEFAULT_BOT_LOGO_URL = "https://www.cxflow.io/app/images/logo.png";
+            const defaultSummaryTemplate = getDefaultSummaryTemplate();
+            try {
+                configOps.upsert(req.user.id, {
+                    botName: "CXFlow Meeting Bot",
+                    webhookUrl: null,
+                    summaryTemplate: defaultSummaryTemplate,
+                    botLogoUrl: DEFAULT_BOT_LOGO_URL,
+                    maxRecordingTime: 60,
+                    totalRecordingMinutes: 0
+                });
+                config = configOps.getByUserId(req.user.id);
+                console.log(`✅ Default configuration created for existing user ${req.user.id}`);
+            } catch (configError) {
+                console.warn(`⚠️  Could not create default configuration for user ${req.user.id}:`, configError.message);
+                // Fallback to defaults if creation fails
+                return res.json({
+                    botName: '',
+                    webhookUrl: '',
+                    summaryTemplate: defaultSummaryTemplate,
+                    botLogoUrl: DEFAULT_BOT_LOGO_URL,
+                    maxRecordingTime: 60,
+                    totalRecordingMinutes: 0
+                });
+            }
+        }
+        
+        // Convert snake_case to camelCase for frontend
+        // Use default logo if no custom logo is configured
+        const DEFAULT_BOT_LOGO_URL = "https://www.cxflow.io/app/images/logo.png";
+        
+        // Debug: Log the summary_template value
+        console.log(`📋 Config for user ${req.user.id}: summary_template =`, config.summary_template ? `[${config.summary_template.length} chars]` : 'null/empty');
+        
+        res.json({
+            botName: config.bot_name || '',
+            webhookUrl: config.webhook_url || '',
+            summaryTemplate: config.summary_template ?? '', // Use nullish coalescing to preserve empty strings
+            botLogoUrl: (config.bot_logo_url && config.bot_logo_url.trim()) || DEFAULT_BOT_LOGO_URL,
+            maxRecordingTime: config.max_recording_time || 60,
+            totalRecordingMinutes: config.total_recording_minutes || 0
+        });
+    } catch (error) {
+        console.error('Error fetching user configuration:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * Save user configuration (authenticated)
+ */
+app.post('/api/configSave', authMiddleware, async (req, res) => {
+    try {
+        const {
+            botName,
+            webhookUrl,
+            summaryTemplate,
+            botLogoUrl,
+            maxRecordingTime,
+            totalRecordingMinutes
+        } = req.body;
+        
+        // Validate input
+        if (maxRecordingTime && (maxRecordingTime < 1 || maxRecordingTime > 480)) {
+            return res.status(400).json({ 
+                error: 'Maximum recording time must be between 1 and 480 minutes' 
+            });
+        }
+        
+        // Use default logo if empty string is provided
+        const DEFAULT_BOT_LOGO_URL = "https://www.cxflow.io/app/images/logo.png";
+        const finalBotLogoUrl = (botLogoUrl && botLogoUrl.trim()) || DEFAULT_BOT_LOGO_URL;
+        
+        // Save configuration
+        const savedConfig = configOps.upsert(req.user.id, {
+            botName,
+            webhookUrl,
+            summaryTemplate,
+            botLogoUrl: finalBotLogoUrl,
+            maxRecordingTime: maxRecordingTime || 60,
+            totalRecordingMinutes: totalRecordingMinutes || 0
+        });
+        
+        console.log(`✅ Configuration saved for user ${req.user.id}`);
+        
+        // Return saved configuration in camelCase
+        res.json({
+            success: true,
+            message: 'Configuration saved successfully',
+            config: {
+                botName: savedConfig.bot_name || '',
+                webhookUrl: savedConfig.webhook_url || '',
+                summaryTemplate: savedConfig.summary_template || '',
+                botLogoUrl: savedConfig.bot_logo_url || '',
+                maxRecordingTime: savedConfig.max_recording_time || 60,
+                totalRecordingMinutes: savedConfig.total_recording_minutes || 0
+            }
+        });
+    } catch (error) {
+        console.error('Error saving user configuration:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
  * Get user's bots (authenticated)
  */
 app.get('/api/bots', authMiddleware, async (req, res) => {
@@ -664,17 +843,34 @@ app.get('/api/bots', authMiddleware, async (req, res) => {
         const userBots = botOps.findByUserId(req.user.id);
         
         // Convert snake_case to camelCase for frontend compatibility
-        const formattedBots = userBots.map(bot => ({
-            id: bot.id,
-            userId: bot.user_id,
-            meetUrl: bot.meet_url,
-            title: bot.title,
-            status: bot.status,
-            error: bot.error,
-            createdAt: bot.created_at,
-            startedAt: bot.started_at,
-            endTime: bot.ended_at
-        }));
+        const formattedBots = [];
+        for (const bot of userBots) {
+            // Prefer runtime metadata title when available (e.g. AI-generated or extension-provided title)
+            let resolvedTitle = bot.title;
+            try {
+                const metadataPath = path.join(RUNTIME_ROOT, String(bot.id), 'bot_metadata.json');
+                if (await fs.pathExists(metadataPath)) {
+                    const metadata = await fs.readJson(metadataPath);
+                    if (metadata && metadata.title && typeof metadata.title === 'string' && metadata.title.trim().length > 0) {
+                        resolvedTitle = metadata.title;
+                    }
+                }
+            } catch (e) {
+                // If anything goes wrong reading metadata, fall back to DB title
+            }
+
+            formattedBots.push({
+                id: bot.id,
+                userId: bot.user_id,
+                meetUrl: bot.meet_url,
+                title: resolvedTitle,
+                status: bot.status,
+                error: bot.error,
+                createdAt: bot.created_at,
+                startedAt: bot.started_at,
+                endTime: bot.ended_at
+            });
+        }
         
         // Also check runtime directory for historical bots not in DB
         try {
@@ -691,10 +887,11 @@ app.get('/api/bots', authMiddleware, async (req, res) => {
                 if (!stat || !stat.isDirectory()) continue;
                 
                 // Check if this directory has bot data (video, transcript, or summary)
-                const videoPath = path.join(botDir, 'video', `${dirName}.webm`);
+                const videoDir = path.join(botDir, 'video');
+                const videoPath = await findVideoFile(dirName, videoDir);
                 const metricsPath = path.join(botDir, 'MeetingMetrics.json');
                 const metadataPath = path.join(botDir, 'bot_metadata.json');
-                const hasData = await fs.pathExists(videoPath) || await fs.pathExists(metricsPath);
+                const hasData = (videoPath !== null) || await fs.pathExists(metricsPath);
                 
                 if (hasData) {
                     // Check user ownership from metadata file
@@ -867,8 +1064,13 @@ app.get('/api/bots/:id', authMiddleware, async (req, res) => {
             if (fs.existsSync(metadataPath)) {
                 try {
                     const metadata = fs.readJsonSync(metadataPath);
+                    // Prefer metadata.title from runtime if available (e.g. AI-generated or extension-provided title)
+                    if (metadata && metadata.title && typeof metadata.title === 'string' && metadata.title.trim().length > 0) {
+                        formattedBot.title = metadata.title;
+                    }
                     if (metadata.s3Key || metadata.s3VideoUrl) {
                         // Generate signed URL for secure access (expires in 4 hours)
+                        // URL is cached to avoid regenerating on every request
                         const { getS3VideoUrl } = require('./utils/s3-upload');
                         const signedUrl = await getS3VideoUrl(req.params.id, null, 14400); // 4 hours
                         
@@ -966,10 +1168,30 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
 
         const {
             meeting_url,
-            bot_name = "CXFlow Meeting Bot",
             caption_language = "es",  // Default to Spanish
-            email_recipients = null  // Optional: comma-separated email addresses
+            notification_emails = null,  // Optional: comma-separated email addresses (snake_case)
+            recording_type = "audio-video",
+            meeting_type = "other",
         } = req.body;
+
+        // Get user configuration if fields are not provided
+        let userConfig = null;
+        try {
+            userConfig = configOps.getByUserId(req.user.id);
+        } catch (e) {
+            console.warn(`⚠️  Could not load user config for ${req.user.id}:`, e.message);
+        }
+
+        // Use provided values or fall back to user config or defaults
+        const finalBotName = (userConfig?.bot_name) || "CXFlow Meeting Bot";
+        const finalSummaryTemplate = (userConfig?.summary_template) || null;
+        const finalMaxRecordingTime = (userConfig?.max_recording_time) || 60;
+        // Accept both snake_case and camelCase keys from different clients
+        let finalEmailRecipients = notification_emails;
+        // Normalize empty strings to 
+        // Use default logo if no custom logo is configured
+        const DEFAULT_BOT_LOGO_URL = "https://www.cxflow.io/app/images/logo.png";
+        const finalBotLogoUrl = (userConfig?.bot_logo_url && userConfig.bot_logo_url.trim()) || DEFAULT_BOT_LOGO_URL;
 
         // Validate required fields
         if (!meeting_url) {
@@ -996,7 +1218,7 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
         console.log(`🤖 Creating bot ${botId} for user ${req.user.id}: ${meeting_url}`);
         
         // Save bot to database (user is authenticated at this point)
-        botOps.create(botId, req.user.id, meeting_url, bot_name);
+        botOps.create(botId, req.user.id, meeting_url, finalBotName);
         
         // Save user_id to metadata file for historical recovery
         try {
@@ -1007,8 +1229,15 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 botId,
                 userId: req.user.id, // User is authenticated, so this is always available
                 meetUrl: meeting_url,
-                title: bot_name,
+                title: finalBotName,
                 captionLanguage: caption_language || 'es', // Save language preference
+                recordingType: recording_type,
+                meetingType: meeting_type,
+                summaryTemplate: finalSummaryTemplate,
+                maxRecordingTime: finalMaxRecordingTime,
+                // Include user's configured webhook URL (if any) so runtime metadata reflects it
+                webhookUrl: userConfig?.webhook_url || null,
+                emailRecipients: finalEmailRecipients,
                 createdAt: new Date().toISOString()
             });
         } catch (e) {
@@ -1029,6 +1258,12 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                     botData.ttlTimer = null;
                 }
                 
+                // Clear max recording time timer
+                if (botData.maxRecordingTimer) {
+                    clearTimeout(botData.maxRecordingTimer);
+                    botData.maxRecordingTimer = null;
+                }
+                
                 // Update database status (user is authenticated, so bot is in DB)
                 try {
                     botOps.updateStatus(botId, 'completed');
@@ -1040,7 +1275,21 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
              // Generate summary from transcript
              try {
                 console.log(`📝 Bot ${botId}: generating meeting summary...`);
-                await generateAndSaveSummary(botId, RUNTIME_ROOT);
+                // Get summary template and meeting type from metadata if available
+                let summaryTemplateToUse = null;
+                let meetingTypeToUse = null;
+                try {
+                    const botDir = path.join(RUNTIME_ROOT, botId);
+                    const metadataPath = path.join(botDir, 'bot_metadata.json');
+                    if (await fs.pathExists(metadataPath)) {
+                        const metadata = await fs.readJson(metadataPath);
+                        summaryTemplateToUse = metadata.summaryTemplate || null;
+                        meetingTypeToUse = metadata.meetingType || null;
+                    }
+                } catch (e) {
+                    console.warn(`⚠️  Could not read metadata for summary template: ${e.message}`);
+                }
+                await generateAndSaveSummary(botId, RUNTIME_ROOT, summaryTemplateToUse, meetingTypeToUse);
                 console.log(`✅ Bot ${botId}: summary generated successfully`);
             } catch (e) {
                 console.error(`❌ Error generating summary for bot ${botId}:`, e && e.message ? e.message : e);
@@ -1076,62 +1325,136 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 console.warn(`⚠️  Could not update meeting title for ${botId}:`, e.message);
             }
 
-            // Send email summary to bot creator (after summary is generated)
+            // Send email summary to all recipients (bot creator + provided emails)
             try {
+                const { sendMeetingSummaryEmail } = require('./utils/email-service');
+                const allRecipients = new Set();
+                console.log(`🧾 Bot ${botId}: configured botData.emailRecipients =`, botData?.emailRecipients);
+                try {
+                    const metadataPath = path.join(RUNTIME_ROOT, botId, 'bot_metadata.json');
+                    if (await fs.pathExists(metadataPath)) {
+                        const metadata = await fs.readJson(metadataPath).catch(() => null);
+                        console.log(`🧾 Bot ${botId}: metadata.emailRecipients =`, metadata && metadata.emailRecipients);
+                    }
+                } catch (metaErr) {
+                    console.warn(`⚠️ Bot ${botId}: could not read metadata for email debug:`, metaErr && metaErr.message ? metaErr.message : metaErr);
+                }
+                
                 // Get bot from database to find the user who created it
                 const bot = botOps.findById(botId);
                 if (bot && bot.user_id) {
                     // Get user email
                     const user = userOps.findById(bot.user_id);
                     if (user && user.email && user.email_verified) {
-                        const { sendMeetingSummaryEmail } = require('./utils/email-service');
-                        console.log(`📧 Bot ${botId}: sending meeting summary email to bot creator: ${user.email}...`);
-                        
-                        const emailResult = await sendMeetingSummaryEmail({
-                            botId: botId,
-                            meetUrl: bot.meet_url,
-                            recipients: user.email,
-                            runtimeRoot: RUNTIME_ROOT
-                        });
-                        
-                        if (emailResult.success) {
-                            console.log(`✅ Bot ${botId}: summary email sent successfully to ${user.email} (${emailResult.attachments} attachments)`);
-                        } else {
-                            console.log(`⚠️ Bot ${botId}: email sending failed - ${emailResult.message || emailResult.error}`);
+                        allRecipients.add(user.email);
+                    }
+                }
+                
+                // Add email recipients from request/configuration
+                if (botData && botData.emailRecipients) {
+                    try {
+                        let emails = [];
+                        // Accept array or comma-separated string
+                        if (Array.isArray(botData.emailRecipients)) {
+                            emails = botData.emailRecipients.map(e => String(e).trim()).filter(e => e);
+                        } else if (typeof botData.emailRecipients === 'string') {
+                            emails = botData.emailRecipients.split(',').map(e => e.trim()).filter(e => e);
+                        } else if (botData.emailRecipients && typeof botData.emailRecipients === 'object') {
+                            // Might be stored as JSON/object with a field 'emails' or similar
+                            if (Array.isArray(botData.emailRecipients.emails)) {
+                                emails = botData.emailRecipients.emails.map(e => String(e).trim()).filter(e => e);
+                            }
                         }
-                    } else if (user && !user.email_verified) {
-                        console.log(`⚠️ Bot ${botId}: user email not verified, skipping summary email`);
+
+                        emails.forEach(email => allRecipients.add(email));
+                    } catch (e) {
+                        console.warn(`⚠️ Bot ${botId}: could not parse configured email recipients:`, e && e.message ? e.message : e);
+                    }
+                }
+                
+                // Send email to all recipients
+                if (allRecipients.size > 0) {
+                    // Convert Set to array for cleaner passing to email service
+                    const recipientsArray = Array.from(allRecipients);
+                    
+                    const emailResult = await sendMeetingSummaryEmail({
+                        botId: botId,
+                        meetUrl: botData?.meetingUrl || (bot ? bot.meet_url : meeting_url),
+                        recipients: recipientsArray, // Pass as array - email-service.js handles both array and string
+                        runtimeRoot: RUNTIME_ROOT
+                    });
+                    
+                    if (emailResult.success) {
+                        console.log(`✅ Bot ${botId}: summary email sent successfully to ${allRecipients.size} recipient(s) (${emailResult.attachments} attachments)`);
                     } else {
-                        console.log(`⚠️ Bot ${botId}: user not found or no email, skipping summary email`);
+                        console.log(`⚠️ Bot ${botId}: email sending failed - ${emailResult.message || emailResult.error}`);
                     }
                 } else {
-                    console.log(`⚠️ Bot ${botId}: bot not found in database, skipping summary email`);
+                    console.log(`⚠️ Bot ${botId}: no valid email recipients found, skipping summary email`);
                 }
             } catch (e) {
                 console.error(`❌ Error sending summary email for bot ${botId}:`, e && e.message ? e.message : e);
             }
 
-             // Also send to additional recipients if configured (legacy functionality)
-             if (botData && botData.emailRecipients) {
-                try {
-                    const { sendMeetingSummaryEmail } = require('./utils/email-service');
-                    console.log(`📧 Bot ${botId}: sending meeting summary email to additional recipients: ${botData.emailRecipients}...`);
+             // Update user's total recording minutes
+             try {
+                const bot = botOps.findById(botId);
+                if (bot && bot.user_id) {
+                    // Try to get recording duration from metrics
+                    let recordingDurationMinutes = 0;
+                    const botDir = path.join(RUNTIME_ROOT, botId);
+                    const metricsPath = path.join(botDir, 'MeetingMetrics.json');
                     
-                    const emailResult = await sendMeetingSummaryEmail({
-                        botId: botId,
-                        meetUrl: botData.meetingUrl,
-                        recipients: botData.emailRecipients,
-                        runtimeRoot: RUNTIME_ROOT
-                    });
-                    
-                    if (emailResult.success) {
-                        console.log(`✅ Bot ${botId}: additional email sent successfully (${emailResult.attachments} attachments)`);
-                    } else {
-                        console.log(`⚠️ Bot ${botId}: additional email sending failed - ${emailResult.message || emailResult.error}`);
+                    if (await fs.pathExists(metricsPath)) {
+                        try {
+                            const metrics = await fs.readJson(metricsPath);
+                            if (metrics.duration && metrics.duration.totalMinutes) {
+                                recordingDurationMinutes = Math.ceil(metrics.duration.totalMinutes); // Round up to nearest minute
+                                console.log(`📊 Bot ${botId}: recording duration from metrics: ${recordingDurationMinutes} minutes`);
+                            }
+                        } catch (e) {
+                            console.warn(`⚠️  Could not read metrics for duration: ${e.message}`);
+                        }
                     }
-                } catch (e) {
-                    console.error(`❌ Error sending additional email for bot ${botId}:`, e && e.message ? e.message : e);
+                    
+                    // Fallback: calculate from bot stats if metrics not available
+                    if (recordingDurationMinutes === 0 && botData?.bot) {
+                        try {
+                            const stats = botData.bot.getStats();
+                            if (stats.recordingDuration && stats.recordingDuration > 0) {
+                                recordingDurationMinutes = Math.ceil(stats.recordingDuration / 60000); // Convert ms to minutes, round up
+                                console.log(`📊 Bot ${botId}: recording duration from stats: ${recordingDurationMinutes} minutes`);
+                            }
+                        } catch (e) {
+                            console.warn(`⚠️  Could not get duration from stats: ${e.message}`);
+                        }
+                    }
+                    
+                    // Only update if we have a valid duration
+                    if (recordingDurationMinutes > 0) {
+                        // Get current user configuration
+                        const currentConfig = configOps.getByUserId(bot.user_id);
+                        const currentTotalMinutes = currentConfig?.total_recording_minutes || 0;
+                        const newTotalMinutes = currentTotalMinutes + recordingDurationMinutes;
+                        
+                        // Update user configuration with new total
+                        configOps.upsert(bot.user_id, {
+                            botName: currentConfig?.bot_name || null,
+                            webhookUrl: currentConfig?.webhook_url || null,
+                            summaryTemplate: currentConfig?.summary_template || null,
+                            botLogoUrl: currentConfig?.bot_logo_url || null,
+                            maxRecordingTime: currentConfig?.max_recording_time || 60,
+                            totalRecordingMinutes: newTotalMinutes
+                        });
+                        
+                        console.log(`✅ Bot ${botId}: updated user total recording minutes: ${currentTotalMinutes} + ${recordingDurationMinutes} = ${newTotalMinutes} minutes`);
+                    } else {
+                        console.warn(`⚠️  Bot ${botId}: could not determine recording duration, skipping total minutes update`);
+                    }
                 }
+            } catch (e) {
+                console.error(`❌ Error updating total recording minutes for bot ${botId}:`, e && e.message ? e.message : e);
+                // Don't fail the cleanup if this update fails
             }
 
             // If a recording file exists, compress and extract audio
@@ -1139,7 +1462,7 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 const botInstance = botData?.bot;
                 if (botInstance && typeof botInstance.getStats === 'function') {
                     const stats = botInstance.getStats();
-                    const recordingFile = stats.recordingFile || stats.recordingPath;
+                    let recordingFile = stats.recordingFile || stats.recordingPath;
                     if (recordingFile && fs.existsSync(recordingFile)) {
                         // Compress video to reduce file size (enabled by default for optimization)
                         // Can be disabled by setting ENABLE_VIDEO_COMPRESSION=false for maximum speed
@@ -1149,42 +1472,78 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                         const fastMode = process.env.FAST_VIDEO_MODE === 'true';
                         const stats = fs.statSync(recordingFile);
                         const sizeMB = stats.size / 1024 / 1024;
-                        if (enableCompression && !(fastMode && sizeMB < 50)) {
-                            try {
-                                console.log(`🗜️  Bot ${botId}: compressing video (${sizeMB.toFixed(1)} MB)...`);
-                                const { compressVideoInPlace, getCompressionRecommendations } = require('./utils/video-compression');
+                        // if (enableCompression && fastMode) {
+                        //     try {
+                        //         console.log(`🗜️  Bot ${botId}: compressing video (${sizeMB.toFixed(1)} MB)...`);
+                        //         const { compressVideoInPlace, getCompressionRecommendations } = require('./utils/video-compression');
                                 
-                                // Get compression recommendations
-                                const recommendations = await getCompressionRecommendations(recordingFile);
+                        //         // Get compression recommendations
+                        //         const recommendations = await getCompressionRecommendations(recordingFile);
                                 
-                                if (recommendations.shouldCompress) {
-                                    console.log(`💡 Bot ${botId}: ${recommendations.reason}`);
-                                    const result = await compressVideoInPlace(recordingFile, recommendations.settings);
-                                    console.log(`✅ Bot ${botId}: video compressed - saved ${result.reductionPercent}% (${result.inputSizeMB - result.outputSizeMB} MB)`);
-                                } else {
-                                    console.log(`ℹ️  Bot ${botId}: compression skipped - ${recommendations.reason}`);
-                                }
-                            } catch (e) {
-                                console.error(`❌ Error compressing video for bot ${botId}:`, e && e.message ? e.message : e);
-                                // Continue even if compression fails
-                            }
-                        }
+                        //         if (recommendations.shouldCompress) {
+                        //             console.log(`💡 Bot ${botId}: ${recommendations.reason}`);
+                        //             const result = await compressVideoInPlace(recordingFile, recommendations.settings);
+                        //             console.log(`✅ Bot ${botId}: video compressed - saved ${result.reductionPercent}% (${result.inputSizeMB - result.outputSizeMB} MB)`);
+                                    
+                        //             // Update recordingFile to point to compressed file (may have different extension)
+                        //             if (result.outputPath) {
+                        //                 recordingFile = result.outputPath;
+                        //                 console.log(`📝 Bot ${botId}: updated recording file path to: ${recordingFile}`);
+                                        
+                        //                 // Update outputFile metadata to reflect actual file extension
+                        //                 if (botData) {
+                        //                     const fileExt = path.extname(result.outputPath);
+                        //                     const filename = path.basename(result.outputPath);
+                        //                     botData.outputFile = filename;
+                        //                 }
+                        //             }
+                        //         } else {
+                        //             console.log(`ℹ️  Bot ${botId}: compression skipped - ${recommendations.reason}`);
+                        //         }
+                        //     } catch (e) {
+                        //         console.error(`❌ Error compressing video for bot ${botId}:`, e && e.message ? e.message : e);
+                        //         // Continue even if compression fails
+                        //     }
+                        // }
                         
                         // Upload video to S3 if configured (with automatic retry)
+                        // Note: recordingFile may now point to .mp4 if compression occurred
                         try {
                             const { uploadVideoToS3, isS3Configured } = require('./utils/s3-upload');
-                            
+
                             if (isS3Configured()) {
                                 console.log(`☁️  Bot ${botId}: Starting S3 upload...`);
-                                const uploadResult = await uploadVideoToS3(recordingFile, botId, 3); // 3 retry attempts
-                                
+
+                                // Attempt remux for .webm files to .mp4 (container copy, faststart)
+                                let fileToUpload = recordingFile;
+                                try {
+                                    const ext = path.extname(recordingFile || '').toLowerCase();
+                                    if (ext === '.webm') {
+                                        const remuxedPath = recordingFile.replace(/\.webm$/i, '.mp4');
+                                        if (!fs.existsSync(remuxedPath)) {
+                                            console.log(`🔁 Bot ${botId}: remuxing ${recordingFile} -> ${remuxedPath}`);
+                                            await remuxWebmToMp4(recordingFile, remuxedPath);
+                                            console.log(`✅ Bot ${botId}: remuxed to mp4: ${remuxedPath}`);
+                                        } else {
+                                            console.log(`ℹ️ Bot ${botId}: remuxed file already exists: ${remuxedPath}`);
+                                        }
+                                        fileToUpload = remuxedPath;
+                                        if (botData) botData.outputFile = path.basename(remuxedPath);
+                                    }
+                                } catch (remuxErr) {
+                                    console.warn(`⚠️ Bot ${botId}: remux failed, will upload original file instead: ${remuxErr && remuxErr.message ? remuxErr.message : remuxErr}`);
+                                    fileToUpload = recordingFile;
+                                }
+
+                                const uploadResult = await uploadVideoToS3(fileToUpload, botId, 3); // 3 retry attempts
+
                                 if (uploadResult.success) {
                                     console.log(`✅ Bot ${botId}: video uploaded to S3: ${uploadResult.s3Url} (${uploadResult.attempts} attempts)`);
-                                    
+
                                     // Store S3 URL in metadata
                                     const botDir = path.join(RUNTIME_ROOT, botId);
                                     const metadataPath = path.join(botDir, 'bot_metadata.json');
-                                    
+
                                     if (await fs.pathExists(metadataPath)) {
                                         const metadata = await fs.readJson(metadataPath);
                                         metadata.s3VideoUrl = uploadResult.s3Url;
@@ -1193,14 +1552,20 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                                         metadata.s3FileSize = uploadResult.size;
                                         await fs.writeJson(metadataPath, metadata, { spaces: 2 });
                                     }
-                                    
+                                    // Mark cache as S3 so future range requests short-circuit
+                                    try { recordingStorageCache.set(recordingId, { where: 's3', ts: Date.now() }); } catch (e) {}
+
                                     // Optionally delete local file after successful upload (if configured)
                                     if (process.env.AWS_S3_DELETE_LOCAL_AFTER_UPLOAD === 'true') {
                                         try {
-                                            await fs.remove(recordingFile);
-                                            console.log(`🗑️  Bot ${botId}: local video file deleted after S3 upload`);
+                                            await fs.remove(fileToUpload);
+                                            console.log(`🗑️  Bot ${botId}: uploaded file deleted after S3 upload: ${fileToUpload}`);
+                                            // Also consider deleting original .webm if a remuxed .mp4 was created
+                                            if (fileToUpload !== recordingFile && fs.existsSync(recordingFile)) {
+                                                try { await fs.remove(recordingFile); console.log(`🗑️  Bot ${botId}: original file deleted: ${recordingFile}`); } catch (e) {}
+                                            }
                                         } catch (e) {
-                                            console.warn(`⚠️  Bot ${botId}: failed to delete local file:`, e.message);
+                                            console.warn(`⚠️  Bot ${botId}: failed to delete uploaded local file:`, e.message);
                                         }
                                     }
                                 } else {
@@ -1208,7 +1573,7 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                                     // Store failure info in metadata for debugging
                                     const botDir = path.join(RUNTIME_ROOT, botId);
                                     const metadataPath = path.join(botDir, 'bot_metadata.json');
-                                    
+
                                     if (await fs.pathExists(metadataPath)) {
                                         const metadata = await fs.readJson(metadataPath);
                                         metadata.s3UploadError = uploadResult.error;
@@ -1252,7 +1617,15 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
         };
 
         // Create bot
-    const bot = new Bot(botId, bot_name, onLeaveCallback, caption_language, email_recipients);
+    const bot = new Bot(botId, finalBotName, onLeaveCallback, caption_language, finalEmailRecipients, recording_type, finalMaxRecordingTime, finalBotLogoUrl);
+        // If the user has configured a webhook URL in their settings, attach it to the bot instance
+        try {
+            const configuredWebhook = userConfig?.webhook_url || process.env.WEBHOOK_URL || null;
+            bot.webhookUrl = configuredWebhook;
+            if (configuredWebhook) console.log(`ℹ️ Bot ${botId}: using user-configured webhook: ${configuredWebhook}`);
+        } catch (e) {
+            console.warn(`⚠️ Bot ${botId}: could not set configured webhook URL: ${e.message}`);
+        }
         
         // Store bot data
         const botData = {
@@ -1260,16 +1633,38 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
             bot,
             userId: req.user.id, // Store userId since authentication is required
             meetingUrl: meeting_url,
-            botName: bot_name,
+            botName: finalBotName,
             captionLanguage: caption_language,
-            emailRecipients: email_recipients,
+            recordingType: recording_type,
+            meetingType: meeting_type,
+            emailRecipients: finalEmailRecipients,
+            summaryTemplate: finalSummaryTemplate,
+            maxRecordingTime: finalMaxRecordingTime,
             status: 'starting',
             createdAt: new Date().toISOString(),
             outputFile: `${botId}.webm`,
             ttlTimer: null,
+            maxRecordingTimer: null, // Timer for max recording time
         };
         
         activeBots.set(botId, botData);
+
+        // Set max recording time timer (in addition to TTL)
+        if (finalMaxRecordingTime && finalMaxRecordingTime > 0) {
+            const maxRecordingTimeMs = finalMaxRecordingTime * 60 * 1000; // Convert minutes to milliseconds
+            botData.maxRecordingTimer = setTimeout(async () => {
+                try {
+                    const current = activeBots.get(botId);
+                    if (!current || current.status === 'completed' || current.status === 'failed') return;
+                    console.log(`⏱️ Bot ${botId} reached max recording time of ${finalMaxRecordingTime} minutes, stopping recording...`);
+                    if (current.bot && typeof current.bot.leaveMeet === 'function') {
+                        await current.bot.leaveMeet().catch(() => {});
+                    }
+                } catch (e) {
+                    console.error(`❌ Error during max recording time shutdown for bot ${botId}:`, e);
+                }
+            }, maxRecordingTimeMs);
+        }
 
         // Per-bot hard TTL: force stop after BOT_MAX_LIFETIME_MS even if
         // recording is still in progress. This prevents orphaned bots.
@@ -1329,7 +1724,7 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
             success: true,
             bot_id: botId,
             meeting_url,
-            bot_name,
+            bot_name: finalBotName,
             status: 'starting',
             output_file: `${botId}.webm`,
             created_at: botData.createdAt
@@ -1500,8 +1895,9 @@ app.get('/v1/recordings', async (req, res) => {
                 if (!(await fs.pathExists(videoDir))) continue;
 
                 const files = await fs.readdir(videoDir).catch(() => []);
-                const webmFiles = files.filter(f => f.endsWith('.webm'));
-                for (const file of webmFiles) {
+                // Include both .webm and .mp4 files (compression may convert to .mp4)
+                const videoFiles = files.filter(f => f.endsWith('.webm') || f.endsWith('.mp4'));
+                for (const file of videoFiles) {
                     try {
                         const fullPath = path.join(videoDir, file);
                         const stats = await fs.stat(fullPath);
@@ -1548,7 +1944,96 @@ app.get('/v1/recordings', async (req, res) => {
 app.get('/v1/recordings/:recordingId', async (req, res) => {
     const { recordingId } = req.params;
     try {
-        const contentType = 'video/webm';
+        // Determine content type based on recording type (audio-only vs audio-video)
+        let contentType = 'video/webm'; // Default to video/webm
+        try {
+            const botDir = path.join(RUNTIME_ROOT, recordingId);
+            const metadataPath = path.join(botDir, 'bot_metadata.json');
+            if (await fs.pathExists(metadataPath)) {
+                const metadata = await fs.readJson(metadataPath);
+                if (metadata.recordingType === 'audio-only') {
+                    contentType = 'audio/webm';
+                    console.log(`🎵 Serving audio-only recording: ${recordingId}`);
+                } else {
+                    console.log(`🎥 Serving video recording: ${recordingId}`);
+                }
+            }
+        } catch (e) {
+            console.warn(`⚠️  Could not read metadata for content type, defaulting to video/webm: ${e.message}`);
+        }
+
+        // Quick local check first: if file exists locally, serve it directly and skip S3 checks.
+    const localVideoCandidateDir = path.join(RUNTIME_ROOT, recordingId, 'video');
+    const localCandidateEarly = await findVideoFile(recordingId, localVideoCandidateDir);
+        if (localCandidateEarly && await fs.pathExists(localCandidateEarly)) {
+            // Serve local file immediately (range handling follows the existing local path logic)
+            const stats = await fs.stat(localCandidateEarly);
+            const fileSize = stats.size;
+            const fileExt = path.extname(localCandidateEarly).toLowerCase();
+            let actualContentType = contentType;
+            if (fileExt === '.mp4') actualContentType = contentType.replace('webm', 'mp4');
+
+            // mark cache
+            try { recordingStorageCache.set(recordingId, { where: 'local', ts: Date.now() }); } catch (e) {}
+
+            // Support HTTP Range requests for video streaming (essential for large files)
+            const lastModified = stats.mtime.toUTCString();
+            const etag = `${stats.size}-${stats.mtimeMs}`;
+
+            res.setHeader('Accept-Ranges', 'bytes');
+            res.setHeader('Content-Type', actualContentType);
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('Last-Modified', lastModified);
+            res.setHeader('ETag', etag);
+
+            if (req.method === 'HEAD') { res.setHeader('Content-Length', fileSize); return res.end(); }
+
+            const range = req.headers.range;
+            if (range) {
+                const parts = range.replace(/bytes=/, "").split("-");
+                let start = parts[0] ? parseInt(parts[0], 10) : NaN;
+                let end = parts[1] ? parseInt(parts[1], 10) : NaN;
+                if (isNaN(start) && !isNaN(end)) { const suffixLen = end; start = Math.max(0, fileSize - suffixLen); end = fileSize - 1; } else { if (isNaN(end)) end = fileSize - 1; }
+                if (isNaN(start) || start < 0 || start >= fileSize || start > end) { res.writeHead(416, { 'Content-Range': `bytes */${fileSize}` }); return res.end(); }
+                const chunksize = (end - start) + 1;
+                const file = fs.createReadStream(localCandidateEarly, { start, end, highWaterMark: 1024 * 1024 });
+                res.writeHead(206, {
+                    'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+                    'Accept-Ranges': 'bytes',
+                    'Content-Length': chunksize,
+                    'Content-Type': actualContentType,
+                    'Cache-Control': 'public, max-age=3600',
+                    'Last-Modified': lastModified,
+                    'ETag': etag
+                });
+                file.pipe(res);
+                return;
+            }
+            res.setHeader('Content-Length', fileSize);
+            const stream = fs.createReadStream(localCandidateEarly, { highWaterMark: 1024 * 1024 });
+            return stream.pipe(res);
+        }
+
+        // Quick cache check: if we recently discovered this recording is in S3, short-circuit
+        try {
+            const cached = getRecordingStorageCacheEntry(recordingId);
+            if (cached && cached.where === 's3') {
+                const { getS3VideoUrl, isS3Configured } = require('./utils/s3-upload');
+                if (isS3Configured()) {
+                    try {
+                        const signedUrl = await getS3VideoUrl(recordingId, null, 3600);
+                        if (signedUrl) {
+                            console.log(`📤 Cached: redirecting to signed S3 URL for ${recordingId}`);
+                            return res.redirect(302, signedUrl);
+                        }
+                    } catch (e) {
+                        console.log(`ℹ️  Cached S3 redirect failed, will fall back to normal checks: ${e.message}`);
+                    }
+                }
+            }
+        } catch (e) {
+            // Continue with normal flow on any cache helper error
+        }
 
         // First, check if video is in S3
         const { getS3VideoUrl, isS3Configured } = require('./utils/s3-upload');
@@ -1564,6 +2049,7 @@ app.get('/v1/recordings/:recordingId', async (req, res) => {
                         const signedUrl = await getS3VideoUrl(recordingId, null, 3600); // 1 hour
                         if (signedUrl) {
                             console.log(`📤 Redirecting to signed S3 URL for ${recordingId}`);
+                            try { recordingStorageCache.set(recordingId, { where: 's3', ts: Date.now() }); } catch (e) {}
                             return res.redirect(302, signedUrl);
                         }
                     }
@@ -1573,26 +2059,53 @@ app.get('/v1/recordings/:recordingId', async (req, res) => {
                 const signedUrl = await getS3VideoUrl(recordingId, null, 3600); // 1 hour
                 if (signedUrl) {
                     // Check if file exists in S3 by trying to get metadata
-                    const AWS = require('aws-sdk');
-                    const s3 = new AWS.S3({
-                        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-                        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+                    const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
+                    const s3 = new S3Client({
+                        credentials: {
+                            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+                            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+                        },
                         region: process.env.AWS_REGION || 'us-east-1'
                     });
                     
                     try {
-                        const s3Key = `videos/${recordingId}/${recordingId}.webm`;
-                        await s3.headObject({
-                            Bucket: process.env.AWS_S3_BUCKET,
-                            Key: s3Key
-                        }).promise();
+                        // Try .mp4 first (compressed files), then .webm
+                        let s3Key = `videos/${recordingId}/${recordingId}.mp4`;
+                        let fileExists = false;
                         
-                        // File exists in S3, redirect to signed URL
-                        console.log(`📤 Redirecting to signed S3 URL: ${recordingId}`);
-                        return res.redirect(302, signedUrl);
+                        try {
+                            await s3.send(new HeadObjectCommand({
+                                Bucket: process.env.AWS_S3_BUCKET,
+                                Key: s3Key
+                            }));
+                            fileExists = true;
+                        } catch (e) {
+                            // Try .webm if .mp4 doesn't exist
+                            s3Key = `videos/${recordingId}/${recordingId}.webm`;
+                            try {
+                                await s3.send(new HeadObjectCommand({
+                                    Bucket: process.env.AWS_S3_BUCKET,
+                                    Key: s3Key
+                                }));
+                                fileExists = true;
+                            } catch (e2) {
+                                // Neither file exists
+                                fileExists = false;
+                            }
+                        }
+                        
+                        if (fileExists) {
+                            // File exists in S3, redirect to signed URL
+                            console.log(`📤 Redirecting to signed S3 URL: ${recordingId}`);
+                            try { recordingStorageCache.set(recordingId, { where: 's3', ts: Date.now() }); } catch (e) {}
+                            return res.redirect(302, signedUrl);
+                        } else {
+                            // File doesn't exist in S3, fall through to local
+                            console.log(`ℹ️  Video not found in S3, checking local storage...`);
+                        }
                     } catch (e) {
-                        // File doesn't exist in S3, fall through to local
-                        console.log(`ℹ️  Video not found in S3, checking local storage...`);
+                        // Error checking S3, fall through to local
+                        console.log(`ℹ️  Error checking S3, checking local storage:`, e.message);
                     }
                 }
             } catch (e) {
@@ -1601,76 +2114,162 @@ app.get('/v1/recordings/:recordingId', async (req, res) => {
             }
         }
 
-        // Fallback: look under runtime/<botId>/video/<botId>.webm
-        const candidate = path.join(RUNTIME_ROOT, recordingId, 'video', `${recordingId}.webm`);
-        if (await fs.pathExists(candidate)) {
+        // Fallback: look under runtime/<botId>/video/<botId>.mp4 or .webm
+        const videoDir = path.join(RUNTIME_ROOT, recordingId, 'video');
+        const candidate = await findVideoFile(recordingId, videoDir);
+        if (candidate && await fs.pathExists(candidate)) {
             const stats = await fs.stat(candidate);
+            try { recordingStorageCache.set(recordingId, { where: 'local', ts: Date.now() }); } catch (e) {}
             const fileSize = stats.size;
             
-            // Support HTTP Range requests for video streaming (essential for large files)
-            res.setHeader('Accept-Ranges', 'bytes');
-            res.setHeader('Content-Type', contentType);
+            // Determine content type based on actual file extension
+            const fileExt = path.extname(candidate).toLowerCase();
+            let actualContentType = contentType;
+            if (fileExt === '.mp4') {
+                actualContentType = contentType.replace('webm', 'mp4');
+            }
             
+            // Support HTTP Range requests for video streaming (essential for large files)
+            const lastModified = stats.mtime.toUTCString();
+            const etag = `${stats.size}-${stats.mtimeMs}`;
+
+            res.setHeader('Accept-Ranges', 'bytes');
+            res.setHeader('Content-Type', actualContentType);
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('Last-Modified', lastModified);
+            res.setHeader('ETag', etag);
+
+            // Handle HEAD requests quickly (return headers only)
+            if (req.method === 'HEAD') {
+              // Indicate full length for HEAD so client can inspect size
+              res.setHeader('Content-Length', fileSize);
+              return res.end();
+            }
+
             // Handle range requests for seeking in large video files
             const range = req.headers.range;
             if (range) {
+                // Support suffix ranges like bytes=-500 and normal ranges
                 const parts = range.replace(/bytes=/, "").split("-");
-                const start = parseInt(parts[0], 10);
-                const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+                let start = parts[0] ? parseInt(parts[0], 10) : NaN;
+                let end = parts[1] ? parseInt(parts[1], 10) : NaN;
+
+                if (isNaN(start) && !isNaN(end)) {
+                    // suffix length: last `end` bytes
+                    const suffixLen = end;
+                    start = Math.max(0, fileSize - suffixLen);
+                    end = fileSize - 1;
+                } else {
+                    if (isNaN(end)) end = fileSize - 1;
+                }
+
+                // Validate range
+                if (isNaN(start) || start < 0 || start >= fileSize || start > end) {
+                    // 416 Range Not Satisfiable
+                    res.writeHead(416, {
+                        'Content-Range': `bytes */${fileSize}`
+                    });
+                    return res.end();
+                }
+
                 const chunksize = (end - start) + 1;
-                const file = fs.createReadStream(candidate, { start, end });
-                
+                const file = fs.createReadStream(candidate, { start, end, highWaterMark: 1024 * 1024 }); // 1MB buffer for faster piping
+
                 res.writeHead(206, {
                     'Content-Range': `bytes ${start}-${end}/${fileSize}`,
                     'Accept-Ranges': 'bytes',
                     'Content-Length': chunksize,
-                    'Content-Type': contentType,
+                    'Content-Type': actualContentType,
+                    'Cache-Control': 'public, max-age=3600',
+                    'Last-Modified': lastModified,
+                    'ETag': etag
                 });
-                
+
                 file.pipe(res);
                 return;
             }
-            
-            // No range request - send full file (but this should rarely happen with large files)
+
+            // No range request - stream full file for playback (do NOT force attachment)
             res.setHeader('Content-Length', fileSize);
-            res.setHeader('Content-Disposition', `attachment; filename="${recordingId}.webm"`);
-            const stream = fs.createReadStream(candidate);
+            const stream = fs.createReadStream(candidate, { highWaterMark: 1024 * 1024 });
             return stream.pipe(res);
         }
 
-        // Fallback: check root (legacy)
-        const legacy = `${recordingId}.webm`;
-        if (await fs.pathExists(legacy)) {
+        // Fallback: check root (legacy) - try both .mp4 and .webm
+        const legacyMp4 = `${recordingId}.mp4`;
+        const legacyWebm = `${recordingId}.webm`;
+        let legacy = null;
+        if (await fs.pathExists(legacyMp4)) {
+            legacy = legacyMp4;
+        } else if (await fs.pathExists(legacyWebm)) {
+            legacy = legacyWebm;
+        }
+        
+        if (legacy) {
             const stats = await fs.stat(legacy);
+            try { recordingStorageCache.set(recordingId, { where: 'local', ts: Date.now() }); } catch (e) {}
             const fileSize = stats.size;
             
-            // Support HTTP Range requests for legacy files too
-            res.setHeader('Accept-Ranges', 'bytes');
-            res.setHeader('Content-Type', contentType);
+            // Determine content type based on actual file extension
+            const legacyExt = path.extname(legacy).toLowerCase();
+            let legacyContentType = contentType;
+            if (legacyExt === '.mp4') {
+                legacyContentType = contentType.replace('webm', 'mp4');
+            }
             
+            // Support HTTP Range requests for legacy files too
+            const lastModifiedLegacy = stats.mtime.toUTCString();
+            const etagLegacy = `${stats.size}-${stats.mtimeMs}`;
+
+            res.setHeader('Accept-Ranges', 'bytes');
+            res.setHeader('Content-Type', legacyContentType);
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('Last-Modified', lastModifiedLegacy);
+            res.setHeader('ETag', etagLegacy);
+
+            if (req.method === 'HEAD') {
+              res.setHeader('Content-Length', fileSize);
+              return res.end();
+            }
+
             const range = req.headers.range;
             if (range) {
                 const parts = range.replace(/bytes=/, "").split("-");
-                const start = parseInt(parts[0], 10);
-                const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+                let start = parts[0] ? parseInt(parts[0], 10) : NaN;
+                let end = parts[1] ? parseInt(parts[1], 10) : NaN;
+
+                if (isNaN(start) && !isNaN(end)) {
+                    const suffixLen = end;
+                    start = Math.max(0, fileSize - suffixLen);
+                    end = fileSize - 1;
+                } else {
+                    if (isNaN(end)) end = fileSize - 1;
+                }
+
+                if (isNaN(start) || start < 0 || start >= fileSize || start > end) {
+                    res.writeHead(416, { 'Content-Range': `bytes */${fileSize}` });
+                    return res.end();
+                }
+
                 const chunksize = (end - start) + 1;
-                const file = fs.createReadStream(legacy, { start, end });
-                
+                const file = fs.createReadStream(legacy, { start, end, highWaterMark: 1024 * 1024 });
                 res.writeHead(206, {
                     'Content-Range': `bytes ${start}-${end}/${fileSize}`,
                     'Accept-Ranges': 'bytes',
                     'Content-Length': chunksize,
-                    'Content-Type': contentType,
+                    'Content-Type': legacyContentType,
+                    'Cache-Control': 'public, max-age=3600',
+                    'Last-Modified': lastModifiedLegacy,
+                    'ETag': etagLegacy
                 });
-                
+
                 file.pipe(res);
                 return;
             }
-            
-            // No range request - send full file
+
+            // No range request - stream full file
             res.setHeader('Content-Length', fileSize);
-            res.setHeader('Content-Disposition', `attachment; filename="${recordingId}.webm"`);
-            const stream = fs.createReadStream(legacy);
+            const stream = fs.createReadStream(legacy, { highWaterMark: 1024 * 1024 });
             return stream.pipe(res);
         }
 
@@ -1743,6 +2342,8 @@ app.get('/v1/info', (req, res) => {
         endpoints: {
             'POST /api/signup': 'User registration',
             'POST /api/login': 'User authentication',
+            'GET /api/config': 'Get user configuration (auth)',
+            'POST /api/config': 'Save user configuration (auth)',
             'GET /api/bots': 'Get user bots (auth)',
             'GET /api/bots/:id': 'Get bot details (auth)',
             'POST /v1/bots': 'Create recording bot',
@@ -1791,6 +2392,7 @@ app.get('/api/share/:shareToken', async (req, res) => {
                 const metadata = fs.readJsonSync(metadataPath);
                 if (metadata.s3Key || metadata.s3VideoUrl) {
                     // Generate signed URL for secure access (expires in 4 hours)
+                    // URL is cached to avoid regenerating on every request
                     const { getS3VideoUrl } = require('./utils/s3-upload');
                     s3VideoUrl = await getS3VideoUrl(botId, null, 14400); // 4 hours
                     
@@ -1820,15 +2422,57 @@ app.get('/api/share/:shareToken', async (req, res) => {
         }
         
         // Load captions and build transcript (after loading metrics)
-        if (fs.existsSync(captionsPath)) {
-            const captions = JSON.parse(await fs.readFile(captionsPath, 'utf8'));
+        let rawCaptions = [];
+        console.log(`📄 Looking for captions at: ${captionsPath}`);
+        
+        if (await fs.pathExists(captionsPath)) {
+            try {
+                const captionsContent = await fs.readFile(captionsPath, 'utf8');
+                rawCaptions = JSON.parse(captionsContent);
+                console.log(`✅ Loaded ${rawCaptions?.length || 0} raw captions from file`);
+                
+                // Build utterances from captions
+                if (rawCaptions && rawCaptions.length > 0) {
+                    const { buildUtterances } = require('./openai-service');
+                    // Use meeting start time from metrics if available
+                    const meetingStartTime = metrics?.duration?.startTime || null;
+                    transcript = buildUtterances(rawCaptions, meetingStartTime);
+                    console.log(`✅ Built ${transcript?.length || 0} utterances from captions`);
+                } else {
+                    console.warn(`⚠️  Captions file exists but is empty or invalid`);
+                }
+            } catch (error) {
+                console.error(`❌ Error reading/parsing captions file:`, error.message);
+            }
+        } else {
+            console.warn(`⚠️  Captions file not found at: ${captionsPath}`);
             
-            // Build utterances from captions
-            if (captions && captions.length > 0) {
-                const { buildUtterances } = require('./openai-service');
-                // Use meeting start time from metrics if available
-                const meetingStartTime = metrics?.duration?.startTime || null;
-                transcript = buildUtterances(captions, meetingStartTime);
+            // Try alternative paths
+            const altPaths = [
+                path.join(botDir, 'captions.json'),
+                path.join(botDir, 'transcript.json'),
+                path.join(botDir, 'transcripts.json')
+            ];
+            
+            for (const altPath of altPaths) {
+                if (await fs.pathExists(altPath)) {
+                    console.log(`📄 Trying alternative path: ${altPath}`);
+                    try {
+                        const captionsContent = await fs.readFile(altPath, 'utf8');
+                        rawCaptions = JSON.parse(captionsContent);
+                        console.log(`✅ Loaded ${rawCaptions?.length || 0} raw captions from alternative path`);
+                        
+                        if (rawCaptions && rawCaptions.length > 0) {
+                            const { buildUtterances } = require('./openai-service');
+                            const meetingStartTime = metrics?.duration?.startTime || null;
+                            transcript = buildUtterances(rawCaptions, meetingStartTime);
+                            console.log(`✅ Built ${transcript?.length || 0} utterances from alternative captions`);
+                        }
+                        break;
+                    } catch (error) {
+                        console.error(`❌ Error reading alternative captions file:`, error.message);
+                    }
+                }
             }
         }
         
@@ -1843,10 +2487,21 @@ app.get('/api/share/:shareToken', async (req, res) => {
             }
         }
         
+        // Load metadata to get title
+        let title = null;
+        if (fs.existsSync(metadataPath)) {
+            try {
+                const metadata = fs.readJsonSync(metadataPath);
+                title = metadata.title || null;
+            } catch (e) {
+                console.warn('Could not parse bot_metadata.json for title');
+            }
+        }
+        
         // Build bot info
         const bot = {
             id: botId,
-            title: `Meeting ${botId.slice(0, 8)}`,
+            title: title || botId, // Use title from metadata, fallback to botId (matching botdetail behavior)
             createdAt: metrics?.duration?.startTime || null,
             duration: metrics?.duration ? 
                 `${metrics.duration.totalMinutes} min` : null,
@@ -1860,6 +2515,7 @@ app.get('/api/share/:shareToken', async (req, res) => {
             success: true,
             bot,
             transcript,
+            apiTranscript: rawCaptions, // Return raw captions for frontend processing
             summary
         });
         
@@ -1929,20 +2585,21 @@ app.use((error, req, res, next) => {
 
 // Serve HTML pages explicitly
 app.get('/reset-password', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public/reset-password.html'));
+    // Redirect to Next.js frontend reset-password route (preserve query string)
+    return res.redirect(FRONTEND_URL + req.originalUrl);
 });
 
 app.get('/signin', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public/signin.html'));
+    return res.redirect(FRONTEND_URL + req.originalUrl);
 });
 
 app.get('/signup', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public/signup.html'));
+    return res.redirect(FRONTEND_URL + req.originalUrl);
 });
 
 // Serve main page
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public/index.html'));
+    return res.redirect(FRONTEND_URL);
 });
 
 // 404 handler for API routes only
@@ -1956,6 +2613,8 @@ app.use('/api/*', (req, res) => {
             'POST /api/reset-password',
             'GET /api/verify-email',
             'POST /api/resend-verification',
+            'GET /api/config',
+            'POST /api/config',
             'GET /api/bots',
             'POST /api/bots',
             'GET /api/bots/:id',
@@ -1985,7 +2644,8 @@ app.use('/v1/*', (req, res) => {
 app.use((req, res) => {
     // For HTML requests, redirect to main page
     if (req.accepts('html')) {
-        res.redirect('/');
+        // Redirect HTML requests to frontend app
+        res.redirect(FRONTEND_URL);
     } else {
         res.status(404).json({ error: 'Not found' });
     }

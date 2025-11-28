@@ -1,0 +1,356 @@
+/* Component-specific styles */
+
+/* MyBots Component */
+.bot-list-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+  transition: background-color 0.2s;
+}
+
+.bot-list-item:hover {
+  background-color: #f9fafb;
+}
+
+.bot-status-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.bot-status-running {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.bot-status-stopped {
+  background-color: #f3f4f6;
+  color: #374151;
+}
+
+.bot-status-error {
+  background-color: #fef2f2;
+  color: #dc2626;
+}
+
+.bot-status-starting {
+  background-color: #fef3c7;
+  color: #d97706;
+}
+
+/* Loading spinner */
+.spinner {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border: 3px solid #f3f4f6;
+  border-radius: 50%;
+  border-top-color: #2563eb;
+  animation: spin 1s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Empty state */
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: #6b7280;
+}
+
+.empty-state-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  opacity: 0.5;
+}
+
+/* Button groups */
+.button-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.button-group .btn-secondary {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+/* Success/Error messages */
+.success-message {
+  color: #059669;
+  font-size: 14px;
+  text-align: center;
+  margin-top: 8px;
+}
+
+.error-message {
+  color: #dc2626;
+  font-size: 14px;
+  text-align: center;
+  margin-top: 8px;
+}
+
+/* Badge styles */
+.badge {
+  display: inline-block;
+  padding: 4px 12px;
+  background-color: #e5e7eb;
+  color: #374151;
+  border-radius: 16px;
+  font-size: 12px;
+  font-weight: 500;
+  margin: 4px;
+}
+
+.badge-success {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.badge-info {
+  background-color: #dbeafe;
+  color: #1d4ed8;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .button-group {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .button-group .btn-secondary {
+
+/* Fullscreen summary overlay (mobile) */
+.summary-fullscreen-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(17,24,39,0.92);
+  color: #fff;
+  z-index: 1200;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+}
+
+.summary-fullscreen-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.summary-fullscreen-close {
+  background: transparent;
+  color: #fff;
+  border: none;
+  font-size: 20px;
+  line-height: 1;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.summary-fullscreen-content {
+  margin-top: 12px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-right: 8px;
+}
+
+/* Show the fullscreen button only on small screens */
+@media (max-width: 767px) {
+  .summary-fullscreen-btn { display: inline-flex !important; }
+}
+    width: 100%;
+    margin-bottom: 4px;
+  }
+}
+
+/* Layout header responsive font sizes */
+.layout-header-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.layout-user-email {
+  font-weight: 500;
+  color: #cbd5e1;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.layout-logout-button {
+  /* base size; .btn-secondary provides padding */
+  font-size: 13px;
+}
+
+/* Increase font-sizes on larger screens (desktop) */
+@media (min-width: 1024px) {
+  .layout-header-title {
+    font-size: 18px;
+  }
+
+  .layout-user-email {
+    font-size: 12px;
+  }
+
+  .layout-logout-button {
+    font-size: 14px;
+  }
+}
+
+/* MyBots card styles - mobile-first */
+.bots-list-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.bots-list-container .bot-item {
+  background: #ffffff;
+  border: 1px solid #e6e7eb;
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+}
+
+.bot-item .bot-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bot-id {
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f172a;
+  word-break: break-word;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bot-logo-small {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+/* Avatar generated from title/uuid initials */
+.bot-avatar {
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  border-radius: 9999px;
+  background: linear-gradient(180deg,#2563eb,#1e40af);
+  color: white;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 14px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+
+.bot-display-name {
+  margin-left: 8px;
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f172a;
+  word-break: break-word;
+}
+
+.bot-logo-image {
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  border-radius: 8px;
+  object-fit: cover;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+
+.bot-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.bot-meta-item {
+  display: block;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 12px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.status-completed { background: #dcfce7; color: #166534; }
+.status-recording { background: #dbeafe; color: #1d4ed8; }
+.status-failed { background: #fee2e2; color: #b91c1c; }
+
+.bot-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Larger / compact layout on wider screens */
+@media (min-width: 768px) {
+  .bots-list-container .bot-item {
+    flex-direction: row;
+    justify-content: space-between;
+    padding: 14px 16px;
+  }
+
+  .bot-item .bot-info {
+    flex: 1 1 auto;
+    padding-right: 12px;
+  }
+
+
+  .bot-actions {
+    width: auto;
+    flex: 0 0 auto;
+  }
+
+}
+
+/* Mobile-specific: reduce summary and transcript font sizes for compact displays */
+@media (max-width: 767px) {
+  .summary-content,
+  .summary-fullscreen-content {
+    font-size: 10px !important;
+    line-height: 1.4 !important;
+  }
+
+  /* Transcript content and related controls */
+  .transcript-section,
+  .transcript-scrollable,
+  .transcript-text,
+  .transcript-item,
+  .speaker-name,
+  .time-stamp {
+    font-size: 10px !important;
+    line-height: 1.3 !important;
+  }
+}

@@ -116,10 +116,175 @@
 			transition: border 0.2s;
 			background: #fff;
 		}
-		input[type=text]:focus, select:focus {
+		input[type=text]:focus, select:focus, textarea:focus {
 			outline: none;
 			border-color: #2563eb;
 			box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+		}
+		
+		/* Enhanced select styling */
+		select {
+			appearance: none;
+			-webkit-appearance: none;
+			-moz-appearance: none;
+			background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6,9 12,15 18,9'%3e%3c/polyline%3e%3c/svg%3e");
+			background-repeat: no-repeat;
+			background-position: right 12px center;
+			background-size: 16px;
+			padding-right: 40px;
+			cursor: pointer;
+			font-weight: 500;
+		}
+		
+		select:hover {
+			border-color: #9ca3af;
+			background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234b5563' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6,9 12,15 18,9'%3e%3c/polyline%3e%3c/svg%3e");
+		}
+		
+		select:focus {
+			background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6,9 12,15 18,9'%3e%3c/polyline%3e%3c/svg%3e");
+		}
+		
+		/* Select option styling */
+		select option {
+			padding: 8px 12px;
+			font-weight: 500;
+			color: #374151;
+		}
+		
+		select option:checked {
+			background-color: #2563eb;
+			color: white;
+		}
+		
+		/* Form group improvements */
+		.form-group select {
+			height: 48px;
+		}
+		
+		/* Enhanced form labels */
+		.form-label {
+			font-weight: 600;
+			color: #374151;
+			margin-bottom: 6px;
+			display: block;
+			font-size: 14px;
+		}
+		
+		/* Form row improvements */
+		.form-row {
+			display: grid;
+			grid-template-columns: 1fr 1fr 1fr;
+			gap: 16px;
+			margin-bottom: 20px;
+			align-items: start;
+		}
+		
+		/* Two column layout for configuration */
+		.form-row.two-columns {
+			grid-template-columns: 1fr 1fr;
+			gap: 20px;
+		}
+		
+		/* Ensure all form groups in a row have consistent heights */
+		.form-row .form-group {
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+		}
+		
+		.form-row .form-group select {
+			height: 48px;
+			margin-bottom: auto;
+		}
+		
+		.form-row .form-group input {
+			height: 48px;
+			width: 100%;
+			padding: 12px 16px;
+			border: 1px solid #d1d5db;
+			border-radius: 8px;
+			font-size: 15px;
+			transition: border 0.2s;
+			background: #fff;
+		}
+		
+		.form-row .form-group input:focus {
+			outline: none;
+			border-color: #2563eb;
+			box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+		}
+		
+		.form-row .form-group input[readonly] {
+			background-color: #f9fafb;
+			color: #6b7280;
+		}
+		
+		/* Position help text consistently */
+		.form-row .form-help {
+			margin-top: 4px;
+			min-height: 16px;
+			font-size: 12px;
+			color: #6b7280;
+			font-style: italic;
+		}
+		
+		/* Responsive behavior for two-column layout */
+		@media (max-width: 768px) {
+			.form-row.two-columns {
+				grid-template-columns: 1fr;
+				gap: 16px;
+			}
+		}
+		
+		@media (max-width: 768px) {
+			.form-row {
+				grid-template-columns: 1fr;
+				gap: 12px;
+			}
+		}
+		
+		textarea {
+			width: 100%;
+			padding: 12px 16px;
+			border: 1px solid #d1d5db;
+			border-radius: 8px;
+			font-size: 15px;
+			resize: vertical;
+			min-height: 80px;
+			font-family: 'Poppins', sans-serif;
+			transition: border 0.2s;
+			background: #fff;
+		}
+		
+		.form-help {
+			font-size: 12px;
+			color: #6b7280;
+			margin-top: 4px;
+			font-style: italic;
+		}
+		
+		.btn-primary {
+			background: #4f46e5;
+			color: white;
+			border: none;
+			padding: 14px 24px;
+			border-radius: 8px;
+			font-size: 16px;
+			font-weight: 600;
+			cursor: pointer;
+			width: 100%;
+			transition: all 0.2s ease;
+			font-family: 'Poppins', sans-serif;
+		}
+		
+		.btn-primary:hover {
+			background: #4338ca;
+			transform: translateY(-1px);
+		}
+		
+		.btn-primary:active {
+			transform: translateY(0);
 		}
 		.form-group {
 			display: flex;
@@ -134,7 +299,6 @@
 		}
 		.form-row {
 			display: grid;
-			grid-template-columns: 1fr 1fr;
 			gap: 16px;
 		}
 		@media (max-width: 768px) {
@@ -915,6 +1079,7 @@
 			<div class="tabs">
 				<button class="tab active" data-tab="create-bot">Create Bot</button>
 				<button class="tab" data-tab="my-bots">My Bots</button>
+				<button class="tab" data-tab="configuration">Configuration</button>
 			</div>
 
 			<!-- Tab 1: Create Bot -->
@@ -929,12 +1094,7 @@
 
 					<div class="form-row">
 						<div class="form-group">
-							<label class="form-label" for="botName">Bot Name (Optional)</label>
-							<input id="botName" type="text" placeholder="CXFlow Meeting Bot">
-						</div>
-						
-						<div class="form-group">
-							<label class="form-label" for="captionLanguage">Caption Language</label>
+							<label class="form-label" for="captionLanguage">Language</label>
 							<select id="captionLanguage">
 								<option value="es" selected>🇪🇸 Spanish</option>
 								<option value="en">🇬🇧 English</option>
@@ -960,9 +1120,40 @@
 								<option value="fi">🇫🇮 Finnish</option>
 							</select>
 						</div>
+						
+						<div class="form-group">
+							<label class="form-label" for="recordingType">Recording</label>
+							<select id="recordingType">
+								<option value="audio-video" selected>Audio + Video</option>
+								<option value="audio-only">Audio Only</option>
+							</select>
+						</div>
+
+						<div class="form-group">
+							<label class="form-label" for="meetingType">Meeting Type</label>
+							<select id="meetingType">
+								<option value="hr-interview" selected>HR Interview</option>
+								<option value="team-meeting">Team Meeting</option>
+								<option value="client-call">Client Call</option>
+								<option value="training-session">Training Session</option>
+								<option value="project-review">Project Review</option>
+								<option value="sales-call">Sales Call</option>
+								<option value="standup-meeting">Standup Meeting</option>
+								<option value="brainstorming">Brainstorming Session</option>
+								<option value="presentation">Presentation</option>
+								<option value="other">Other</option>
+							</select>
+							<div class="form-help">Used to enrich the AI prompt and summary template.</div>
+						</div>
 					</div>
 
-					<button id="startBtn" style="width: 100%;">Send Bot</button>
+					<div class="form-group">
+						<label class="form-label" for="notificationEmails">Emails to receive transcript when meeting ends</label>
+						<textarea id="notificationEmails" rows="3" placeholder="host@example.com, manager@example.com"></textarea>
+						<div class="form-help">Separate multiple emails with commas.</div>
+					</div>
+
+					<button id="startBtn" class="btn-primary">Send Bot</button>
 					
 					<div id="status" class="small"></div>
 					<div id="badges"></div>
@@ -981,6 +1172,55 @@
 				<div id="botDetailView" class="hidden">
 					<button id="backButton" class="secondary back-button">← Back to List</button>
 					<div id="botDetailContent"></div>
+				</div>
+			</div>
+
+			<!-- Tab 3: Configuration -->
+			<div id="configurationTab" class="tab-content">
+				<div class="card">
+					<h2 class="card-title">Configuration</h2>
+					
+					<div class="form-group">
+						<label class="form-label" for="botName">Bot Name</label>
+						<input id="botName" type="text" placeholder="CXFlow Meeting Bot"></input>
+						<div class="form-help">This name may be shown when the bot joins the meeting.</div>
+					</div>
+
+					<div class="form-group">
+						<label class="form-label" for="webhookUrl">Webhook URL</label>
+						<input id="webhookUrl" type="text" placeholder="https://yourapp.com/webhooks/meeting-bot">
+						<div class="form-help">We will send meeting events, transcript and summary to this endpoint.</div>
+					</div>
+
+					<div class="form-group">
+						<label class="form-label" for="summaryTemplate">Summary Template (AI Prompt)</label>
+						<textarea id="summaryTemplate" rows="8" placeholder="Describe how the AI should summarize the meeting, structure key points, decisions, and next steps..."></textarea>
+						<div class="form-help">Custom AI prompt used to generate the meeting summary.</div>
+					</div>
+
+					<div class="form-group">
+						<label class="form-label" for="botLogoUrl">Bot Logo URL</label>
+						<input id="botLogoUrl" type="text" placeholder="https://yourcdn.com/assets/meeting-bot-logo.png">
+						<div class="form-help">Logo shown when the bot joins the meeting (if supported).</div>
+					</div>
+
+					<div class="form-row two-columns">
+						<div class="form-group">
+							<label class="form-label" for="maxRecordingTime">Maximum Recording Time per Meeting (minutes)</label>
+							<input id="maxRecordingTime" type="number" value="60" min="1" max="480">
+							<div class="form-help">The bot will automatically stop recording after this time.</div>
+						</div>
+
+						<div class="form-group">
+							<label class="form-label" for="totalRecordingMinutes">Total recording minutes</label>
+							<input id="totalRecordingMinutes" type="number" value="0" readonly>
+							<div class="form-help">Total recording minutes available in your current plan (read-only).</div>
+						</div>
+					</div>
+
+					<button id="saveConfigBtn" class="btn-primary">Save Configuration</button>
+					
+					<div id="configStatus" class="small"></div>
 				</div>
 			</div>
 		</section>

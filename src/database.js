@@ -5,11 +5,22 @@ const fs = require('fs-extra');
 // Database file path
 const DB_PATH = path.join(__dirname, '../database.sqlite');
 
-// Initialize database
-const db = new Database(DB_PATH);
+// Initialize database with configuration for better concurrency
+const db = new Database(DB_PATH, {
+    timeout: 10000, // Wait up to 10 seconds for database to be available
+});
 
 // Enable foreign keys
 db.pragma('foreign_keys = ON');
+// Enable WAL mode for better concurrency (allows multiple readers and one writer)
+try {
+    db.pragma('journal_mode = WAL');
+    console.log('✅ Database WAL mode enabled for better concurrency');
+} catch (e) {
+    console.warn('⚠️  Could not enable WAL mode:', e.message);
+}
+// Set busy timeout to handle locked database situations (milliseconds)
+db.pragma('busy_timeout = 10000');
 
 /**
  * Initialize database schema
@@ -57,6 +68,28 @@ function initializeDatabase() {
         CREATE INDEX IF NOT EXISTS idx_bots_user_id ON bots(user_id);
         CREATE INDEX IF NOT EXISTS idx_bots_created_at ON bots(created_at);
         CREATE INDEX IF NOT EXISTS idx_bots_status ON bots(status);
+    `);
+
+    // Create user_configurations table
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS user_configurations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL UNIQUE,
+            bot_name TEXT,
+            webhook_url TEXT,
+            summary_template TEXT,
+            bot_logo_url TEXT,
+            max_recording_time INTEGER DEFAULT 60,
+            total_recording_minutes INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    `);
+
+    // Create index on user_configurations table
+    db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_user_configurations_user_id ON user_configurations(user_id);
     `);
 
     console.log('✅ Database initialized successfully');
@@ -423,10 +456,90 @@ if (fs.existsSync(usersJsonPath) || fs.existsSync(botsJsonPath)) {
     migrations.migrateFromJSON();
 }
 
+/**
+ * User Configuration operations
+ */
+const configOps = {
+    /**
+     * Get user configuration
+     */
+    getByUserId: (userId) => {
+        const stmt = db.prepare('SELECT * FROM user_configurations WHERE user_id = ?');
+        return stmt.get(userId);
+    },
+
+    /**
+     * Create or update user configuration
+     */
+    upsert: (userId, config) => {
+        const now = Date.now();
+        
+        // Check if configuration exists
+        const existing = configOps.getByUserId(userId);
+        
+        if (existing) {
+            // Update existing configuration - update each value explicitly
+            const stmt = db.prepare(`
+                UPDATE user_configurations SET 
+                    bot_name = ?, 
+                    webhook_url = ?, 
+                    summary_template = ?, 
+                    bot_logo_url = ?, 
+                    max_recording_time = ?, 
+                    total_recording_minutes = ?, 
+                    updated_at = ?
+                WHERE user_id = ?
+            `);
+            stmt.run(
+                config.botName || null,
+                config.webhookUrl || null,
+                config.summaryTemplate || null,
+                config.botLogoUrl || null,
+                config.maxRecordingTime || 60,
+                config.totalRecordingMinutes || 0,
+                now,
+                userId
+            );
+        } else {
+            // Create new configuration
+            const stmt = db.prepare(`
+                INSERT INTO user_configurations (
+                    user_id, bot_name, webhook_url, summary_template, 
+                    bot_logo_url, max_recording_time, total_recording_minutes, 
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            stmt.run(
+                userId,
+                config.botName || null,
+                config.webhookUrl || null,
+                config.summaryTemplate || null,
+                config.botLogoUrl || null,
+                config.maxRecordingTime || 60,
+                config.totalRecordingMinutes || 0,
+                now,
+                now
+            );
+        }
+        
+        // Return the updated/created configuration
+        return configOps.getByUserId(userId);
+    },
+
+    /**
+     * Delete user configuration
+     */
+    delete: (userId) => {
+        const stmt = db.prepare('DELETE FROM user_configurations WHERE user_id = ?');
+        stmt.run(userId);
+    }
+};
+
 module.exports = {
     db,
     userOps,
     botOps,
+    configOps,
     migrations,
     closeDatabase
 };

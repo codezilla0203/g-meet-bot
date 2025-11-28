@@ -1,6 +1,9 @@
-const AWS = require('aws-sdk');
+const { S3Client, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { Upload } = require('@aws-sdk/lib-storage');
 const fs = require('fs-extra');
 const path = require('path');
+const { sendWebhook } = require('./webhook');
 
 /**
  * S3 Upload Utility
@@ -9,6 +12,10 @@ const path = require('path');
 
 let s3Client = null;
 let s3Config = null;
+
+// Cache for signed URLs to avoid regenerating on every request
+// Format: { botId: { url: string, expiresAt: number } }
+const signedUrlCache = new Map();
 
 /**
  * Initialize S3 client if credentials are provided
@@ -40,9 +47,11 @@ function initS3() {
         bucket
     };
     
-    s3Client = new AWS.S3({
-        accessKeyId,
-        secretAccessKey,
+    s3Client = new S3Client({
+        credentials: {
+            accessKeyId,
+            secretAccessKey
+        },
         region
     });
     
@@ -58,14 +67,15 @@ async function testS3Connection() {
     try {
         const client = initS3();
         if (!client) {
+            try { sendWebhook('error.occurred', { code: 's3_config_error', message: 'S3 not configured', details: {} }); } catch (e) {}
             return { success: false, error: 'S3 not configured' };
         }
         
         // Test bucket access by listing objects (with limit 1)
-        await client.listObjectsV2({
+        await client.send(new ListObjectsV2Command({
             Bucket: s3Config.bucket,
             MaxKeys: 1
-        }).promise();
+        }));
         
         console.log(`✅ S3 connection test successful - bucket: ${s3Config.bucket}`);
         return { success: true };
@@ -93,19 +103,32 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
         }
         
         if (!await fs.pathExists(localFilePath)) {
+            try { sendWebhook('error.occurred', { code: 's3_upload_error', message: 'Local file not found', details: { localFilePath, botId } }); } catch (e) {}
             return { success: false, error: 'Local file not found' };
         }
         
         const fileName = path.basename(localFilePath);
         const s3Key = `videos/${botId}/${fileName}`;
         
+        // Determine content type based on file extension
+        const fileExt = path.extname(localFilePath).toLowerCase();
+        let contentType = 'video/webm'; // Default
+        if (fileExt === '.mp4') {
+            contentType = 'video/mp4';
+        } else if (fileExt === '.webm') {
+            contentType = 'video/webm';
+        } else if (fileExt === '.ogg' || fileExt === '.ogv') {
+            contentType = 'video/ogg';
+        }
+        
         // Test connection first
         const connectionTest = await testS3Connection();
         if (!connectionTest.success) {
+            try { sendWebhook('error.occurred', { code: 's3_connection_error', message: 'S3 connection test failed', details: { error: connectionTest.error } }); } catch (e) {}
             return { success: false, error: connectionTest.error };
         }
         
-        console.log(`📤 Uploading video to S3: ${s3Key}...`);
+        console.log(`📤 Uploading video to S3: ${s3Key} (${contentType})...`);
         
         const fileStats = await fs.stat(localFilePath);
         const fileSizeMB = (fileStats.size / 1024 / 1024).toFixed(2);
@@ -122,31 +145,35 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
                 const fileStream = fs.createReadStream(localFilePath);
                 
                 const uploadParams = {
-                    Bucket: s3Config.bucket,
-                    Key: s3Key,
-                    Body: fileStream,
-                    ContentType: 'video/webm',
-                    // Remove ACL to avoid permission issues - use bucket policy instead
-                    Metadata: {
-                        'bot-id': botId,
-                        'uploaded-at': new Date().toISOString(),
-                        'file-size': fileStats.size.toString(),
-                        'attempt': attempt.toString()
+                    client: client,
+                    params: {
+                        Bucket: s3Config.bucket,
+                        Key: s3Key,
+                        Body: fileStream,
+                        ContentType: contentType,
+                        Metadata: {
+                            'bot-id': botId,
+                            'uploaded-at': new Date().toISOString(),
+                            'file-size': fileStats.size.toString(),
+                            'attempt': attempt.toString()
+                        }
                     }
                 };
                 
                 // Add progress tracking for large files
-                const upload = client.upload(uploadParams);
+                const upload = new Upload(uploadParams);
                 
                 // Track upload progress
                 upload.on('httpUploadProgress', (progress) => {
-                    const percent = Math.round((progress.loaded / progress.total) * 100);
-                    if (percent % 25 === 0 || percent === 100) { // Log every 25%
-                        console.log(`📈 Upload progress: ${percent}% (${(progress.loaded / 1024 / 1024).toFixed(1)} MB / ${fileSizeMB} MB)`);
+                    if (progress.total) {
+                        const percent = Math.round((progress.loaded / progress.total) * 100);
+                        if (percent % 25 === 0 || percent === 100) { // Log every 25%
+                            console.log(`📈 Upload progress: ${percent}% (${(progress.loaded / 1024 / 1024).toFixed(1)} MB / ${fileSizeMB} MB)`);
+                        }
                     }
                 });
                 
-                const result = await upload.promise();
+                const result = await upload.done();
                 
                 // Success - break retry loop
                 const s3Url = result.Location || `https://${s3Config.bucket}.s3.${s3Config.region}.amazonaws.com/${s3Key}`;
@@ -166,9 +193,13 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
                 console.warn(`⚠️  Upload attempt ${attempt} failed:`, error.message);
                 
                 // Don't retry on certain errors
-                if (error.code === 'NoSuchBucket' || 
-                    error.code === 'InvalidAccessKeyId' || 
-                    error.code === 'SignatureDoesNotMatch') {
+                const errorName = error.name || error.code;
+                if (errorName === 'NoSuchBucket' || 
+                    errorName === 'NotFound' ||
+                    errorName === 'InvalidAccessKeyId' || 
+                    errorName === 'InvalidClientTokenId' ||
+                    errorName === 'SignatureDoesNotMatch' ||
+                    errorName === 'InvalidSignature') {
                     break; // These won't be fixed by retrying
                 }
                 
@@ -181,8 +212,10 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
             }
         }
         
-        // All retries failed
-        throw lastError || new Error('Upload failed after all retries');
+    // All retries failed
+    const finalErr = lastError || new Error('Upload failed after all retries');
+    try { sendWebhook('error.occurred', { code: 's3_upload_error', message: 'Upload failed after retries', details: { localFilePath, botId, error: finalErr && finalErr.message ? finalErr.message : String(finalErr) } }); } catch (e) {}
+    throw finalErr;
         
     } catch (error) {
         console.error(`❌ S3 upload failed:`, {
@@ -194,15 +227,21 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
             key: s3Key
         });
         
+        // Emit error webhook
+        try { sendWebhook('error.occurred', { code: 's3_upload_error', message: 'S3 upload failed', details: { localFilePath, botId, error: error && error.message ? error.message : String(error) } }); } catch (e) {}
+        
         // Provide more specific error messages
         let errorMessage = error.message || 'Unknown error';
-        if (error.code === 'NoSuchBucket') {
+        const errorName = error.name || error.code;
+        const statusCode = error.$metadata?.httpStatusCode || error.statusCode;
+        
+        if (errorName === 'NoSuchBucket' || errorName === 'NotFound') {
             errorMessage = `S3 bucket '${s3Config.bucket}' does not exist`;
-        } else if (error.code === 'AccessDenied') {
+        } else if (errorName === 'AccessDenied' || errorName === 'Forbidden') {
             errorMessage = 'Access denied - check AWS credentials and bucket permissions';
-        } else if (error.code === 'InvalidAccessKeyId') {
+        } else if (errorName === 'InvalidAccessKeyId' || errorName === 'InvalidClientTokenId') {
             errorMessage = 'Invalid AWS Access Key ID';
-        } else if (error.code === 'SignatureDoesNotMatch') {
+        } else if (errorName === 'SignatureDoesNotMatch' || errorName === 'InvalidSignature') {
             errorMessage = 'Invalid AWS Secret Access Key';
         }
         
@@ -210,8 +249,8 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
             success: false,
             error: errorMessage,
             awsError: {
-                code: error.code,
-                statusCode: error.statusCode
+                code: errorName,
+                statusCode: statusCode
             }
         };
     }
@@ -220,7 +259,7 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
 /**
  * Get signed S3 URL for a video (secure, time-limited access)
  * @param {string} botId - Bot ID
- * @param {string} fileName - Video file name (default: {botId}.webm)
+ * @param {string} fileName - Video file name (default: tries {botId}.mp4 then {botId}.webm)
  * @param {number} expiresIn - URL expiration time in seconds (default: 1 hour)
  * @returns {Promise<string|null>} Signed S3 URL or null if not configured
  */
@@ -228,19 +267,111 @@ async function getS3VideoUrl(botId, fileName = null, expiresIn = 3600) {
     const client = initS3();
     if (!client) return null;
     
+    // Check cache first (only if no fileName specified, as cache is per botId)
+    if (!fileName) {
+        const cacheKey = botId;
+        const cached = signedUrlCache.get(cacheKey);
+        if (cached) {
+            const now = Date.now();
+            // Use cached URL if it has at least 5 minutes left (to account for clock skew)
+            const bufferTime = 5 * 60 * 1000; // 5 minutes in ms
+            if (cached.expiresAt > (now + bufferTime)) {
+                console.log(`♻️  Using cached signed URL for ${botId} (expires in ${Math.round((cached.expiresAt - now) / 1000)}s)`);
+                return cached.url;
+            } else {
+                // Cache expired, remove it
+                signedUrlCache.delete(cacheKey);
+            }
+        }
+    }
+    
     try {
-        const file = fileName || `${botId}.webm`;
+        let file = fileName;
+        let contentType = 'video/webm';
+        
+        // If no filename provided, check S3 directly for both .mp4 and .webm files
+        if (!file) {
+            // Try .mp4 first (compressed files), then .webm
+            const mp4Key = `videos/${botId}/${botId}.mp4`;
+            const webmKey = `videos/${botId}/${botId}.webm`;
+            
+            // Check if .mp4 exists in S3
+            try {
+                await client.send(new HeadObjectCommand({
+                    Bucket: s3Config.bucket,
+                    Key: mp4Key
+                }));
+                file = `${botId}.mp4`;
+                contentType = 'video/mp4';
+            } catch (e) {
+                // .mp4 doesn't exist, try .webm
+                try {
+                    await client.send(new HeadObjectCommand({
+                        Bucket: s3Config.bucket,
+                        Key: webmKey
+                    }));
+                    file = `${botId}.webm`;
+                    contentType = 'video/webm';
+                } catch (e2) {
+                    // Neither exists in S3, check local files as fallback
+                    const RUNTIME_ROOT = path.join(__dirname, '../runtime');
+                    const videoDir = path.join(RUNTIME_ROOT, botId, 'video');
+                    const mp4Path = path.join(videoDir, `${botId}.mp4`);
+                    const webmPath = path.join(videoDir, `${botId}.webm`);
+                    
+                    if (await fs.pathExists(mp4Path)) {
+                        file = `${botId}.mp4`;
+                        contentType = 'video/mp4';
+                    } else if (await fs.pathExists(webmPath)) {
+                        file = `${botId}.webm`;
+                        contentType = 'video/webm';
+                    } else {
+                        // Default to .mp4 (compressed files are more common now)
+                        file = `${botId}.mp4`;
+                        contentType = 'video/mp4';
+                    }
+                }
+            }
+        } else {
+            // Determine content type from provided filename
+            const fileExt = path.extname(file).toLowerCase();
+            if (fileExt === '.mp4') {
+                contentType = 'video/mp4';
+            } else if (fileExt === '.webm') {
+                contentType = 'video/webm';
+            }
+        }
+        
         const s3Key = `videos/${botId}/${file}`;
         
         // Generate signed URL for secure access
-        const signedUrl = await client.getSignedUrlPromise('getObject', {
+        const command = new GetObjectCommand({
             Bucket: s3Config.bucket,
             Key: s3Key,
-            Expires: expiresIn, // URL expires in 1 hour by default
-            ResponseContentType: 'video/webm'
+            ResponseContentType: contentType
         });
+        const signedUrl = await getSignedUrl(client, command, { expiresIn });
         
-        console.log(`🔐 Generated signed URL for ${s3Key} (expires in ${expiresIn}s)`);
+        // Cache the signed URL (only if no fileName specified)
+        if (!fileName) {
+            const cacheKey = botId;
+            const expiresAt = Date.now() + (expiresIn * 1000);
+            signedUrlCache.set(cacheKey, {
+                url: signedUrl,
+                expiresAt: expiresAt
+            });
+            // Clean up old cache entries periodically (keep cache size reasonable)
+            if (signedUrlCache.size > 1000) {
+                const now = Date.now();
+                for (const [key, value] of signedUrlCache.entries()) {
+                    if (value.expiresAt <= now) {
+                        signedUrlCache.delete(key);
+                    }
+                }
+            }
+        }
+        
+        console.log(`🔐 Generated signed URL for ${s3Key} (${contentType}, expires in ${expiresIn}s)`);
         return signedUrl;
         
     } catch (error) {
@@ -252,14 +383,14 @@ async function getS3VideoUrl(botId, fileName = null, expiresIn = 3600) {
 /**
  * Get public S3 URL (for reference, but use signed URLs instead)
  * @param {string} botId - Bot ID
- * @param {string} fileName - Video file name (default: {botId}.webm)
+ * @param {string} fileName - Video file name (default: tries {botId}.mp4 then {botId}.webm)
  * @returns {string|null} Public S3 URL or null if not configured
  */
 function getPublicS3VideoUrl(botId, fileName = null) {
     const client = initS3();
     if (!client) return null;
     
-    const file = fileName || `${botId}.webm`;
+    const file = fileName || `${botId}.mp4`; // Default to .mp4 (compressed files)
     const s3Key = `videos/${botId}/${file}`;
     
     // Return public URL (requires bucket to be public)
@@ -277,7 +408,7 @@ function isS3Configured() {
 /**
  * Delete video from S3
  * @param {string} botId - Bot ID
- * @param {string} fileName - Video file name (default: {botId}.webm)
+ * @param {string} fileName - Video file name (default: tries {botId}.mp4 then {botId}.webm)
  * @returns {Promise<{success: boolean, error?: string}>}
  */
 async function deleteVideoFromS3(botId, fileName = null) {
@@ -287,13 +418,33 @@ async function deleteVideoFromS3(botId, fileName = null) {
             return { success: false, error: 'S3 not configured' };
         }
         
-        const file = fileName || `${botId}.webm`;
+        let file = fileName;
+        
+        // If no filename provided, try to find the actual file
+        if (!file) {
+            const RUNTIME_ROOT = path.join(__dirname, '../runtime');
+            const videoDir = path.join(RUNTIME_ROOT, botId, 'video');
+            
+            // Try .mp4 first (compressed files), then .webm
+            const mp4Path = path.join(videoDir, `${botId}.mp4`);
+            const webmPath = path.join(videoDir, `${botId}.webm`);
+            
+            if (await fs.pathExists(mp4Path)) {
+                file = `${botId}.mp4`;
+            } else if (await fs.pathExists(webmPath)) {
+                file = `${botId}.webm`;
+            } else {
+                // Default to .mp4 if file not found locally
+                file = `${botId}.mp4`;
+            }
+        }
+        
         const s3Key = `videos/${botId}/${file}`;
         
-        await client.deleteObject({
+        await client.send(new DeleteObjectCommand({
             Bucket: s3Config.bucket,
             Key: s3Key
-        }).promise();
+        }));
         
         console.log(`🗑️  Video deleted from S3: ${s3Key}`);
         return { success: true };

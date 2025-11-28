@@ -1,0 +1,262 @@
+/* Share Page Styles */
+body.share-page { 
+  font-family: 'Poppins', sans-serif; 
+  margin: 0; 
+  color: #111; 
+  background: #f3f4f6; 
+}
+
+.share-header { 
+  background: #111827; 
+  color: #fff; 
+  padding: 16px 20px; 
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.share-header h1 { 
+  margin: 0; 
+  font-size: 20px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.subtitle {
+  font-size: 13px;
+  color: #9ca3af;
+  margin-top: 4px;
+}
+
+.share-main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 20px;
+}
+
+@media (max-width: 768px) {
+  .share-main {
+    grid-template-columns: 1fr;
+    padding: 16px;
+  }
+}
+
+.share-card {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 20px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.share-card-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  color: #111827;
+}
+
+.transcript-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 2px solid #e5e7eb;
+  margin-bottom: 16px;
+}
+
+.transcript-tab {
+  padding: 8px 16px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  color: #6b7280;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -2px;
+  transition: all 0.2s;
+}
+
+.transcript-tab:hover {
+  color: #111827;
+  background: #f9fafb;
+}
+
+.transcript-tab.active {
+  color: #2563eb;
+  border-bottom-color: #2563eb;
+}
+
+.transcript-search {
+  position: relative;
+  margin-bottom: 16px;
+}
+
+.transcript-search input {
+  width: 100%;
+  padding: 8px 12px 8px 36px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 14px;
+  background: #fff;
+}
+
+.transcript-search input:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.transcript-item {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.transcript-time {
+  font-family: 'Monaco', 'Menlo', monospace;
+  font-size: 12px;
+  color: #6b7280;
+  width: 60px;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.transcript-content {
+  flex: 1;
+}
+
+.transcript-speaker {
+  font-weight: 600;
+  color: #111827;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.transcript-text {
+  color: #374151;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.audio-player {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  background: #f9fafb;
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.play-button {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #2563eb;
+  color: white;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.play-button:hover {
+  background: #1d4ed8;
+}
+
+.progress-bar {
+  flex: 1;
+  height: 4px;
+  background: #e5e7eb;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #2563eb;
+  transition: width 0.1s;
+}
+
+.time-display {
+  font-size: 12px;
+  color: #6b7280;
+  font-family: 'Monaco', 'Menlo', monospace;
+}
+
+.participant-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.participant-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #e5e7eb;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  color: #374151;
+  font-size: 14px;
+}
+
+.participant-name {
+  font-size: 14px;
+  color: #111827;
+}
+
+.speaker-stat {
+  margin-bottom: 16px;
+}
+
+.speaker-stat-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.speaker-name {
+  font-weight: 600;
+  color: #111827;
+  font-size: 14px;
+}
+
+.speaker-time {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.speaker-bar {
+  height: 8px;
+  background: #e5e7eb;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.speaker-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s;
+}
+
+.share-footer {
+  text-align: center;
+  padding: 40px 20px;
+  color: #6b7280;
+  font-size: 14px;
+  border-top: 1px solid #e5e7eb;
+  margin-top: 40px;
+}

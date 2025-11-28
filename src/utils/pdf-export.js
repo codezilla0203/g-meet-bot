@@ -517,13 +517,44 @@ async function generateBotPDF(botId, runtimeRoot) {
  * Format timestamp for display
  */
 function formatTimestamp(seconds) {
-    if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
-    const s = Math.floor(seconds % 60);
-    const m = Math.floor((seconds / 60) % 60);
-    const h = Math.floor(seconds / 3600);
-    const pad = (n) => String(n).padStart(2, '0');
-    if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
-    return `${pad(m)}:${pad(s)}`;
+    // Accept a variety of timestamp formats:
+    // - relative seconds (small numbers, e.g. 0..3600) => show mm:ss or h:mm:ss
+    // - epoch seconds (>= ~1e9) => show local clock time (HH:MM:SS)
+    // - epoch milliseconds (>= ~1e11) => show local clock time (HH:MM:SS)
+    if (seconds === null || seconds === undefined || seconds === '') return '';
+
+    // Try coercing strings to numbers
+    const num = Number(seconds);
+    if (!Number.isNaN(num)) {
+        // epoch ms (e.g. 1_700_000_000_000)
+        if (num > 1e11) {
+            const d = new Date(num);
+            return d.toLocaleTimeString('en-US', { hour12: false });
+        }
+        // epoch seconds (e.g. 1_700_000_000)
+        if (num > 1e9) {
+            const d = new Date(num * 1000);
+            return d.toLocaleTimeString('en-US', { hour12: false });
+        }
+
+        // treat as relative seconds
+        let secs = Math.floor(Math.max(0, num));
+        const s = Math.floor(secs % 60);
+        const m = Math.floor((secs / 60) % 60);
+        const h = Math.floor(secs / 3600);
+        const pad = (n) => String(n).padStart(2, '0');
+        if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
+        return `${pad(m)}:${pad(s)}`;
+    }
+
+    // As a last resort, try parsing as ISO date string
+    const parsed = Date.parse(String(seconds));
+    if (!Number.isNaN(parsed)) {
+        const d = new Date(parsed);
+        return d.toLocaleTimeString('en-US', { hour12: false });
+    }
+
+    return '';
 }
 
 /**

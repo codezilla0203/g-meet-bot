@@ -1,7 +1,9 @@
 (() => {
 	const meetUrlInput = document.getElementById('meetUrl');
-	const botNameInput = document.getElementById('botName');
 	const captionLanguageSelect = document.getElementById('captionLanguage');
+	const recordingTypeSelect = document.getElementById('recordingType');
+	const meetingTypeSelect = document.getElementById('meetingType');
+	const notificationEmailsInput = document.getElementById('notificationEmails');
 	const startBtn = document.getElementById('startBtn');
 	const statusEl = document.getElementById('status');
 	const badgesEl = document.getElementById('badges');
@@ -254,11 +256,18 @@
 
 				if (targetTab === 'create-bot') {
 					document.getElementById('createBotTab').classList.add('active');
+					// Stop auto-refresh when leaving My Bots tab
+					stopBotListAutoRefresh();
 				} else if (targetTab === 'my-bots') {
 					document.getElementById('myBotsTab').classList.add('active');
 					loadAllBots(true); // Force initial load
 					// Start auto-refresh when on My Bots tab
 					startBotListAutoRefresh();
+				} else if (targetTab === 'configuration') {
+					document.getElementById('configurationTab').classList.add('active');
+					loadConfiguration();
+					// Stop auto-refresh when leaving My Bots tab
+					stopBotListAutoRefresh();
 				} else {
 					// Stop auto-refresh when leaving My Bots tab
 					stopBotListAutoRefresh();
@@ -1717,7 +1726,7 @@
 		}, 3000);
 	}
 
-	async function startBot(meetingUrl, botName, captionLanguage) {
+	async function startBot(meetingUrl, captionLanguage, recordingType, meetingType, notificationEmails) {
 		// Check token expiration before creating bot
 		if (!checkTokenExpiration()) {
 			setStatus('❌ Session expired. Please sign in again.');
@@ -1731,14 +1740,28 @@
 			meeting_url: meetingUrl
 		};
 		
-		// Add optional bot name
-		if (botName && botName.trim()) {
-			payload.bot_name = botName.trim();
-		}
-		
 		// Add caption language (defaults to 'en' on server if not provided)
 		if (captionLanguage) {
 			payload.caption_language = captionLanguage;
+		}
+		
+		// Add recording type
+		if (recordingType) {
+			payload.recording_type = recordingType;
+		}
+		
+		// Add meeting type
+		if (meetingType) {
+			payload.meeting_type = meetingType;
+		}
+		
+		// Add notification emails
+		if (notificationEmails) {
+			// Split by comma and clean up emails
+			const emails = notificationEmails.split(',').map(email => email.trim()).filter(email => email);
+			if (emails.length > 0) {
+				payload.notification_emails = emails;
+			}
 		}
 		
 		const resp = await fetch('/v1/bots', {
@@ -1773,8 +1796,10 @@
 				return alert('Please enter a valid Google Meet URL');
 			}
 			
-			const botName = botNameInput.value.trim();
 			const captionLanguage = captionLanguageSelect.value;
+			const recordingType = recordingTypeSelect.value;
+			const meetingType = meetingTypeSelect.value;
+			const notificationEmails = notificationEmailsInput.value.trim();
 			
 			startBtn.disabled = true;
 			setStatus('⏳ Starting bot...');
@@ -1784,7 +1809,7 @@
 			
 			setStatus(`⏳ Starting ${displayBotName} with ${languageName} captions...`);
 			
-			botId = await startBot(url, botName, captionLanguage);
+			botId = await startBot(url, captionLanguage, recordingType, meetingType, notificationEmails);
 			setBadges(botId, 0);
 			saveBotToHistory(botId, url);
 			setStatus(`✅ Bot started successfully! (Language: ${languageName})`);
@@ -1792,9 +1817,11 @@
 			
 			// Clear form
 			meetUrlInput.value = '';
-			botNameInput.value = '';
-			// Reset language selector to default Spanish
+			notificationEmailsInput.value = '';
+			// Reset selectors to defaults
 			captionLanguageSelect.value = 'es';
+			recordingTypeSelect.value = 'audio-video';
+			meetingTypeSelect.value = 'hr-interview';
 		} catch (e) {
 			alert(e.message || 'Failed to start bot');
 			setStatus('❌ Failed to start bot.');
@@ -1803,7 +1830,64 @@
 		}
 	});
 
+	// Configuration Management
+	function loadConfiguration() {
+		const config = getConfiguration();
+		
+		// Load saved configuration into form fields
+		document.getElementById('botName').value = config.botName || 'CXFlow Meeting Bot';
+		document.getElementById('webhookUrl').value = config.webhookUrl || '';
+		document.getElementById('summaryTemplate').value = config.summaryTemplate || '';
+		document.getElementById('botLogoUrl').value = config.botLogoUrl || '';
+		document.getElementById('maxRecordingTime').value = config.maxRecordingTime || 60;
+		document.getElementById('totalRecordingMinutes').value = config.totalRecordingMinutes || 0;
+	}
+	
+	function getConfiguration() {
+		const configStr = localStorage.getItem('botConfiguration');
+		return configStr ? JSON.parse(configStr) : {};
+	}
+	
+	function saveConfiguration() {
+		const config = {
+			botName: document.getElementById('botName').value,
+			webhookUrl: document.getElementById('webhookUrl').value,
+			summaryTemplate: document.getElementById('summaryTemplate').value,
+			botLogoUrl: document.getElementById('botLogoUrl').value,
+			maxRecordingTime: parseInt(document.getElementById('maxRecordingTime').value) || 60,
+			totalRecordingMinutes: parseInt(document.getElementById('totalRecordingMinutes').value) || 0
+		};
+		
+		localStorage.setItem('botConfiguration', JSON.stringify(config));
+		
+		// Show success message
+		const configStatus = document.getElementById('configStatus');
+		configStatus.textContent = '✅ Configuration saved successfully!';
+		configStatus.style.color = '#059669';
+		setTimeout(() => {
+			configStatus.textContent = '';
+		}, 3000);
+	}
+	
+	function applyConfigurationToForm() {
+		// This function can be used later if we want to apply config to Create Bot form
+		// For now, configuration is separate from the bot creation form
+	}
+	
+	// Configuration save button event listener
+	document.addEventListener('DOMContentLoaded', () => {
+		const saveConfigBtn = document.getElementById('saveConfigBtn');
+		if (saveConfigBtn) {
+			saveConfigBtn.addEventListener('click', saveConfiguration);
+		}
+	});
+
 	// Initialize
 	initAuth();
 	initTabs();
+	
+	// Apply configuration on page load
+	setTimeout(() => {
+		applyConfigurationToForm();
+	}, 100);
 })();

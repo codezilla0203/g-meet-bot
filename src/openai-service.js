@@ -1,6 +1,8 @@
 const OpenAI = require('openai');
 const fs = require('fs-extra');
 const path = require('path');
+const { getCurrentTimestamp } = require('./utils/timezone');
+const { sendWebhook } = require('./utils/webhook');
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -12,6 +14,126 @@ const openai = new OpenAI({
  */
 function isConfigured() {
     return !!process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== '';
+}
+
+/**
+ * Get meeting type context to enrich AI prompts
+ */
+function getMeetingTypeContext(meetingType) {
+    if (!meetingType) return '';
+    
+    const meetingTypeMap = {
+        'hr-interview': `MEETING CONTEXT: This is an HR Interview meeting. Focus on:
+- Candidate qualifications, experience, and skills discussed
+- Interview questions and candidate responses
+- Assessment of candidate fit for the role
+- Next steps in the hiring process (interviews, offers, rejections)
+- Salary, benefits, or compensation discussions
+- Candidate questions and concerns
+- Timeline for hiring decisions
+- Reference checks or background verification mentioned
+- Team fit and cultural alignment discussions
+
+`,
+        'team-meeting': `MEETING CONTEXT: This is a Team Meeting. Focus on:
+- Team updates and status reports
+- Project progress and milestones
+- Collaboration and coordination between team members
+- Resource allocation and workload distribution
+- Team goals and objectives
+- Challenges and blockers the team is facing
+- Team dynamics and communication
+- Action items for team members
+- Upcoming deadlines and priorities
+
+`,
+        'client-call': `MEETING CONTEXT: This is a Client Call. Focus on:
+- Client requirements and expectations
+- Project scope, deliverables, and timelines
+- Client feedback and concerns
+- Contract terms, pricing, and payment discussions
+- Service level agreements (SLAs) and commitments
+- Client satisfaction and relationship management
+- Follow-up actions and next steps
+- Escalation issues or complaints
+- Upselling or additional service opportunities
+
+`,
+        'training-session': `MEETING CONTEXT: This is a Training Session. Focus on:
+- Training topics and learning objectives covered
+- Key concepts, procedures, or skills taught
+- Questions from trainees and answers provided
+- Practical exercises or demonstrations
+- Assessment or evaluation criteria
+- Resources and materials shared
+- Follow-up training or practice needed
+- Trainee progress and understanding
+- Certification or completion requirements
+
+`,
+        'project-review': `MEETING CONTEXT: This is a Project Review meeting. Focus on:
+- Project status, milestones, and deliverables
+- Budget, timeline, and resource utilization
+- Risks, issues, and mitigation strategies
+- Stakeholder feedback and approval status
+- Change requests and scope modifications
+- Quality metrics and performance indicators
+- Lessons learned and best practices
+- Project dependencies and blockers
+- Go-live dates and launch plans
+
+`,
+        'sales-call': `MEETING CONTEXT: This is a Sales Call. Focus on:
+- Product or service features and benefits discussed
+- Customer pain points and needs identified
+- Pricing, quotes, and proposal details
+- Objections raised and how they were addressed
+- Decision-making process and timeline
+- Competitive comparisons
+- Next steps in the sales cycle
+- Contract terms and negotiation points
+- Customer commitment level and buying signals
+
+`,
+        'standup-meeting': `MEETING CONTEXT: This is a Standup Meeting (daily sync). Focus on:
+- What each team member accomplished since last meeting
+- What each team member plans to work on today
+- Blockers or impediments preventing progress
+- Quick status updates and progress indicators
+- Dependencies between team members
+- Sprint goals and alignment
+- Quick decisions or clarifications needed
+- Action items for the day
+
+`,
+        'brainstorming': `MEETING CONTEXT: This is a Brainstorming Session. Focus on:
+- Ideas, concepts, and creative solutions proposed
+- Problem statements and challenges being addressed
+- Evaluation criteria for ideas
+- Pros and cons of different approaches
+- Voting or prioritization of ideas
+- Action items to research or prototype ideas
+- Next steps for idea development
+- Resource needs for implementation
+- Innovation opportunities identified
+
+`,
+        'presentation': `MEETING CONTEXT: This is a Presentation. Focus on:
+- Main topics and key messages presented
+- Data, statistics, and evidence shared
+- Visual aids, slides, or demos shown
+- Questions from audience and responses
+- Key takeaways and conclusions
+- Call-to-action or next steps presented
+- Audience engagement and feedback
+- Follow-up materials or resources promised
+- Presentation effectiveness and impact
+
+`,
+        'other': ''
+    };
+    
+    return meetingTypeMap[meetingType] || '';
 }
 
 /**
@@ -92,17 +214,39 @@ function estimateTokens(text) {
 }
 
 /**
- * Split transcript into chunks for processing
+ * Split transcript into chunks for processing with overlap to preserve context
  */
-function chunkTranscript(transcript, maxTokens = 6000) {
+function chunkTranscript(transcript, maxTokens = 6000, overlapTokens = 500) {
     const lines = transcript.split('\n');
     const chunks = [];
     let currentChunk = '';
+    let lastChunkEnd = '';
     
     for (const line of lines) {
         const testChunk = currentChunk + line + '\n';
         if (estimateTokens(testChunk) > maxTokens && currentChunk) {
-            chunks.push(currentChunk.trim());
+            // Save current chunk with overlap from previous
+            const chunkWithOverlap = lastChunkEnd ? lastChunkEnd + '\n\n--- CONTINUED ---\n\n' + currentChunk.trim() : currentChunk.trim();
+            chunks.push(chunkWithOverlap);
+            
+            // Extract overlap from end of current chunk for next chunk
+            const currentLines = currentChunk.split('\n');
+            let overlapText = '';
+            let overlapTokenCount = 0;
+            
+            // Get last lines that fit in overlapTokens
+            for (let i = currentLines.length - 1; i >= 0 && overlapTokenCount < overlapTokens; i--) {
+                const lineToAdd = currentLines[i] + '\n';
+                const lineTokens = estimateTokens(lineToAdd);
+                if (overlapTokenCount + lineTokens <= overlapTokens) {
+                    overlapText = lineToAdd + overlapText;
+                    overlapTokenCount += lineTokens;
+                } else {
+                    break;
+                }
+            }
+            
+            lastChunkEnd = overlapText.trim();
             currentChunk = line + '\n';
         } else {
             currentChunk = testChunk;
@@ -110,7 +254,9 @@ function chunkTranscript(transcript, maxTokens = 6000) {
     }
     
     if (currentChunk.trim()) {
-        chunks.push(currentChunk.trim());
+        // Add final chunk with overlap
+        const finalChunk = lastChunkEnd ? lastChunkEnd + '\n\n--- CONTINUED ---\n\n' + currentChunk.trim() : currentChunk.trim();
+        chunks.push(finalChunk);
     }
     
     return chunks;
@@ -119,25 +265,48 @@ function chunkTranscript(transcript, maxTokens = 6000) {
 /**
  * Generate summary for a chunk
  */
-async function summarizeChunk(chunk, chunkIndex, totalChunks, language = 'Spanish') {
-    const systemPrompt = `You are an expert meeting analyst. Analyze the following meeting transcript segment (part ${chunkIndex + 1} of ${totalChunks}) and extract:
+async function summarizeChunk(chunk, chunkIndex, totalChunks, language = 'Spanish', customSummaryTemplate = null, meetingType = null) {
+    // Build meeting type context for prompt enrichment
+    const meetingTypeContext = meetingType ? getMeetingTypeContext(meetingType) : '';
+    
+    // Use custom template if provided, otherwise use enhanced default
+    const systemPrompt = customSummaryTemplate && customSummaryTemplate.trim() 
+        ? `${customSummaryTemplate}\n\n${meetingTypeContext}IMPORTANT: This is part ${chunkIndex + 1} of ${totalChunks}. Extract ALL details from this segment. Respond in ${language} language.`
+        : `You are an expert meeting analyst with exceptional attention to detail. Analyze the following meeting transcript segment (part ${chunkIndex + 1} of ${totalChunks}) and extract EVERY important detail with 100% accuracy.
 
-1. Key discussion points
-2. Decisions made
-3. Action items with owners
-4. Concerns or risks mentioned
+${meetingTypeContext}
 
-Be concise and factual. Focus on actionable information.
+CRITICAL REQUIREMENTS:
+- Extract ALL discussion points, no matter how minor they seem
+- Capture EVERY decision made, including who made it and when
+- List ALL action items with exact owners, tasks, and deadlines (preserve exact dates/times mentioned)
+- Note ALL concerns, risks, blockers, or uncertainties mentioned
+- Preserve exact names, numbers, dates, and technical terms exactly as stated
+- Include ALL commitments and promises made by participants
+- Capture ALL questions asked and answers given
+- Note ALL agreements and disagreements
+- Preserve context and relationships between topics
+
+Format your analysis clearly with:
+1. Key Discussion Points (ALL points, not just top ones)
+2. Decisions Made (EVERY decision with context)
+3. Action Items (COMPLETE list with Who/What/When)
+4. Concerns & Risks (ALL mentioned)
+5. Important Quotes or Statements (exact wording when critical)
+6. Questions & Answers (ALL Q&A pairs)
+7. Agreements & Commitments (EVERY commitment)
+
+Be thorough and comprehensive. Do not omit any information. Accuracy is more important than brevity.
 IMPORTANT: Respond in ${language} language.`;
 
     const completion = await openai.chat.completions.create({
-        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        model: process.env.OPENAI_MODEL || 'gpt-4o', // Use gpt-4o for better accuracy
         messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: chunk }
+            { role: 'user', content: `Analyze this transcript segment in detail:\n\n${chunk}` }
         ],
-        temperature: 0.5,
-        max_tokens: 1500
+        temperature: 0.3, // Lower temperature for more deterministic, exact outputs
+        max_tokens: 3000 // Increased for comprehensive chunk summaries
     });
 
     return completion.choices[0].message.content;
@@ -146,43 +315,32 @@ IMPORTANT: Respond in ${language} language.`;
 /**
  * Generate final summary from chunk summaries
  */
-async function generateFinalSummary(chunkSummaries, fullTranscript, language = 'Spanish') {
-    const combinedSummaries = chunkSummaries.join('\n\n---\n\n');
+async function generateFinalSummary(chunkSummaries, fullTranscript, language = 'Spanish', customSummaryTemplate = null, meetingType = null) {
+    const combinedSummaries = chunkSummaries.join('\n\n--- CHUNK SEPARATOR ---\n\n');
     
-    const systemPrompt = `Analyze the following meeting transcript and produce a structured executive summary with the 5 core sections used by top conversation-intelligence platforms. Keep the summary clear, concise, and actionable.
+    // Build meeting type context for prompt enrichment
+    const meetingTypeContext = meetingType ? getMeetingTypeContext(meetingType) : '';
+    
+    // Use custom template if provided, otherwise use default template
+    const defaultTemplate = getDefaultSummaryTemplate();
+    const systemPrompt = customSummaryTemplate && customSummaryTemplate.trim() 
+        ? `${customSummaryTemplate}\n\n${meetingTypeContext}CRITICAL: Ensure 100% accuracy. Include ALL details from all chunks. Do not omit any information. Respond in ${language} language.`
+        : `You are an expert meeting analyst creating a comprehensive, 100% accurate executive summary. Your task is to synthesize ALL information from the chunk analyses below into a complete, exact, and detailed summary.
 
-Deliver the output in this exact structure:
+${meetingTypeContext}
 
-**Executive Summary** (30–60 words)
-High-level overview of the meeting purpose, tone, and outcomes. No details, just the essence.
+${defaultTemplate}
 
-**Key Discussion Points**
-Top 5–8 points discussed. Use bullets. Capture facts, ideas, proposals, objections, technical issues, or decisions being explored.
-
-**Decisions & Commitments**
-List all confirmed decisions. Who committed to what. Include deadlines if mentioned.
-
-**Action Items (Who / What / When)**
-Output as a mini-table or bullet list. If no date was given, write "No deadline provided." Rewrite vague tasks into clear and measurable actions.
-
-**Risks, Concerns & Follow-ups**
-Identify blockers, uncertainties, or anything that needs clarification. Include follow-up questions the team should answer.
-
-Guidelines:
-- Be objective and avoid adding interpretation that was not mentioned.
-- If audio quality seemed low or transcription unclear, indicate "Potential transcription ambiguity" where needed.
-- If participants express emotions (frustration, urgency, enthusiasm), summarize tone briefly in the Executive Summary.
-- Maintain professional formatting.
-IMPORTANT: Respond in ${language} language.`;
+IMPORTANT: Cross-reference information across chunks to ensure nothing is missed. This summary must be complete and exact. Double-check that you have included ALL information from all chunks. Respond in ${language} language.`;
 
     const completion = await openai.chat.completions.create({
-        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        model: process.env.OPENAI_MODEL || 'gpt-4o', // Use gpt-4o for better accuracy
         messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Now analyze the transcript below:\n\n${combinedSummaries}` }
+            { role: 'user', content: `Synthesize ALL information from the chunk analyses below into a comprehensive, 100% accurate summary. Ensure nothing is omitted:\n\n${combinedSummaries}\n\n---\n\nAlso reference the full transcript context when needed:\n\n${fullTranscript.slice(0, 5000)}${fullTranscript.length > 5000 ? '\n\n[... transcript continues ...]' : ''}` }
         ],
-        temperature: 0.7,
-        max_tokens: 2000
+        temperature: 0.3, // Lower temperature for more deterministic, exact outputs
+        max_tokens: 4000 // Increased for comprehensive summaries
     });
 
     return completion.choices[0].message.content;
@@ -191,7 +349,7 @@ IMPORTANT: Respond in ${language} language.`;
 /**
  * Generate meeting summary using OpenAI
  */
-async function generateSummary(captions, languageCode = 'es') {
+async function generateSummary(captions, languageCode = 'es', customSummaryTemplate = null, meetingType = null) {
     if (!isConfigured()) {
         console.warn('⚠️  OpenAI API key not configured. Skipping AI summary generation.');
         return generateBasicSummary(captions);
@@ -220,8 +378,10 @@ async function generateSummary(captions, languageCode = 'es') {
             'gpt-4o-mini': 128000
         };
 
-        const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-        const modelLimit = modelLimits[model] || 4096;
+        // Use gpt-4o for better accuracy, fallback to gpt-4o-mini if not available
+        const defaultModel = 'gpt-4o'; // Better accuracy for exact summaries
+        const model = process.env.OPENAI_MODEL || defaultModel;
+        const modelLimit = modelLimits[model] || modelLimits[defaultModel] || 4096;
         
         // Reserve tokens for system prompt and response
         const maxInputTokens = modelLimit - 3000;
@@ -230,59 +390,47 @@ async function generateSummary(captions, languageCode = 'es') {
             console.log(`⚠️  Transcript too long (${estimatedTokens} tokens). Using chunked summarization strategy...`);
             
             // Split transcript into manageable chunks
-            const chunks = chunkTranscript(transcript, 6000);
+            // Split transcript into manageable chunks with overlap for context preservation
+            const chunks = chunkTranscript(transcript, 6000, 500);
             console.log(`📄 Split transcript into ${chunks.length} chunks`);
             
             // Summarize each chunk
             const chunkSummaries = [];
             for (let i = 0; i < chunks.length; i++) {
                 console.log(`   Processing chunk ${i + 1}/${chunks.length}...`);
-                const chunkSummary = await summarizeChunk(chunks[i], i, chunks.length, language);
+                const chunkSummary = await summarizeChunk(chunks[i], i, chunks.length, language, customSummaryTemplate, meetingType);
                 chunkSummaries.push(chunkSummary);
             }
             
             // Generate final comprehensive summary
             console.log('📝 Generating final comprehensive summary...');
-            const finalSummary = await generateFinalSummary(chunkSummaries, transcript, language);
+            const finalSummary = await generateFinalSummary(chunkSummaries, transcript, language, customSummaryTemplate, meetingType);
             console.log('✅ AI summary generated successfully (chunked approach)');
             
             return finalSummary;
         } else {
             // Transcript fits in one request
-            const systemPrompt = `Analyze the following meeting transcript and produce a structured executive summary with the 5 core sections used by top conversation-intelligence platforms. Keep the summary clear, concise, and actionable.
+            // Build meeting type context for prompt enrichment
+            const meetingTypeContext = meetingType ? getMeetingTypeContext(meetingType) : '';
+            
+            // Use custom template if provided, otherwise use default template
+            const defaultTemplate = getDefaultSummaryTemplate();
+            const systemPrompt = customSummaryTemplate && customSummaryTemplate.trim() 
+                ? `${customSummaryTemplate}\n\n${meetingTypeContext}CRITICAL: Ensure 100% accuracy. Include ALL details. Do not omit any information. Respond in ${language} language.`
+                : `${defaultTemplate}
 
-Deliver the output in this exact structure:
+${meetingTypeContext}
 
-**Executive Summary** (30–60 words)
-High-level overview of the meeting purpose, tone, and outcomes. No details, just the essence.
-
-**Key Discussion Points**
-Top 5–8 points discussed. Use bullets. Capture facts, ideas, proposals, objections, technical issues, or decisions being explored.
-
-**Decisions & Commitments**
-List all confirmed decisions. Who committed to what. Include deadlines if mentioned.
-
-**Action Items (Who / What / When)**
-Output as a mini-table or bullet list. If no date was given, write "No deadline provided." Rewrite vague tasks into clear and measurable actions.
-
-**Risks, Concerns & Follow-ups**
-Identify blockers, uncertainties, or anything that needs clarification. Include follow-up questions the team should answer.
-
-Guidelines:
-- Be objective and avoid adding interpretation that was not mentioned.
-- If audio quality seemed low or transcription unclear, indicate "Potential transcription ambiguity" where needed.
-- If participants express emotions (frustration, urgency, enthusiasm), summarize tone briefly in the Executive Summary.
-- Maintain professional formatting.
-IMPORTANT: Respond in ${language} language.`;
+IMPORTANT: This summary must be complete and exact. Double-check that you have included ALL information from the transcript. Respond in ${language} language.`;
 
             const completion = await openai.chat.completions.create({
-                model: model,
+                model: model === 'gpt-4o-mini' ? 'gpt-4o' : model, // Use gpt-4o for better accuracy when possible
                 messages: [
                     { role: 'system', content: systemPrompt },
-                    { role: 'user', content: `Now analyze the transcript below:\n\n${transcript}` }
+                    { role: 'user', content: `Analyze this meeting transcript in detail and create a comprehensive, 100% accurate summary. Ensure nothing is omitted:\n\n${transcript}` }
                 ],
-                temperature: 0.7,
-                max_tokens: 2000
+                temperature: 0.3, // Lower temperature for more deterministic, exact outputs
+                max_tokens: 4000 // Increased for comprehensive summaries
             });
 
             const summary = completion.choices[0].message.content;
@@ -293,6 +441,7 @@ IMPORTANT: Respond in ${language} language.`;
 
     } catch (error) {
         console.error('❌ Error generating OpenAI summary:', error.message);
+        try { await sendWebhook('error.occurred', { meeting_id: null, code: 'summary_generation_error', message: error && error.message ? error.message : String(error), details: { botId: null } }); } catch (e) {}
         
         // Fallback to basic summary
         console.log('📝 Falling back to basic summary...');
@@ -566,14 +715,74 @@ Example format: ["project timeline", "budget approval", "team collaboration", "d
 
     } catch (error) {
         console.error('❌ Error generating keywords:', error);
+        try { await sendWebhook('error.occurred', { meeting_id: null, code: 'keywords_generation_error', message: error && error.message ? error.message : String(error), details: {} }); } catch (e) {}
         return [];
+    }
+}
+
+/**
+ * Generate a short, descriptive meeting title from the transcript or summary using OpenAI
+ */
+async function generateMeetingTitle(captions, existingSummary = '', languageCode = 'es') {
+    // Fallback simple title if OpenAI not configured
+    if (!isConfigured()) {
+        try {
+            // Try to build a heuristic title from top speakers or first caption
+            if (Array.isArray(captions) && captions.length > 0) {
+                const first = captions.find(c => (c.text || '').trim());
+                const speakers = Array.from(new Set(captions.map(c => (c.speaker || c.personName || 'Unknown').trim()).filter(Boolean))).slice(0,3);
+                const titleParts = [];
+                if (speakers.length) titleParts.push(speakers.join(', '));
+                if (first && first.text) titleParts.push(first.text.trim().slice(0, 60));
+                return titleParts.join(' - ').slice(0, 100) || 'Meeting';
+            }
+        } catch (e) {
+            // ignore and fallback
+        }
+        return 'Meeting';
+    }
+
+    const language = getLanguageName(languageCode);
+    try {
+        const transcript = formatTranscript(captions);
+        const prompt = `Generate a short, descriptive meeting title (6 words or fewer) for the following meeting. Return only the title text, nothing else. Respond in ${language}.
+
+Context (either summary or transcript):\n${existingSummary ? existingSummary.slice(0, 4000) : transcript.slice(0, 4000)}`;
+
+        const completion = await openai.chat.completions.create({
+            model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+            messages: [
+                { role: 'system', content: `You are an assistant that crafts concise, informative meeting titles.` },
+                { role: 'user', content: prompt }
+            ],
+            temperature: 0.2,
+            max_tokens: 32
+        });
+
+        let title = completion.choices[0].message.content.trim();
+        // Clean title: strip surrounding quotes and newlines
+        title = title.replace(/^\s+|\s+$/g, '').replace(/^['"]+|['"]+$/g, '');
+        if (!title) return 'Meeting';
+        return title.slice(0, 200);
+    } catch (e) {
+        console.warn('⚠️ Could not generate meeting title via OpenAI:', e.message);
+        // Fallback heuristics
+        try {
+            if (Array.isArray(captions) && captions.length > 0) {
+                const first = captions.find(c => (c.text || '').trim());
+                return first && first.text ? first.text.trim().slice(0, 80) : 'Meeting';
+            }
+        } catch (ie) {
+            // ignore
+        }
+        return 'Meeting';
     }
 }
 
 /**
  * Generate and save summary for a bot
  */
-async function generateAndSaveSummary(botId, runtimeRoot) {
+async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate = null, meetingType = null) {
     try {
         console.log(`📝 Generating summary for bot ${botId}...`);
 
@@ -600,8 +809,9 @@ async function generateAndSaveSummary(botId, runtimeRoot) {
             return summaryPath;
         }
 
-        // Read bot metadata to get language preference
+        // Read bot metadata to get language preference and meeting type
         let languageCode = 'es'; // Default to Spanish
+        let finalMeetingType = meetingType; // Use provided meeting type or try to get from metadata
         try {
             if (await fs.pathExists(metadataPath)) {
                 const metadata = await fs.readJson(metadataPath);
@@ -609,20 +819,47 @@ async function generateAndSaveSummary(botId, runtimeRoot) {
                     languageCode = metadata.captionLanguage;
                     console.log(`🌐 Using language from metadata: ${languageCode}`);
                 }
+                if (!finalMeetingType && metadata.meetingType) {
+                    finalMeetingType = metadata.meetingType;
+                    console.log(`📋 Using meeting type from metadata: ${finalMeetingType}`);
+                }
             }
         } catch (e) {
-            console.warn(`⚠️  Could not read bot metadata for language, using default: ${e.message}`);
+            console.warn(`⚠️  Could not read bot metadata, using defaults: ${e.message}`);
         }
 
         // Save formatted transcript
         await saveFormattedTranscript(botId, captions, runtimeRoot);
 
-        // Generate summary (with or without OpenAI) - pass language code
-        const summary = await generateSummary(captions, languageCode);
+        // Generate summary (with or without OpenAI) - pass language code, custom template, and meeting type
+        const summary = await generateSummary(captions, languageCode, customSummaryTemplate, finalMeetingType);
 
         // Save summary
         await fs.writeFile(summaryPath, summary, 'utf8');
         console.log(`✅ Summary saved: ${summaryPath}`);
+
+        // Emit summary.completed webhook (best-effort). Include optional public URL if configured.
+        try {
+            const ts = getCurrentTimestamp();
+            let publicSummaryUrl = null;
+            if (process.env.PUBLIC_BASE_URL) {
+                // Build a public URL if a base is provided. Expect PUBLIC_BASE_URL to map to runtimeRoot publicly.
+                const base = String(process.env.PUBLIC_BASE_URL).replace(/\/$/, '');
+                publicSummaryUrl = `${base}/${encodeURIComponent(botId)}/summary.txt`;
+            }
+            // await to log potential errors; sendWebhook itself is best-effort
+            await sendWebhook('summary.completed', {
+                meeting_id: botId,
+                summary: summary,
+                public_summary_url: publicSummaryUrl,
+                language: languageCode,
+                saved_path: summaryPath,
+                completed_at: ts.formatted,
+                timezone: ts.timezone
+            });
+        } catch (e) {
+            console.warn(`⚠️ Could not send summary.completed webhook for ${botId}: ${e && e.message ? e.message : e}`);
+        }
 
         // Generate and save keywords
         const keywords = await generateKeywords(captions, languageCode);
@@ -694,12 +931,123 @@ async function generateAndSaveSummary(botId, runtimeRoot) {
             console.warn(`⚠️  Could not update metrics with keywords: ${e.message}`);
         }
 
+        // Generate a short meeting title and persist it into bot_metadata.json
+        try {
+            const generatedTitle = await generateMeetingTitle(captions, summary, languageCode);
+            try {
+                let metadata = {};
+                if (await fs.pathExists(metadataPath)) {
+                    try {
+                        metadata = await fs.readJson(metadataPath);
+                    } catch (e) {
+                        console.warn(`⚠️ Could not parse existing metadata when saving title: ${e.message}`);
+                        metadata = {};
+                    }
+                }
+
+                // Only update if title is different to avoid unnecessary writes
+                if (!metadata.title || metadata.title !== generatedTitle) {
+                    metadata.title = generatedTitle;
+                    await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+                    console.log(`✅ Updated bot metadata title: ${generatedTitle}`);
+                } else {
+                    console.log('ℹ️  Bot metadata title already up-to-date');
+                }
+            } catch (metaErr) {
+                console.warn(`⚠️ Could not save generated title to metadata: ${metaErr.message}`);
+            }
+        } catch (titleErr) {
+            console.warn(`⚠️ Could not generate meeting title: ${titleErr.message}`);
+        }
+
         return summaryPath;
 
     } catch (error) {
         console.error(`❌ Error generating summary for bot ${botId}:`, error);
+        try { await sendWebhook('error.occurred', { meeting_id: botId, code: 'summary_pipeline_error', message: error && error.message ? error.message : String(error), details: {} }); } catch (e) {}
         throw error;
     }
+}
+
+/**
+ * Get default summary template
+ * This is the base template used when no custom template is provided.
+ * Note: meetingTypeContext and language are added dynamically when the template is used.
+ */
+function getDefaultSummaryTemplate() {
+    return `You are an expert meeting analyst creating a comprehensive, 100% accurate executive summary. Analyze the following meeting transcript with exceptional attention to detail.
+
+CRITICAL REQUIREMENTS FOR 100% ACCURACY:
+- Include EVERY decision, action item, and commitment mentioned
+- Preserve exact names, numbers, dates, and technical terms
+- Do NOT omit any information - completeness is essential
+- Capture ALL discussion points, not just highlights
+- Maintain exact context and relationships between topics
+- Preserve all deadlines, dates, and time commitments exactly as stated
+- Include ALL participants and their contributions
+- Capture ALL questions, answers, and follow-ups
+
+Deliver the output in this exact structure:
+
+**Executive Summary** (50–100 words)
+Comprehensive overview of the meeting purpose, participants, tone, key outcomes, and overall context. Include meeting type and main objectives.
+
+**Key Discussion Points**
+ALL major and minor discussion points, not just top ones. Use detailed bullets. Include:
+- Facts, data, and statistics mentioned
+- Ideas, proposals, and suggestions
+- Objections, concerns, and counter-arguments
+- Technical issues and solutions discussed
+- Decisions being explored or debated
+- Background context and explanations
+
+**Decisions & Commitments**
+COMPLETE list of ALL confirmed decisions with:
+- Exact decision statement
+- Who made or agreed to the decision
+- When it was made (if mentioned)
+- Context and reasoning behind the decision
+- Any conditions or caveats
+
+**Action Items (Who / What / When / Status)**
+COMPREHENSIVE list of ALL action items in this format:
+- Owner: [Exact name]
+- Task: [Detailed description]
+- Deadline: [Exact date/time or "No deadline provided"]
+- Dependencies: [If any]
+- Notes: [Additional context]
+
+Include ALL tasks mentioned, even if not explicitly assigned. Rewrite vague tasks into clear, measurable actions while preserving original intent.
+
+**Risks, Concerns & Follow-ups**
+ALL identified items including:
+- Blockers and obstacles mentioned
+- Uncertainties and open questions
+- Technical or resource concerns
+- Follow-up questions that need answers
+- Items requiring clarification
+- Potential issues or warnings raised
+
+**Important Quotes & Statements**
+Exact quotes or statements that are critical to understanding context, decisions, or commitments. Include speaker name and context.
+
+**Participants Summary**
+List all participants and their key contributions/roles in the meeting.
+
+**Next Steps & Follow-ups**
+All follow-up actions, meetings, or communications planned.
+
+Guidelines:
+- Be 100% accurate - do not add information not in the transcript
+- Be comprehensive - include ALL details, not just highlights
+- Preserve exact wording for critical statements
+- Maintain chronological flow where relevant
+- If audio quality seemed low or transcription unclear, indicate "Potential transcription ambiguity" where needed
+- If participants express emotions (frustration, urgency, enthusiasm), note this in the Executive Summary
+- Maintain professional formatting with clear sections
+- Use markdown formatting for readability
+
+IMPORTANT: This summary must be complete and exact. Double-check that you have included ALL information from the transcript.`;
 }
 
 /**
@@ -721,6 +1069,7 @@ module.exports = {
     saveFormattedTranscript,
     isConfigured,
     getModelInfo,
-    buildUtterances
+    buildUtterances,
+    getDefaultSummaryTemplate
 };
 

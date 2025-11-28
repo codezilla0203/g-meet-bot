@@ -1,314 +1,351 @@
 /**
- * Video Compression Utility
- * 
- * Provides post-processing video compression using FFmpeg
- * Reduces file size without changing resolution
+ * Video Compression Utility (Optimized for Web Playback)
+ *
+ * - Downscale to 720p (configurable)
+ * - H.264 MP4 with streaming-friendly settings
+ * - Smooth seeking, minimal buffering
  */
 
 const { spawn } = require('child_process');
 const fs = require('fs-extra');
 const path = require('path');
 const ffmpegPath = require('ffmpeg-static');
+const { sendWebhook } = require('./webhook');
 
 /**
- * Compress video file using FFmpeg
- * @param {string} inputPath - Path to input video file
- * @param {string} outputPath - Path to output compressed video file  
- * @param {Object} options - Compression options
- * @returns {Promise<Object>} Compression result
+ * Compress + (optionally) downscale video using FFmpeg
+ *
+ * @param {string} inputPath   - Path to input video file
+ * @param {string} outputPath  - Path to output compressed video file
+ * @param {Object} options
+ * @returns {Promise<Object>}
  */
 async function compressVideo(inputPath, outputPath, options = {}) {
-    const {
-        videoBitrate = null,          // If null, use CRF mode (better quality at same size)
-        audioBitrate = '64k',         // Lower audio bitrate (voice doesn't need much)
-        preset = 'ultrafast',         // Encoding speed vs compression (ultrafast for maximum speed)
-        crf = 35,                     // Constant Rate Factor (higher = faster encoding, still acceptable quality)
-        codec = 'libx264',            // H.264 codec (much faster than VP9)
-        twoPass = false,              // Two-pass encoding for better quality
-        removeOriginal = false        // Remove original file after compression
-    } = options;
+  const {
+    // resolution
+    targetHeight = 720,        // null = keep original, 720 = downscale to 720p
 
-    console.log(`🗜️  Compressing video: ${inputPath}`);
-    if (videoBitrate) {
-        console.log(`   Mode: Bitrate-based (${videoBitrate}), CRF: ${crf}, Preset: ${preset}`);
-    } else {
-        console.log(`   Mode: Quality-based (CRF: ${crf}), Preset: ${preset}`);
+    // quality / bitrate
+    videoBitrate = null,       // null = CRF only (recommended)
+    maxrate = '900k',          // cap peaks for smoother streaming
+    bufsize = '1800k',
+    audioBitrate = '64k',
+
+    // encoder
+    crf = 30,                  // 26–32 is typical for meetings
+    preset = 'veryfast',       // much better than ultrafast for compression efficiency
+    codec = 'libx264',
+
+    removeOriginal = false
+  } = options;
+
+  console.log(`🗜️  Compressing video: ${inputPath}`);
+  console.log(`   targetHeight=${targetHeight}, crf=${crf}, preset=${preset}, codec=${codec}`);
+
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(inputPath)) {
+      // Notify webhook and reject
+      try { sendWebhook('error.occurred', { code: 'video_compression_error', message: 'Input file not found', details: { inputPath } }); } catch (e) {}
+      return reject(new Error(`Input file not found: ${inputPath}`));
     }
 
-    return new Promise((resolve, reject) => {
-        // Check if input file exists
-        if (!fs.existsSync(inputPath)) {
-            return reject(new Error(`Input file not found: ${inputPath}`));
-        }
+    const inputStats = fs.statSync(inputPath);
+    const inputSizeMB = (inputStats.size / 1024 / 1024).toFixed(2);
 
-        // Get input file size
-        const inputStats = fs.statSync(inputPath);
-        const inputSizeMB = (inputStats.size / 1024 / 1024).toFixed(2);
+    const args = [];
 
-        // Build FFmpeg command
-        // Use CRF mode (quality-based) for better compression efficiency
-        const args = [
-            '-i', inputPath,
-            '-c:v', codec
-        ];
-        
-        // If bitrate is explicitly set, use bitrate mode
-        if (videoBitrate) {
-            args.push('-b:v', videoBitrate);
-        } else {
-            // Use CRF mode (quality-based) - better for maintaining quality at smaller size
-            args.push('-crf', String(crf), '-b:v', '0');
-        }
-        
-        // Add remaining options optimized for speed
+    // Overwrite output if exists
+    args.push('-y');
+
+    // Input
+    args.push('-i', inputPath);
+
+    // --- DOWNSCALE (if targetHeight given) ---
+    if (targetHeight) {
+      // Keep aspect ratio, width auto & divisible by 2
+      args.push('-vf', `scale=-2:${targetHeight}`);
+    }
+
+    // Video codec & quality
+    args.push(
+      '-c:v', codec,
+      '-preset', preset,
+      '-tune', 'fastdecode',    // helps decoding & seeking
+      '-crf', String(crf),
+      '-pix_fmt', 'yuv420p'     // best browser compatibility
+    );
+
+    // Bitrate / streaming control
+    if (videoBitrate) {
+      // If you explicitly set a bitrate, use it as both target & cap
+      args.push(
+        '-b:v', videoBitrate,
+        '-maxrate', videoBitrate,
+        '-bufsize', videoBitrate
+      );
+    } else {
+      // Pure CRF mode with peak caps for smooth streaming
+      if (maxrate && bufsize) {
         args.push(
-            '-c:a', 'aac',            // AAC audio (faster than Opus)
-            '-b:a', audioBitrate,
-            '-preset', 'ultrafast',   // H.264 ultrafast preset for maximum speed
-            '-tune', 'zerolatency',   // Optimize for speed over compression
-            '-threads', '0',          // Use all available threads (0 = auto)
-            '-movflags', '+faststart', // Enable fast start for web playback
-            '-y',                     // Overwrite output
-            outputPath
+          '-maxrate', maxrate,
+          '-bufsize', bufsize
         );
+      }
+    }
 
-        console.log(`   FFmpeg command: ${ffmpegPath} ${args.join(' ')}`);
+    // Audio
+    args.push(
+      '-c:a', 'aac',
+      '-b:a', audioBitrate
+    );
 
-        const startTime = Date.now();
-        const ffmpeg = spawn(ffmpegPath, args);
+    // Web playback optimizations
+    args.push(
+      '-movflags', '+faststart' // moov atom at beginning => fast start & seeking
+    );
 
-        let stderr = '';
+    // IMPORTANT: No custom -x264-params (no fixed keyint/scenecut=0)
+    // Let x264 decide GOP & scenecuts for smoother bit distribution.
 
-        ffmpeg.stderr.on('data', (data) => {
-            stderr += data.toString();
-            // Log progress
-            const match = stderr.match(/time=(\d+:\d+:\d+\.\d+)/);
-            if (match) {
-                process.stdout.write(`\r   Progress: ${match[1]}`);
-            }
-        });
+    // Output
+    args.push(outputPath);
 
-        ffmpeg.on('close', (code) => {
-            const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`   FFmpeg command: ${ffmpegPath} ${args.join(' ')}`);
 
-            if (code === 0) {
-                // Check output file
-                if (fs.existsSync(outputPath)) {
-                    const outputStats = fs.statSync(outputPath);
-                    const outputSizeMB = (outputStats.size / 1024 / 1024).toFixed(2);
-                    const reduction = ((1 - outputStats.size / inputStats.size) * 100).toFixed(1);
+    const startTime = Date.now();
+    const ffmpeg = spawn(ffmpegPath, args);
 
-                    console.log(`\n✅ Compression complete in ${duration}s`);
-                    console.log(`   Original: ${inputSizeMB} MB → Compressed: ${outputSizeMB} MB`);
-                    console.log(`   Reduction: ${reduction}% (saved ${(inputSizeMB - outputSizeMB).toFixed(2)} MB)`);
+    let stderr = '';
 
-                    // Remove original if requested
-                    if (removeOriginal) {
-                        fs.removeSync(inputPath);
-                        console.log(`   🗑️  Original file removed`);
-                    }
-
-                    resolve({
-                        success: true,
-                        inputSize: inputStats.size,
-                        outputSize: outputStats.size,
-                        inputSizeMB: parseFloat(inputSizeMB),
-                        outputSizeMB: parseFloat(outputSizeMB),
-                        reductionPercent: parseFloat(reduction),
-                        duration: parseFloat(duration),
-                        outputPath
-                    });
-                } else {
-                    reject(new Error('Output file not created'));
-                }
-            } else {
-                console.error(`\n❌ FFmpeg compression failed with code ${code}`);
-                console.error(`   Error output: ${stderr.slice(-500)}`);
-                reject(new Error(`FFmpeg exited with code ${code}`));
-            }
-        });
-
-        ffmpeg.on('error', (error) => {
-            reject(new Error(`Failed to start FFmpeg: ${error.message}`));
-        });
+    ffmpeg.stderr.on('data', (data) => {
+      stderr += data.toString();
+      const match = stderr.match(/time=(\d+:\d+:\d+\.\d+)/);
+      if (match) {
+        process.stdout.write(`\r   Progress: ${match[1]}`);
+      }
     });
+
+    ffmpeg.on('close', (code) => {
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      if (code === 0) {
+        if (fs.existsSync(outputPath)) {
+          const outputStats = fs.statSync(outputPath);
+          const outputSizeMB = (outputStats.size / 1024 / 1024).toFixed(2);
+          const reduction = ((1 - outputStats.size / inputStats.size) * 100).toFixed(1);
+
+          console.log(`\n✅ Compression complete in ${duration}s`);
+          console.log(`   Original: ${inputSizeMB} MB → Compressed: ${outputSizeMB} MB`);
+          console.log(`   Reduction: ${reduction}%`);
+
+          if (removeOriginal) {
+            fs.removeSync(inputPath);
+            console.log('   🗑️  Original file removed');
+          }
+
+          resolve({
+            success: true,
+            inputSize: inputStats.size,
+            outputSize: outputStats.size,
+            inputSizeMB: parseFloat(inputSizeMB),
+            outputSizeMB: parseFloat(outputSizeMB),
+            reductionPercent: parseFloat(reduction),
+            duration: parseFloat(duration),
+            outputPath
+          });
+        } else {
+          reject(new Error('Output file not created'));
+        }
+      } else {
+        const message = `FFmpeg exited with code ${code}`;
+        console.error(`\n❌ FFmpeg compression failed with code ${code}`);
+        console.error(`   Error output (tail): ${stderr.slice(-500)}`);
+        try { sendWebhook('error.occurred', { code: 'video_compression_error', message, details: { inputPath, outputPath, exitCode: code, stderr: stderr.slice(-2000) } }); } catch (e) {}
+        reject(new Error(`FFmpeg exited with code ${code}`));
+      }
+    });
+
+    ffmpeg.on('error', (error) => {
+      try { sendWebhook('error.occurred', { code: 'video_compression_error', message: 'Failed to start FFmpeg', details: { inputPath, error: error && error.message ? error.message : String(error) } }); } catch (e) {}
+      reject(new Error(`Failed to start FFmpeg: ${error.message}`));
+    });
+  });
 }
 
 /**
  * Compress video in place (replaces original)
- * @param {string} filePath - Path to video file
- * @param {Object} options - Compression options
- * @returns {Promise<Object>} Compression result
+ *
+ * @param {string} filePath  - Path to video file
+ * @param {Object} options   - Compression options
+ * @returns {Promise<Object>}
  */
 async function compressVideoInPlace(filePath, options = {}) {
-    const tempPath = filePath + '.compressed.webm';
-    
-    try {
-        const result = await compressVideo(filePath, tempPath, options);
-        
-        // Replace original with compressed version
-        fs.removeSync(filePath);
-        fs.renameSync(tempPath, filePath);
-        
-        console.log(`✅ Original file replaced with compressed version`);
-        
-        return {
-            ...result,
-            outputPath: filePath
-        };
-    } catch (error) {
-        // Clean up temp file if it exists
-        if (fs.existsSync(tempPath)) {
-            fs.removeSync(tempPath);
-        }
-        throw error;
+  const codec = options.codec || 'libx264';
+  const extension = (codec === 'libx264' || codec === 'libx265') ? '.mp4' : '.webm';
+  const tempPath = filePath + '.compressed' + extension;
+
+  try {
+    const result = await compressVideo(filePath, tempPath, {
+      targetHeight: options.targetHeight ?? 720, // default: 720p downscale
+      ...options
+    });
+
+    const pathObj = path.parse(filePath);
+    const finalPath = path.join(pathObj.dir, pathObj.name + extension);
+
+    // Remove original file
+    fs.removeSync(filePath);
+    // Rename compressed temp to final path
+    fs.renameSync(tempPath, finalPath);
+
+    console.log('✅ Original file replaced with compressed version');
+
+    return {
+      ...result,
+      outputPath: finalPath
+    };
+  } catch (error) {
+    if (fs.existsSync(tempPath)) {
+      fs.removeSync(tempPath);
     }
+    try { sendWebhook('error.occurred', { code: 'video_compression_error', message: 'compressVideoInPlace failed', details: { filePath, error: error && error.message ? error.message : String(error) } }); } catch (e) {}
+    throw error;
+  }
 }
 
 /**
- * Get video file information
- * @param {string} filePath - Path to video file
- * @returns {Promise<Object>} Video information
+ * Get video file information (duration, bitrate, codecs, resolution)
+ *
+ * @param {string} filePath
+ * @returns {Promise<Object>}
  */
 async function getVideoInfo(filePath) {
-    return new Promise((resolve, reject) => {
-        const args = [
-            '-i', filePath,
-            '-hide_banner'
-        ];
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-i', filePath,
+      '-hide_banner'
+    ];
 
-        const ffprobe = spawn(ffmpegPath, args);
-        let stderr = '';
+    const ffprobe = spawn(ffmpegPath, args);
+    let stderr = '';
 
-        ffprobe.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
-
-        ffprobe.on('close', () => {
-            // Parse video info from stderr
-            const durationMatch = stderr.match(/Duration: (\d+):(\d+):(\d+\.\d+)/);
-            const bitrateMatch = stderr.match(/bitrate: (\d+) kb\/s/);
-            const videoMatch = stderr.match(/Video: ([^,]+), ([^,]+), (\d+x\d+)/);
-            const audioMatch = stderr.match(/Audio: ([^,]+), (\d+) Hz/);
-
-            const info = {
-                duration: null,
-                bitrate: null,
-                videoCodec: null,
-                resolution: null,
-                audioCodec: null,
-                sampleRate: null
-            };
-
-            if (durationMatch) {
-                const hours = parseInt(durationMatch[1]);
-                const minutes = parseInt(durationMatch[2]);
-                const seconds = parseFloat(durationMatch[3]);
-                info.duration = hours * 3600 + minutes * 60 + seconds;
-            }
-
-            if (bitrateMatch) {
-                info.bitrate = parseInt(bitrateMatch[1]);
-            }
-
-            if (videoMatch) {
-                info.videoCodec = videoMatch[1].trim();
-                info.resolution = videoMatch[3];
-            }
-
-            if (audioMatch) {
-                info.audioCodec = audioMatch[1].trim();
-                info.sampleRate = parseInt(audioMatch[2]);
-            }
-
-            resolve(info);
-        });
-
-        ffprobe.on('error', (error) => {
-            reject(error);
-        });
+    ffprobe.stderr.on('data', (data) => {
+      stderr += data.toString();
     });
+
+    ffprobe.on('close', () => {
+      const durationMatch = stderr.match(/Duration: (\d+):(\d+):(\d+\.\d+)/);
+      const bitrateMatch = stderr.match(/bitrate: (\d+) kb\/s/);
+      const videoMatch = stderr.match(/Video: ([^,]+), ([^,]+), (\d+x\d+)/);
+      const audioMatch = stderr.match(/Audio: ([^,]+), (\d+) Hz/);
+
+      const info = {
+        duration: null,
+        bitrate: null,
+        videoCodec: null,
+        resolution: null,
+        audioCodec: null,
+        sampleRate: null
+      };
+
+      if (durationMatch) {
+        const hours = parseInt(durationMatch[1], 10);
+        const minutes = parseInt(durationMatch[2], 10);
+        const seconds = parseFloat(durationMatch[3]);
+        info.duration = hours * 3600 + minutes * 60 + seconds;
+      }
+
+      if (bitrateMatch) {
+        info.bitrate = parseInt(bitrateMatch[1], 10);
+      }
+
+      if (videoMatch) {
+        info.videoCodec = videoMatch[1].trim();
+        info.resolution = videoMatch[3]; // e.g. "1920x1080"
+      }
+
+      if (audioMatch) {
+        info.audioCodec = audioMatch[1].trim();
+        info.sampleRate = parseInt(audioMatch[2], 10);
+      }
+
+      resolve(info);
+    });
+
+    ffprobe.on('error', (error) => {
+      reject(error);
+    });
+  });
 }
 
 /**
- * Get compression recommendations based on file size and duration
- * @param {string} filePath - Path to video file
- * @returns {Promise<Object>} Recommended settings
+ * Get compression recommendations based on size & duration
+ * (for meetings / screen recordings)
+ *
+ * @param {string} filePath
+ * @returns {Promise<{shouldCompress:boolean, reason:string, settings:Object}>}
  */
 async function getCompressionRecommendations(filePath) {
-    const stats = fs.statSync(filePath);
-    const sizeMB = stats.size / 1024 / 1024;
-    
-    let recommendations = {
-        shouldCompress: false,
-        reason: '',
-        settings: {}
+  const stats = fs.statSync(filePath);
+  const sizeMB = stats.size / 1024 / 1024;
+
+  const recommendations = {
+    shouldCompress: false,
+    reason: '',
+    settings: {}
+  };
+
+  try {
+    const info = await getVideoInfo(filePath);
+    const durationSeconds = info.duration || 0;
+    const durationMinutes = durationSeconds / 60;
+
+    // Skip tiny videos
+    if (sizeMB < 5 && durationSeconds < 15) {
+      recommendations.shouldCompress = false;
+      recommendations.reason =
+        `Very small/short video (${sizeMB.toFixed(1)} MB, ${durationSeconds.toFixed(1)}s) - skipping compression`;
+      return recommendations;
+    }
+
+    recommendations.shouldCompress = true;
+
+    // Base streaming-friendly defaults
+    let settings = {
+      videoBitrate: null,     // pure CRF
+      maxrate: '900k',        // ~0.9 Mbps peaks (good for most networks)
+      bufsize: '1800k',
+      crf: 30,
+      preset: 'veryfast',
+      audioBitrate: '64k',
+      codec: 'libx264',
+      targetHeight: 720       // downscale to 720p
     };
 
-    try {
-        const info = await getVideoInfo(filePath);
-        const durationMinutes = info.duration ? (info.duration / 60) : 0;
-
-        // Use fast compression settings optimized for speed
-        if (sizeMB > 100) {
-            // Large file - fast compression with higher CRF
-            recommendations.shouldCompress = true;
-            recommendations.reason = `Large file size (${sizeMB.toFixed(1)} MB) - fast compression recommended`;
-            recommendations.settings = {
-                videoBitrate: null,  // Use CRF mode
-                crf: 38,             // Higher CRF = much faster encoding
-                preset: 'ultrafast',
-                audioBitrate: '64k',
-                codec: 'libx264'     // H.264 for speed
-            };
-        } else if (sizeMB > 50) {
-            // Medium file - moderate fast compression
-            recommendations.shouldCompress = true;
-            recommendations.reason = `Medium file size (${sizeMB.toFixed(1)} MB) - fast compression recommended`;
-            recommendations.settings = {
-                videoBitrate: null,  // Use CRF mode
-                crf: 35,             // Fast encoding with acceptable quality
-                preset: 'ultrafast',
-                audioBitrate: '64k',
-                codec: 'libx264'     // H.264 for speed
-            };
-        } else if (durationMinutes > 30 && sizeMB > 30) {
-            // Long duration - light compression with CRF
-            recommendations.shouldCompress = true;
-            recommendations.reason = `Long meeting (${durationMinutes.toFixed(1)} min) - fast compression recommended`;
-            recommendations.settings = {
-                videoBitrate: null,  // Use CRF mode
-                crf: 33,             // Fast encoding
-                preset: 'ultrafast',
-                audioBitrate: '64k',
-                codec: 'libx264'     // H.264 for speed
-            };
-        } else if (sizeMB > 20) {
-            // Small but could be optimized
-            recommendations.shouldCompress = true;
-            recommendations.reason = `File size (${sizeMB.toFixed(1)} MB) - fast optimization recommended`;
-            recommendations.settings = {
-                videoBitrate: null,  // Use CRF mode
-                crf: 32,             // Fast encoding
-                preset: 'ultrafast',
-                audioBitrate: '64k',
-                codec: 'libx264'     // H.264 for speed
-            };
-        } else {
-            recommendations.reason = `File size acceptable (${sizeMB.toFixed(1)} MB)`;
-        }
-
-        return recommendations;
-    } catch (error) {
-        console.error('Error getting compression recommendations:', error);
-        return recommendations;
+    if (sizeMB > 200 || durationMinutes > 60) {
+      recommendations.reason =
+        `Large/long recording (${sizeMB.toFixed(1)} MB, ${durationMinutes.toFixed(1)} min) - compressing for web playback`;
+      // Optionally slightly higher CRF to shrink more
+      settings.crf = 31;
+    } else if (sizeMB > 50 || durationMinutes > 30) {
+      recommendations.reason =
+        `Medium/long video (${sizeMB.toFixed(1)} MB, ${durationMinutes.toFixed(1)} min) - compressing with 720p streaming settings`;
+    } else {
+      recommendations.reason =
+        `File size ${sizeMB.toFixed(1)} MB - compressing for smoother browser playback`;
     }
+
+    recommendations.settings = settings;
+    return recommendations;
+  } catch (error) {
+    console.error('Error getting compression recommendations:', error);
+    return recommendations;
+  }
 }
 
 module.exports = {
-    compressVideo,
-    compressVideoInPlace,
-    getVideoInfo,
-    getCompressionRecommendations
+  compressVideo,
+  compressVideoInPlace,
+  getVideoInfo,
+  getCompressionRecommendations
 };
-

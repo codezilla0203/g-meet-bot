@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Background: CXFlow blue -->
+  <rect x="0" y="0" width="64" height="64" rx="16" ry="16" fill="#1E6FFF" />
+  
+  <!-- Chat bubble -->
+  <path
+    d="M18 18
+       h28
+       a6 6 0 0 1 6 6
+       v16
+       a6 6 0 0 1-6 6
+       h-14
+       l-6 6
+       -2-6
+       h-6
+       a6 6 0 0 1-6-6
+       v-16
+       a6 6 0 0 1 6-6
+       z"
+    fill="white"
+    opacity="0.95"
+  />
+  
+  <!-- CX text inside bubble -->
+  <text
+    x="32"
+    y="32"
+    text-anchor="middle"
+    dominant-baseline="middle"
+    fill="#1E6FFF"
+    font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+    font-weight="700"
+    font-size="18"
+  >
+    CX
+  </text>
+</svg>
+
+
+
+

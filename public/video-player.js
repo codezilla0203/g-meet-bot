@@ -72,17 +72,30 @@ class ProfessionalVideoPlayer {
           done();
         };
 
+        // Resolve fast when the browser begins seeking so the UI can update immediately.
+        // Some browsers take time to fully 'seeked' (buffering). Listening for 'seeking'
+        // gives a snappier UX while we still hide loading when 'seeked' fires.
+        const onSeeking = () => {
+          // Call done quickly but allow 'seeked' later to run its path (done is idempotent)
+          done();
+        };
+
         const timer = setTimeout(() => {
           // If seeked never fires, we still resolve and avoid hanging
           done();
         }, 2000);
 
         const doSeek = () => {
+          // Attach both 'seeking' and 'seeked' handlers for fast UI response and cleanup
           this.video.addEventListener('seeked', onSeeked, { once: true });
+          this.video.addEventListener('seeking', onSeeking, { once: true });
           try {
+            // Assign immediately — this triggers 'seeking' quickly on most browsers
             this.video.currentTime = safeTime;
           } catch (err) {
-            this.video.removeEventListener('seeked', onSeeked);
+            // Cleanup listeners on error
+            try { this.video.removeEventListener('seeked', onSeeked); } catch {}
+            try { this.video.removeEventListener('seeking', onSeeking); } catch {}
             clearTimeout(timer);
             this._hideLoading();
             reject(err);
@@ -703,20 +716,37 @@ class ProfessionalVideoPlayer {
   
     _seekFromProgress(previewOnly = false) {
       if (!this.video || !this.progressEl) return;
-      const ratio = this.progressEl.value / 1000;
+      // Parse progress value safely and guard against non-finite values
+      const rawValue = parseFloat(this.progressEl.value);
+      const ratio = Number.isFinite(rawValue) ? rawValue / 1000 : NaN;
       const duration = this.duration || this.video.duration || 0;
-      if (!duration) return;
-  
+
+      // If duration is not available or not finite, abort
+      if (!Number.isFinite(duration) || duration <= 0) return;
+
       const time = ratio * duration;
-  
+
+      // If calculated time is not a finite number, don't set currentTime
+      if (!Number.isFinite(time)) return;
+
+      const clamped = Math.min(Math.max(time, 0), duration);
+
       if (previewOnly) {
         // Update time label, but don't force play/pause
-        this.currentTimeEl.textContent = this._formatTime(time);
-        // For immediate visual sync, you *can* update video.currentTime during drag:
-        this.video.currentTime = time;
+        this.currentTimeEl.textContent = this._formatTime(clamped);
+        // For immediate visual sync, update video.currentTime during drag only if finite
+        try {
+          this.video.currentTime = clamped;
+        } catch (err) {
+          // ignore invalid assignment
+        }
       } else {
-        this.video.currentTime = time;
-        this.currentTimeEl.textContent = this._formatTime(time);
+        try {
+          this.video.currentTime = clamped;
+        } catch (err) {
+          // ignore invalid assignment
+        }
+        this.currentTimeEl.textContent = this._formatTime(clamped);
       }
     }
   

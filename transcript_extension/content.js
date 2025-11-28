@@ -8,7 +8,6 @@ try {
   localStorage.removeItem('userName');
   localStorage.removeItem('chatMessages');
   localStorage.removeItem('meetingStartTimeStamp');
-  localStorage.removeItem('meetingTitle');
   localStorage.removeItem('operationMode'); // Clear operation mode
   console.log("✅ Previous state cleared successfully");
 } catch (e) {
@@ -38,7 +37,6 @@ console.log(`📅 Extension using timezone: ${timezone}, locale: ${locale}`);
 
 let meetingStartTimeStamp = new Date().toISOString().toUpperCase();
 let meetingStartTimeFormatted = new Date().toLocaleString(locale, { timeZone: timezone });
-let meetingTitle = document.title;
 let isTranscriptDomErrorCaptured = false;
 let isChatMessagesDomErrorCaptured = false;
 let hasMeetingStarted = false;
@@ -48,7 +46,7 @@ let hasMeetingEnded = false;
 let transcriptObserver = null;
 
 // Save initial clean state
-overWriteChromeStorage(["userName", "chatMessages", "meetingStartTimeStamp", "meetingTitle"], false);
+overWriteChromeStorage(["userName", "chatMessages", "meetingStartTimeStamp"], false);
 
 const checkElement = async (selector, text) => {
   if (text) {
@@ -228,8 +226,6 @@ async function meetingRoutines(uiType) {
   });
 
   try {
-    setTimeout(() => updateMeetingTitle(), 5000);
-
     // Wait a bit for UI to fully settle after admission
     await new Promise(resolve => setTimeout(resolve, 2000));
 
@@ -333,6 +329,58 @@ async function meetingRoutines(uiType) {
 
     // Start transcript observer (global, per-utterance timing)
     startTranscriptObserver();
+
+    // Start host detection observer: publish meeting host to localStorage
+    // This avoids needing the bot to open the People panel.
+    (function startHostObserver() {
+      const findHostAndPublish = () => {
+        try {
+          // Find any element that contains "Meeting host" (but not "Waiting for the host")
+          const indicators = Array.from(document.querySelectorAll('*')).filter(el => {
+            try {
+              const t = (el.textContent || '').trim();
+              return t.includes('Meeting host') && !t.includes('Waiting for the host');
+            } catch { return false; }
+          });
+
+          for (const ind of indicators) {
+            try {
+              // Try to find a containing participant listitem
+              let parent = ind.closest('div[role="listitem"]') || ind.parentElement?.parentElement;
+              if (!parent) continue;
+
+              // Typical name containers observed in Meet
+              const nameSpan = parent.querySelector('.zWGUib') || parent.querySelector('span') || parent.querySelector('div');
+              let name = (nameSpan && nameSpan.textContent) ? nameSpan.textContent.trim() : (parent.getAttribute('aria-label') || '').trim();
+              if (!name) continue;
+              // Clean name
+              name = name.split('(')[0].split(',')[0].trim();
+              if (!name) continue;
+              if (name.toLowerCase() === 'you') continue;
+              localStorage.setItem('meetingHost', name);
+              console.log('[CXFlow Extension] ✅ Published meetingHost to localStorage:', name);
+              return true;
+            } catch (e) { /* continue */ }
+          }
+        } catch (e) {
+          // ignore
+        }
+        return false;
+      };
+
+      // Try once now
+      try { findHostAndPublish(); } catch {}
+
+      // Observe for changes that may reveal the host (people panel opening, participant updates)
+      const hostMo = new MutationObserver(() => {
+        try { findHostAndPublish(); } catch {}
+      });
+      try {
+        hostMo.observe(document.body, { childList: true, subtree: true, attributes: true });
+        // Auto-disconnect after 10 minutes to reduce overhead (host should be discovered quickly)
+        setTimeout(() => hostMo.disconnect(), 10 * 60 * 1000);
+      } catch (e) { /* ignore */ }
+    })();
 
     const chatMessagesButton = contains(".google-symbols", "chat")[0];
     if (chatMessagesButton) {
@@ -488,8 +536,7 @@ function overWriteChromeStorage(keys, sendDownloadMessage) {
     localStorage.setItem('userName', JSON.stringify(userName));
   if (keys.includes("transcript"))
     localStorage.setItem('transcript', JSON.stringify(transcript));
-  if (keys.includes("meetingTitle"))
-    localStorage.setItem('meetingTitle', meetingTitle);
+  // meetingTitle capture removed — do not persist title from the extension
   if (keys.includes("meetingStartTimeStamp"))
     localStorage.setItem('meetingStartTimeStamp', JSON.stringify(meetingStartTimeStamp));
   if (keys.includes("chatMessages"))
@@ -504,24 +551,7 @@ function overWriteChromeStorage(keys, sendDownloadMessage) {
   }
 }
 
-function updateMeetingTitle() {
-  try {
-    // Prefer explicit header element; fall back to document.title
-    const titleElem =
-      document.querySelector('.u6vdEc') || // legacy selector
-      document.querySelector('.PDXcif');   // newer selector observed Nov 2025
-
-    const rawTitle = (titleElem?.textContent || document.title || '').trim();
-    if (!rawTitle) return; // nothing to store
-
-    const invalidFilenameRegex = /[^\w\-_.() ]/g;
-    meetingTitle = rawTitle.replace(invalidFilenameRegex, '_');
-
-    overWriteChromeStorage(['meetingTitle'], false);
-  } catch (error) {
-    console.error('[CXFlow Meeting Bot] updateMeetingTitle error:', error);
-  }
-}
+// meeting title capture removed from extension
 
 // Utility: wait until an element containing specific text is present
 async function waitForContains(selector, text, timeout = 10000, interval = 200) {

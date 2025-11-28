@@ -6,7 +6,8 @@ const { spawn, execSync, spawnSync } = require('child_process');
 const { WebRTCCapture } = require('./modules/webrtc-capture');
 const WebSocket = require('ws');
 const crypto = require('crypto');
-const { getCurrentTimestamp, formatDate, formatDateLong } = require('./utils/timezone');
+const { getCurrentTimestamp, formatDate, formatDateLong, timestampToTimezone } = require('./utils/timezone');
+const { sendWebhook } = require('./utils/webhook');
 // ADD EXTENSION_PATH constant to point to the built-in Chrome extension.
 const EXTENSION_PATH = path.resolve(__dirname, '..', 'transcript_extension');
 
@@ -30,16 +31,15 @@ const GOOGLE_NO_RESPONSE = 'No one responded to your request to join the call';
  * - High-quality recording output
  */
 class Bot {
-    constructor(id, botName = "CXFlow Meeting Bot", onLeaveCallback = null, captionLanguage = "es", emailRecipients = null) {
+    constructor(id, botName = "CXFlow Meeting Bot", onLeaveCallback = null, captionLanguage = "es", emailRecipients = null, recordingType = "audio-video", maxRecordingDuration = null, botLogoUrl = null) {
         this.id = id;
         this.botName = botName;
         this.onLeave = onLeaveCallback;
         this.captionLanguage = captionLanguage;  // Caption language preference (ISO code)
         this.emailRecipients = emailRecipients;  // Email addresses to send summary to
+        this.recordingType = recordingType;  // "audio-video" or "audio-only"
+        this.botLogoUrl = botLogoUrl;  // Bot logo URL for profile picture overlay
         this.meetUrl = null;  // Will be set when joining meeting
-        this.meetingTitle = null;  // Will be set from extension when available
-        
-        // Security ID for browser<->node communication
         this.slightlySecretId = crypto.randomBytes(16).toString('hex');
         
         // Core components
@@ -80,10 +80,13 @@ class Bot {
 
         // Recording (GoogleMeetBot style - MediaRecorder based)
         this.slightlySecretId = crypto.randomBytes(16).toString('hex'); // For secure browser<->node communication
-        this.recordingPath = path.join(this.videoDir, `${this.id}.webm`);
+        // Use appropriate file extension based on recording type
+        const fileExtension = this.recordingType === 'audio-only' ? '.webm' : '.webm'; // WebM supports both audio-only and video
+        this.recordingPath = path.join(this.videoDir, `${this.id}${fileExtension}`);
         this.recordingStartedAt = 0;
         this.recordingChunks = []; // Store recording chunks temporarily
-        this.maxRecordingDuration = parseInt(process.env.MAX_RECORDING_DURATION) || 60; // minutes
+        // Use provided maxRecordingDuration or fall back to environment variable or default
+        this.maxRecordingDuration = maxRecordingDuration || 60; // minutes
         this.inactivityLimit = parseInt(process.env.INACTIVITY_LIMIT) || 10; // minutes
         this.activateInactivityAfter = parseInt(process.env.ACTIVATE_INACTIVITY_AFTER) || 2; // minutes
 
@@ -92,6 +95,7 @@ class Bot {
         this.participants = [];
         this.lastActivity = undefined;
         this.timeAloneStarted = Infinity;
+        this.meetingHost = null; // Store meeting host name
         // Helper list of self-labels to ignore when parsing aria-label names
         this._SELF_VIEW_LABELS = [
             'you',
@@ -99,10 +103,15 @@ class Bot {
             'self view'
         ];
 
+        // Track participant join times and temporary absence counts for left detection
+        this.participantJoinTimes = {}; // name -> timestampMs
+        this.participantAbsenceCounts = {}; // name -> consecutive missing checks
+
         // Meeting metrics tracking
         this.meetingStartTime = null;
         this.meetingEndTime = null;
         this.maxParticipantsSeen = 0; // Track maximum number of participants seen during monitoring
+        // Locking / leader election state (local lock-file only)
         this.keywordsList = [
             // Common meeting keywords - can be customized via environment variable
             'action item', 'follow up', 'deadline', 'decision', 'agreement',
@@ -116,6 +125,36 @@ class Bot {
             } catch (e) {
                 console.warn(`[${this.id}] ⚠️ Failed to parse MEETING_KEYWORDS, using defaults`);
             }
+        }
+    }
+
+    // Webhook sending is delegated to src/utils/webhook.sendWebhook
+
+    /**
+     * Emit a standardized error webhook (event: error.occurred)
+     * Payload: { meeting_id, code, message, timestamp_iso, timestamp_formatted, timezone, details }
+     */
+    async emitError(code, message, details = {}) {
+        try {
+            const meetingId = this.getMeetingIdFromUrl(this.meetUrl) || this.id || null;
+            const ts = getCurrentTimestamp ? getCurrentTimestamp() : { iso: new Date().toISOString(), formatted: new Date().toISOString(), timezone: process.env.TIMEZONE || 'UTC' };
+            const payload = {
+                meeting_id: meetingId,
+                code: code || 'unknown_error',
+                message: message || '',
+                timestamp_iso: ts.iso || new Date().toISOString(),
+                timestamp: ts.formatted || (new Date()).toISOString(),
+                timezone: ts.timezone || process.env.TIMEZONE || 'UTC',
+                details: details || {}
+            };
+
+            // Log locally as well
+            console.error(`[${this.id}] 🔥 Emitting error webhook: ${payload.code} - ${payload.message}`);
+
+            // Best-effort send; do not throw on failure
+            await sendWebhook('error.occurred', payload);
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ emitError failed: ${e && e.message ? e.message : e}`);
         }
     }
 
@@ -136,15 +175,53 @@ class Bot {
             // Run in page context – Node does not have DOM APIs like querySelectorAll/offsetParent
             await this.page.evaluate(() => {
                 try {
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    const gotItButtons = buttons.filter((btn) => {
-                        const el = btn;
-                        return el.offsetParent !== null && (el.innerText || '').includes('Got it');
-                    });
-                    if (gotItButtons.length > 0) {
-                        console.log('[Browser] ✖️ Dismissing modal');
-                        gotItButtons[0].click();
+                    // Robust modal/overlay cleanup: try clicking common buttons first, then remove heavy overlay nodes
+                    const textCandidates = ['got it', 'click allow', 'click to allow', 'allow', 'allow access', 'continue', 'ok', 'ok got it', 'turn on captions', 'enable captions', 'accept'];
+
+                    const clickIfMatches = (el) => {
+                        try {
+                            const txt = (el.innerText || '').toLowerCase().trim();
+                            if (!txt) return false;
+                            for (const cand of textCandidates) {
+                                if (txt.includes(cand)) {
+                                    try { el.click(); } catch { /* fallthrough */ }
+                                    console.log('[Browser] ✖️ Clicked modal button matching:', cand);
+                                    return true;
+                                }
+                            }
+                        } catch {}
+                        return false;
+                    };
+
+                    // 1) Attempt to click visible buttons/anchors with matching text
+                    const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                    for (const e of els) {
+                        if (e.offsetParent === null) continue; // not visible
+                        if (clickIfMatches(e)) return;
                     }
+
+                    // 2) Try to remove obvious overlay/dialog containers
+                    const overlaySelectors = ['[role="dialog"]', '.modal', '.overlay', '.caveat', '.permission', '[data-modal]'];
+                    for (const sel of overlaySelectors) {
+                        const nodes = Array.from(document.querySelectorAll(sel));
+                        for (const n of nodes) {
+                            try {
+                                const cs = window.getComputedStyle(n);
+                                if (cs && (cs.position === 'fixed' || cs.position === 'absolute' || parseInt(cs.zIndex || '0', 10) > 1000)) {
+                                    console.log('[Browser] ✖️ Removing overlay node for selector', sel);
+                                    n.remove();
+                                    return;
+                                }
+                            } catch (e) {}
+                        }
+                    }
+
+                    // 3) Fallback: dispatch Escape key event to dismiss dialogs
+                    try {
+                        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+                        console.log('[Browser] ✖️ Dispatched Escape to dismiss possible dialogs');
+                    } catch (e) {}
+
                 } catch (err) {
                     console.error('[Browser] Modal dismiss evaluate error:', err);
                 }
@@ -236,18 +313,38 @@ class Bot {
      * Orchestrate full join + record flow
      */
     async joinMeet(meetUrl) {
-        await this.launchBrowser();
+        // Launch browser and join flow with guarded error reporting
+        try {
+            await this.launchBrowser();
+        } catch (e) {
+            try { await this.emitError('launch_failure', 'Failed to launch browser', { error: e && e.message ? e.message : String(e) }); } catch {}
+            throw e;
+        }
+
         await this.dismissInitialModals();
-        await this.navigateAndJoin(meetUrl);
-        
+
+        try {
+            await this.navigateAndJoin(meetUrl);
+        } catch (e) {
+            try { await this.emitError('join_failure', 'Failed during navigateAndJoin', { phase: 'navigateAndJoin', error: e && e.message ? e.message : String(e) }); } catch {}
+            // Attempt graceful cleanup
+            try { await this.leaveMeet(); } catch {}
+            return;
+        }
+
         // Perform random mouse movements on the Meet lobby page to simulate human behavior
         await this.performRandomMouseMovements(8);
-        
-        await this.waitForAdmission();
+
+        try {
+            await this.waitForAdmission();
+        } catch (e) {
+            try { await this.emitError('admission_failure', 'Failed during waitForAdmission', { phase: 'waitForAdmission', error: e && e.message ? e.message : String(e) }); } catch {}
+            try { await this.leaveMeet(); } catch {}
+            return;
+        }
 
         // Mark admission in page context so the extension can start captions only
         // after we are actually inside the meeting (not just in the waiting room).
-        
         
         // Quick modal dismissal after admission
         try {
@@ -271,6 +368,12 @@ class Bot {
         // Mute mic/camera BEFORE recording starts
         await this.muteInCall();
 
+        // Retry logo injection after participants join (video tiles should be fully loaded now)
+        if (this.botLogoUrl) {
+            await this.page.waitForTimeout(2000); // Wait for video tiles to stabilize
+            await this.injectBotLogo();
+        }
+
         const others = await this.waitForOtherParticipants(120000);
         if (!others) {
             console.log(`[${this.id}] ⏹️ No other participants joined within timeout; leaving.`);
@@ -279,16 +382,22 @@ class Bot {
         }
         this.hasSeenParticipants = true;
 
-        // Enable and start collecting Google Meet live captions (best-effort, non-fatal on failure)
-        /*
+        // Fire webhook for bot admission if configured
         try {
-            this.page.waitForTimeout(3000);
-            await this.enableCaptions();
-            await this.startCaptionsCollector();
+            const meetingId = this.getMeetingIdFromUrl(this.meetUrl) || null;
+            // Use repo timezone helper so joined_at is in configured Mexico timezone (formatted)
+            const ts = getCurrentTimestamp();
+            const joinedAt = ts.formatted; // e.g. '2025-11-27 10:30:45' in TIMEZONE
+            // Send asynchronously but await to log errors
+            await sendWebhook('meeting.bot_joined', {
+                meeting_id: meetingId,
+                meeting_url: this.meetUrl,
+                joined_at: joinedAt,
+                timezone: ts.timezone
+            });
         } catch (e) {
-            console.warn(`[${this.id}] ⚠️ Could not start captions collector:`, e && e.message ? e.message : e);
+            console.warn(`[${this.id}] ⚠️ Error sending meeting.bot_joined webhook: ${e && e.message ? e.message : e}`);
         }
-        */
 
         try {
             await this.page.evaluate(() => {
@@ -303,309 +412,13 @@ class Bot {
             console.warn(`[${this.id}] ⚠️ Could not set botAdmitted flag:`, e && e.message ? e.message : e);
         }
 
+        this.startModalDismissal();
         await this.startRecording();
         this.startParticipantMonitoring();
 
         // await this.ensureTiledLayout();
     }
 
-    /**
-     * Helper: check if captions region is visible.
-     */
-    async captionsRegionVisible(timeoutMs = 4000) {
-        try {
-            await this.page.waitForSelector('[role="region"][aria-label*="Captions"]', {
-                timeout: timeoutMs,
-                visible: true
-            });
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    /**
-     * Best-effort enabling of Google Meet captions using keyboard shortcut and CC button.
-     * Based on proven Playwright implementation patterns.
-     * Fails silently if not possible; caller should treat errors as non-fatal.
-     */
-    async enableCaptions() {
-        try {
-            console.log(`[${this.id}] 💬 Enabling captions...`);
-            // Attempt clicking captions button via common selectors
-            const sels = [
-                'button[aria-label*="Turn on captions" i]',
-                'button[aria-label*="captions" i]',
-            ];
-            await this.page.waitForTimeout(500);
-            let clicked = false;
-            for (const sel of sels) {
-                const btn = await this.page.$(sel);
-                if (btn) {
-                    try { 
-                        await btn.click({ delay: 20 }); 
-                        clicked = true; 
-                        console.log(`[${this.id}] ✅ Captions toggled by button`);
-                        break; 
-                    } catch {}
-                }
-            }
-            if (!clicked) {
-                // Fallback: Try keyboard shortcut 'Shift+c'
-                try {
-                    await this.page.keyboard.press('KeyC');
-                    clicked = true;
-                } catch {}
-            }
-            if(clicked)console.log(`[${this.id}] ✅ Captions toggled`);
-        } catch (e) {
-            console.warn(`[${this.id}] ⚠️ Could not enable captions: ${e.message}`);
-        }
-    }
-
-
-    /**
-     * Start a MutationObserver in the browser to stream Google Meet caption updates
-     * back into Node via page.exposeFunction.
-     */
-
-    
-    async startCaptionsCollector() {
-        if (!this.page) return;
-        if (this.captionsCollectorStarted) return;
-        this.captionsCollectorStarted = true;
-
-        console.log(`[${this.id}] 📝 Starting captions collector...`);
-
-        // Expose a Node-side handler to receive caption updates from the page
-        await this.page.exposeFunction('screenAppOnCaption', async (speaker, text) => {
-            try {
-                const captionText = (text || '').trim();
-                const speakerName = (speaker || '').trim() || 'Unknown Speaker';
-
-                // Basic filtering: ignore empty/very short captions or obvious UI placeholders
-                if (!captionText || captionText.length < 2) return;
-                const lc = captionText.toLowerCase();
-                if (lc.includes('no captions') || lc.includes('captions off') || lc.includes('captions disabled')) return;
-
-                const timestampMs = Date.now();
-
-                // Ignore captions that appear before recording actually starts to avoid noisy pre/post entries
-                if (!this.recordingStartedAt || this.recordingStartedAt === 0) return;
-
-                const index = this.captionsIndex++;
-                const offsetMs = Math.max(timestampMs - this.recordingStartedAt, 0);
-                const offsetSeconds = Math.round(offsetMs / 1000);
-
-                // Deduplicate simple repeated/partial updates: if last caption has identical speaker and text, skip
-                const last = this.captions.length ? this.captions[this.captions.length - 1] : null;
-                if (last && last.speaker === speakerName && last.text === captionText) return;
-
-                // If last caption is very recent and is a prefix of this caption, replace it (prefer longer text)
-                if (last && last.speaker === speakerName && (timestampMs - last.timestampMs) < 1500) {
-                    if (captionText.startsWith(last.text) && captionText.length > last.text.length) {
-                        // extend last caption
-                        last.text = captionText;
-                        last.timestampMs = timestampMs;
-                        last.offsetSeconds = offsetSeconds;
-                        // update speaker activity too
-                        this.registerSpeakerActivity(speakerName, timestampMs);
-                        return;
-                    }
-                }
-
-                this.captions.push({
-                    index,
-                    speaker: speakerName,
-                    text: captionText,
-                    timestampMs,
-                    offsetSeconds
-                });
-
-                // Reuse the same speaker activity registration used by active-speaker sampling
-                this.registerSpeakerActivity(speakerName, timestampMs);
-            } catch (e) {
-                console.warn(`[${this.id}] ⚠️ Error handling caption event:`, e && e.message ? e.message : e);
-            }
-        });
-
-        // Do not block on caption region—attach observer immediately; log a warning if not found within 5 s
-        (async () => {
-            try {
-                await this.page.waitForSelector('[aria-live]', { timeout: 5000 });
-            } catch {
-                console.warn(`[${this.id}] ⚠️ aria-live region not visible after 5 s; observer will still attempt to attach`);
-            }
-        })().catch(()=>{});
-
-        // Inject the MutationObserver into the page to watch for caption updates (utterance-based)
-        await this.page.evaluate(() => {
-            try {
-                const send = typeof window.screenAppOnCaption === 'function'
-                    ? window.screenAppOnCaption
-                    : null;
-                if (!send) return;
-
-                const badgeSel = '.NWpY1d, .xoMHSc';
-
-                // Per-speaker buffering and replacement tracking
-                const buffers = new Map(); // speaker -> { text, timer, lastTs, utteranceId }
-
-                const endsWithPunctuation = (t) => /[.!?\u2026]\s*$/.test(String(t || ''));
-                const normalizeText = (t) => String(t || '').replace(/\s+/g, ' ').trim();
-                const isSpeakerEcho = (speaker, text) =>
-                    normalizeText(text).toLowerCase() === normalizeText(speaker).toLowerCase();
-
-                const FINAL_IDLE_MS = 2500;   // long pause to finalize if no punctuation
-                const PUNCT_STABLE_MS = 900;  // short stabilization for punctuated sentences
-
-                const sameUtteranceHeuristic = (oldText, newText) => {
-                    const a = normalizeText(oldText);
-                    const b = normalizeText(newText);
-                    if (!a) return true;
-                    if (b.startsWith(a)) return true; // continuation
-                    // small edits/replacements treated as same utterance
-                    return Math.abs(b.length - a.length) <= 20;
-                };
-
-                const scheduleFinalize = (speaker) => {
-                    const st = buffers.get(speaker);
-                    if (!st) return;
-
-                    const text = normalizeText(st.text);
-                    const delay = endsWithPunctuation(text) ? PUNCT_STABLE_MS : FINAL_IDLE_MS;
-
-                    if (st.timer) clearTimeout(st.timer);
-                    st.timer = setTimeout(() => {
-                        const latestState = buffers.get(speaker);
-                        if (!latestState) return;
-                        const latest = normalizeText(latestState.text || '');
-                        if (!latest || isSpeakerEcho(speaker, latest)) return;
-
-                        // Emit a finalized sentence to Node
-                        send(speaker || 'Unknown Speaker', latest);
-
-                        // Start a new utterance id for next turn
-                        buffers.delete(speaker);
-                    }, delay);
-                };
-
-                const handleCaptionUpdate = (speaker, text) => {
-                    if (!speaker) speaker = '';
-                    const cleaned = normalizeText(text);
-                    if (!cleaned || cleaned.length < 2) return;
-                    if (isSpeakerEcho(speaker, cleaned)) return;
-
-                    const now = Date.now();
-                    let st = buffers.get(speaker);
-
-                    if (!st) {
-                        st = { text: '', timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
-                        buffers.set(speaker, st);
-                    }
-
-                    const prevText = st.text || '';
-
-                    // If new text looks like a new turn and previous existed without finalization, finalize previous
-                    if (prevText && !sameUtteranceHeuristic(prevText, cleaned)) {
-                        if (st.timer) clearTimeout(st.timer);
-
-                        const prevFinal = normalizeText(prevText);
-                        if (prevFinal && !isSpeakerEcho(speaker, prevFinal)) {
-                            send(speaker || 'Unknown Speaker', prevFinal);
-                        }
-
-                        // Start new utterance id
-                        st = { text: '', timer: null, lastTs: 0, utteranceId: `${speaker}-${now}` };
-                        buffers.set(speaker, st);
-                    }
-
-                    st.text = cleaned;
-                    st.lastTs = now;
-
-                    scheduleFinalize(speaker);
-                };
-
-                const observeRegion = (captionRegion) => {
-                    let lastKnownSpeaker = 'Unknown Speaker';
-
-                    const handleNode = (node) => {
-                        if (!(node instanceof HTMLElement)) return;
-
-                        const speakerElem = node.querySelector(badgeSel);
-                        let speaker = speakerElem && speakerElem.textContent
-                            ? speakerElem.textContent.trim()
-                            : lastKnownSpeaker;
-
-                        if (speaker && speaker !== 'Unknown Speaker') {
-                            lastKnownSpeaker = speaker;
-                        }
-
-                        // Clone node and remove speaker label to isolate caption text
-                        const clone = node.cloneNode(true);
-                        const badge = clone.querySelector(badgeSel);
-                        if (badge && badge.parentNode) {
-                            badge.parentNode.removeChild(badge);
-                        }
-
-                        const caption = (clone.textContent || '').trim();
-                        if (caption) {
-                            handleCaptionUpdate(speaker, caption);
-                        }
-                    };
-
-                    const observer = new MutationObserver((mutations) => {
-                        for (const mutation of mutations) {
-                            const nodes = Array.from(mutation.addedNodes);
-                            if (nodes.length > 0) {
-                                nodes.forEach((n) => {
-                                    if (n instanceof HTMLElement) handleNode(n);
-                                });
-                            } else if (
-                                mutation.type === 'characterData' &&
-                                mutation.target &&
-                                mutation.target.parentElement instanceof HTMLElement
-                            ) {
-                                handleNode(mutation.target.parentElement);
-                            }
-                        }
-                    });
-
-                    observer.observe(captionRegion, {
-                        childList: true,
-                        subtree: true,
-                        characterData: true,
-                    });
-
-                    window.__captionsObserver = observer;
-                };
-
-                // Try to find caption region repeatedly (UI can mount lazily)
-                const tryStartObserver = () => {
-                    const region =
-                        document.querySelector('[role="region"][aria-label*="Captions"]') ||
-                        document.querySelector('[role="region"][aria-label*="captions" i]') ||
-                        document.querySelector('[aria-live]');
-
-                    if (region) {
-                        observeRegion(region);
-                        return true;
-                    }
-                    return false;
-                };
-
-                if (!tryStartObserver()) {
-                    const interval = setInterval(() => {
-                        if (tryStartObserver()) {
-                            clearInterval(interval);
-                        }
-                    }, 1000);
-                }
-            } catch (e) {
-                console.error('[Browser] Failed to start captions observer:', e);
-            }
-        });
-    }
     /**
      * Launch browser with working configuration
      */
@@ -657,12 +470,17 @@ class Bot {
                 // Load custom transcript extension instead of using caption collector
                 `--disable-extensions-except=${EXTENSION_PATH}`,
                 `--load-extension=${EXTENSION_PATH}`,
+                `--allow-file-access-from-files`,
+                `--disable-features=IsolateOrigins,site-per-process`,
+                `--allow-insecure-localhost`,
+                // `--use-fake-ui-for-media-stream`
             ]
         });
 
         // Handle browser disconnection
         this.browser.on('disconnected', () => {
             console.warn(`[${this.id}] ⚠️ Browser disconnected unexpectedly`);
+            try { this.emitError && this.emitError('browser_disconnected', 'Browser disconnected unexpectedly'); } catch (e) {}
             
             // Immediately stop all intervals to prevent errors
             try {
@@ -694,6 +512,41 @@ class Bot {
         });
 
         this.page = await this.browser.newPage();
+
+        // 👉 NEW: make navigator.permissions.query say "granted" for mic/cam/display
+        try {
+            await this.page.evaluateOnNewDocument(() => {
+                try {
+                    if (!navigator.permissions || !navigator.permissions.query) return;
+
+                    const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+
+                    navigator.permissions.query = (params) => {
+                        try {
+                            const name = params && params.name;
+                            if (
+                                name === 'microphone' ||
+                                name === 'camera' ||
+                                name === 'display-capture' ||
+                                name === 'displayCapture'
+                            ) {
+                                return Promise.resolve({
+                                    state: 'granted',
+                                    onchange: null,
+                                    addEventListener() {},
+                                    removeEventListener() {},
+                                });
+                            }
+                        } catch {}
+                        return originalQuery(params);
+                    };
+                } catch (e) {
+                    console.error('[Browser] permissions monkey patch failed', e);
+                }
+            });
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Could not patch navigator.permissions: ${e.message}`);
+        }
 
         // Mirror browser console logs into Node console for easier debugging of
         // things like audio track availability and MediaRecorder behaviour.
@@ -806,13 +659,41 @@ class Bot {
     async startKeepAlive() {
         try {
             this._cdp = await this.page.target().createCDPSession();
-            try { await this._cdp.send('Emulation.setIdleOverride', { isUserActive: true, isScreenUnlocked: true }); } catch {}
-            try { await this._cdp.send('Page.setWebLifecycleState', { state: 'active' }); } catch {}
-            // Re-assert active state periodically
+
+            // 👉 NEW: tell Chrome that meet.google.com already has media permissions
+            try {
+                await this._cdp.send('Browser.grantPermissions', {
+                    origin: 'https://meet.google.com',
+                    permissions: [
+                        'audioCapture',
+                        'videoCapture',
+                        'displayCapture',  // for getDisplayMedia/tab audio
+                    ],
+                });
+                console.log(`[${this.id}] ✅ Granted media permissions via CDP`);
+            } catch (e) {
+                console.warn(`[${this.id}] ⚠️ grantPermissions failed: ${e.message}`);
+            }
+
+            // existing keep-alive
+            try {
+                await this._cdp.send('Emulation.setIdleOverride', {
+                    isUserActive: true,
+                    isScreenUnlocked: true
+                });
+            } catch {}
+            try {
+                await this._cdp.send('Page.setWebLifecycleState', { state: 'active' });
+            } catch {}
+
             if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
             this.keepAliveInterval = setInterval(async () => {
-                try { await this._cdp.send('Emulation.setIdleOverride', { isUserActive: true, isScreenUnlocked: true }); } catch {}
-                try { await this._cdp.send('Page.setWebLifecycleState', { state: 'active' }); } catch {}
+                try {
+                    await this._cdp.send('Emulation.setIdleOverride', { isUserActive: true, isScreenUnlocked: true });
+                } catch {}
+                try {
+                    await this._cdp.send('Page.setWebLifecycleState', { state: 'active' });
+                } catch {}
             }, 10000);
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ Keep-alive CDP setup failed: ${e.message}`);
@@ -1091,6 +972,11 @@ class Bot {
                     await this.page.waitForTimeout(500);
                     console.log(`[${this.id}] ✅ Admitted to meeting & state reset`);
 
+                    // Inject bot logo overlay if logo URL is provided
+                    // if (this.botLogoUrl) {
+                    //     await this.injectBotLogo();
+                    // }
+
                     // Dismiss any blocking onboarding/self-view modals (e.g. "Others may see your video differently")
                     return;
                 }
@@ -1241,6 +1127,145 @@ class Bot {
     }
 
     /**
+     * Detect other bot-like participants using a combination of heuristics:
+     * - configurable text identifiers (env BOT_IDENTIFIERS)
+     * - configurable image domain tokens (env BOT_IMAGE_DOMAINS)
+     * - look for 'recording'/'rec' indicators inside tile text
+     * Returns { botCount, humanCount, details }
+     */
+    async detectOtherBots() {
+        if (!this.page || (this.page.isClosed && this.page.isClosed())) return { botCount: 0, humanCount: 0, details: [] };
+
+        const envList = process.env.BOT_IDENTIFIERS || '';
+        const envImgList = process.env.BOT_IMAGE_DOMAINS || '';
+        const extras = envList.split(',').map(s => s.trim()).filter(Boolean);
+        const imgExtras = envImgList.split(',').map(s => s.trim()).filter(Boolean);
+
+        // Defaults that catch common recording bots/platforms. Can be extended via env vars.
+        // Add common third-party bot names (Recall, Fireflies, Meetingbase, Notetaker, etc.) and a generic 'ai' token.
+        const identifiers = ['recall', 'fireflies', 'otter', 'meetgeek', 'meetbot', 'meetingbase', 'notetaker', 'record', 'recording', 'bot', ...extras];
+        const imageDomains = ['recall.ai', 'fireflies.ai', 'otter.ai', 'meetgeek.ai', 'meetingbase', 'notetaker', 'tactiq.io', ...imgExtras];
+
+        try {
+            const result = await this.page.evaluate((ids, imgDomains, selfName) => {
+                const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const idRegexes = ids.map(i => new RegExp(esc(i), 'i'));
+                const imgRegexes = imgDomains.map(d => new RegExp(esc(d), 'i'));
+
+                // Conservative selectors: prefer explicit participant containers and data attributes
+                const tileSelectors = ['div[data-participant-id]', 'div[jsname="BOHaEe"]', '[data-self-name]'];
+                const tiles = new Set();
+                for (const sel of tileSelectors) {
+                    try { document.querySelectorAll(sel).forEach(n => tiles.add(n)); } catch {}
+                }
+
+                // UI blacklist tokens (common Meet UI strings that should not be treated as participants)
+                const UI_BLACKLIST = ['reframe', 'backgrounds', 'effects', 'more options', 'meeting language', 'font size', 'font color', 'open caption', 'caption settings', 'english', 'apply', 'cancel', 'settings', 'present now', 'raise hand', 'participants', 'people', 'chat', 'translate', 'leave call'];
+
+                let botCount = 0, humanCount = 0;
+                const details = [];
+
+                for (const tile of Array.from(tiles)) {
+                    try {
+                        // Ignore non-visible tiles
+                        if (tile.offsetParent === null) continue;
+
+                        // Ignore tiles that are clearly part of UI menus/dialogs
+                        let role = '';
+                        try { role = (tile.getAttribute && tile.getAttribute('role')) || ''; } catch {}
+                        if (role && /menu|dialog|presentation|toolbar/i.test(role)) continue;
+
+                        // Require a participant identity signal: data-participant-id OR presence of media (video/img/canvas)
+                        const hasParticipantId = !!(tile.getAttribute && tile.getAttribute('data-participant-id'));
+                        let hasMedia = false;
+                        try {
+                            if (tile.querySelector && tile.querySelector('video, img, canvas')) hasMedia = true;
+                        } catch {}
+                        if (!hasParticipantId && !hasMedia) {
+                            // Skip generic UI tiles that lack media or participant id
+                            continue;
+                        }
+
+                        // Extract a sensible label/name from the tile
+                        let label = '';
+                        try { label = (tile.getAttribute && (tile.getAttribute('aria-label') || tile.getAttribute('data-self-name'))) || tile.innerText || ''; } catch {}
+                        label = String(label || '').trim();
+                        // If label is suspiciously long or contains many UI lines, skip it
+                        const lineCount = (label.match(/\n/g) || []).length + 1;
+                        if (lineCount > 4 || label.length > 240) continue;
+
+                        // Normalize name
+                        let name = label.split(/is speaking|is presenting|\(|,|–|-/i)[0].trim();
+                        if (!name) name = label;
+
+                        // Skip self
+                        if (selfName && name.toLowerCase() === String(selfName).toLowerCase()) continue;
+
+                        // Skip tiles where label matches UI blacklist tokens
+                        const lower = (label || '').toLowerCase();
+                        const isUiLabel = UI_BLACKLIST.some(tok => lower.includes(tok));
+                        if (isUiLabel) continue;
+
+                        // Inspect images inside tile for known bot image domains
+                        let imgMatches = false;
+                        try {
+                            const imgs = Array.from(tile.querySelectorAll('img'));
+                            for (const im of imgs) {
+                                try {
+                                    const src = im.src || im.getAttribute('src') || '';
+                                    if (!src) continue;
+                                    // Skip data URLs that are usually avatars or icons
+                                    if (src.startsWith('data:')) continue;
+                                    if (imgRegexes.some(rx => rx.test(src))) { imgMatches = true; break; }
+                                } catch {}
+                            }
+                        } catch {}
+
+                        const recordingIndicator = /\b(recording|rec|auto[- ]?record|transcript|ai)\b/i.test(lower);
+                        const idMatch = idRegexes.some(r => r.test(name) || r.test(label));
+
+                        const isBot = imgMatches || idMatch || recordingIndicator;
+                        if (isBot) {
+                            botCount++;
+                            details.push({ name: name || '(unknown)', label: label || '(no-label)', reason: imgMatches ? 'img' : (recordingIndicator ? 'recording-indicator' : 'text-match') });
+                        } else {
+                            humanCount++;
+                            details.push({ name: name || '(unknown)', label: label || '(no-label)', reason: 'text-suspect-human' });
+                        }
+                    } catch (e) {
+                        // ignore per-tile errors
+                    }
+                }
+
+                return { botCount, humanCount, details };
+            }, identifiers, imageDomains, this.botName || '');
+
+            return result;
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ detectOtherBots failed: ${e && e.message ? e.message : e}`);
+            return { botCount: 0, humanCount: 0, details: [] };
+        }
+    }
+
+    /**
+     * Extract meeting id from a Google Meet URL.
+     */
+    getMeetingIdFromUrl(url) {
+        if (!url) return null;
+        try {
+            const u = new URL(url);
+            // Path may be like /abc-defg-hij or /_/some/path
+            const parts = u.pathname.split('/').filter(Boolean);
+            // Google Meet IDs commonly look like xxxx-xxxx-xxx or a UUID-like token
+            for (const p of parts) {
+                if (/^[a-z0-9-]{6,}$/i.test(p)) return p;
+                // fallback: return first non-empty path segment
+                return p;
+            }
+        } catch (e) {}
+        return null;
+    }
+    /**
      * Configure Google Meet layout at start of meeting.
      * 
      * Current behaviour:
@@ -1379,6 +1404,9 @@ class Bot {
                 } catch (error) {
                     console.error(`[${this.id}] ❌ Chunk write failed (attempt ${attempt}/${retries}):`, error.message);
                     if (attempt === retries) {
+                        try {
+                            await this.emitError('file_write_error', 'Failed to write recording chunk after retries', { path: this.recordingPath, attempt, error: error && error.message ? error.message : String(error) });
+                        } catch (err) {}
                         throw error;
                     }
                     // Wait before retry
@@ -1401,6 +1429,9 @@ class Bot {
                 // Log additional context for debugging
                 console.error(`[${this.id}] 🔍 Chunk data length: ${data ? data.length : 'null'}`);
                 console.error(`[${this.id}] 🔍 Buffer creation failed:`, error.stack);
+                try {
+                    await this.emitError('file_write_error', 'Error saving recording chunk', { path: this.recordingPath, error: error && error.message ? error.message : String(error) });
+                } catch (err) {}
             }
         });
 
@@ -1412,12 +1443,13 @@ class Bot {
                 this.leaveMeet();
             } catch (error) {
                 console.error(`[${this.id}] ❌ Error processing meeting end:`, error.message);
+                try { this.emitError && this.emitError('recording_error', 'Error processing meeting end', { error: error && error.message ? error.message : String(error) }); } catch (e) {}
             }
         });
 
         // Inject recording code into browser context
         await this.page.evaluate(
-            async ({ botId, duration, inactivityLimit, slightlySecretId, activateInactivityAfterMinutes }) => {
+            async ({ botId, duration, inactivityLimit, slightlySecretId, activateInactivityAfterMinutes, recordingType }) => {
                 const durationMs = duration * 60 * 1000;
                 const inactivityLimitMs = inactivityLimit * 60 * 1000;
                 
@@ -1445,7 +1477,9 @@ class Bot {
                 };
 
                 async function startRecording() {
+                    const isAudioOnly = recordingType === 'audio-only';
                     console.log(`[Browser] Starting MediaRecorder capture at ${new Date().toISOString()}`);
+                    console.log(`[Browser] Recording type: ${recordingType} (${isAudioOnly ? 'Audio Only' : 'Audio + Video'})`);
                     console.log(`[Browser] Inactivity detection activates after ${activateInactivityAfterMinutes} minutes`);
 
                     // Check for mediaDevices API
@@ -1454,7 +1488,11 @@ class Bot {
                         return;
                     }
 
-                    const stream = await navigator.mediaDevices.getDisplayMedia({
+                    // Configure getDisplayMedia based on recording type
+                    // Note: getDisplayMedia requires video to be requested, even for audio-only recording
+                    // We'll request video and then remove video tracks if audio-only
+                    const getDisplayMediaOptions = {
+                        // Always request video (required by getDisplayMedia API)
                         video: true,
                         // Request tab/system audio as aggressively as Chrome allows.
                         // On modern Chrome this hints that we want the tab's own audio
@@ -1470,33 +1508,68 @@ class Bot {
                             systemAudio: 'include'
                         },
                         preferCurrentTab: true,
-                    });
+                    };
+
+                    const stream = await navigator.mediaDevices.getDisplayMedia(getDisplayMediaOptions);
+
+                    // For audio-only, remove video tracks from the stream
+                    if (isAudioOnly) {
+                        const videoTracks = stream.getVideoTracks();
+                        videoTracks.forEach(track => {
+                            track.stop();
+                            stream.removeTrack(track);
+                        });
+                        console.log('[Browser] Removed video tracks for audio-only recording');
+                    }
 
                     // Store stream in global for cleanup
                     window.__recordingStream = stream;
 
-                    // Determine codec and compression settings
-                    // Optimized for smaller files with good quality (VP9 is efficient)
-                    // Reduced from 2.5 Mbps to 1.8 Mbps - VP9 maintains quality at lower bitrates
-                    const videoBitsPerSecond = 1800000; // 1.8 Mbps (optimized for size/quality balance)
-                    const audioBitsPerSecond = 96000;    // 96 kbps (sufficient for voice)
+                    // Determine codec and compression settings based on recording type
+                    let options = {};
                     
-                    let options = {
-                        videoBitsPerSecond,
-                        audioBitsPerSecond
-                    };
-                    
-                    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
-                        console.log('[Browser] Using VP9 codec with compression');
-                        options.mimeType = 'video/webm;codecs=vp9';
-                    } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
-                        console.log('[Browser] Using VP8 codec with compression (fallback)');
-                        options.mimeType = 'video/webm;codecs=vp8';
+                    if (isAudioOnly) {
+                        // Audio-only recording settings
+                        const audioBitsPerSecond = 96000; // 96 kbps (sufficient for voice)
+                        options.audioBitsPerSecond = audioBitsPerSecond;
+                        
+                        // Use audio-only codec
+                        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                            console.log('[Browser] Using Opus codec for audio-only recording');
+                            options.mimeType = 'audio/webm;codecs=opus';
+                        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+                            console.log('[Browser] Using WebM audio codec (fallback)');
+                            options.mimeType = 'audio/webm';
+                        } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+                            console.log('[Browser] Using OGG Opus codec (fallback)');
+                            options.mimeType = 'audio/ogg;codecs=opus';
+                        } else {
+                            console.warn('[Browser] Using default audio codec');
+                        }
+                        
+                        console.log('[Browser] Audio bitrate: ' + (audioBitsPerSecond / 1000).toFixed(0) + ' kbps');
                     } else {
-                        console.warn('[Browser] Using default codec with compression');
+                        // Audio + Video recording settings
+                        // Optimized for smaller files with good quality (VP9 is efficient)
+                        // Reduced from 2.5 Mbps to 1.8 Mbps - VP9 maintains quality at lower bitrates
+                        const videoBitsPerSecond = 900000; ; // 0.9 Mbps (optimized for size/quality balance)
+                        const audioBitsPerSecond = 64000;    // 64 kbps (sufficient for voice)
+                        
+                        options.videoBitsPerSecond = videoBitsPerSecond;
+                        options.audioBitsPerSecond = audioBitsPerSecond;
+                        
+                        if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+                            console.log('[Browser] Using VP9 codec with compression');
+                            options.mimeType = 'video/webm;codecs=vp9';
+                        } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+                            console.log('[Browser] Using VP8 codec with compression (fallback)');
+                            options.mimeType = 'video/webm;codecs=vp8';
+                        } else {
+                            console.warn('[Browser] Using default codec with compression');
+                        }
+                        
+                        console.log('[Browser] Video bitrate: ' + (videoBitsPerSecond / 1000000).toFixed(2) + ' Mbps, Audio: ' + (audioBitsPerSecond / 1000).toFixed(0) + ' kbps');
                     }
-                    
-                    console.log('[Browser] Video bitrate: ' + (videoBitsPerSecond / 1000000).toFixed(2) + ' Mbps, Audio: ' + (audioBitsPerSecond / 1000).toFixed(0) + ' kbps');
 
                     const mediaRecorder = new MediaRecorder(stream, options);
                     
@@ -1609,18 +1682,56 @@ class Bot {
                     // Modal dismissal (optimized frequency)
                     modalDismissInterval = setInterval(() => {
                         try {
-                            const buttons = document.querySelectorAll('button');
-                            const gotItButtons = Array.from(buttons).filter(
-                                btn => btn.offsetParent !== null && btn.innerText?.includes('Got it')
-                            );
-                            if (gotItButtons.length > 0) {
-                                console.log('[Browser] ✖️ Dismissing modal');
-                                gotItButtons[0].click();
+                            // Look for a wider set of blocking UI elements or buttons
+                            const textCandidates = ['got it', 'click allow', 'click to allow', 'allow', 'allow access', 'continue', 'ok', 'turn on captions', 'enable captions', 'accept'];
+
+                            const clickIfMatches = (el) => {
+                                try {
+                                    const txt = (el.innerText || '').toLowerCase().trim();
+                                    if (!txt) return false;
+                                    for (const cand of textCandidates) {
+                                        if (txt.includes(cand)) {
+                                            try { el.click(); } catch {}
+                                            console.log('[Browser] ✖️ Clicked modal button matching:', cand);
+                                            return true;
+                                        }
+                                    }
+                                } catch {}
+                                return false;
+                            };
+
+                            const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                            for (const e of els) {
+                                if (e.offsetParent === null) continue;
+                                if (clickIfMatches(e)) return;
                             }
+
+                            // Remove obvious overlay containers if present
+                            const overlaySelectors = ['[role="dialog"]', '.modal', '.overlay', '.caveat', '.permission', '[data-modal]'];
+                            for (const sel of overlaySelectors) {
+                                const nodes = Array.from(document.querySelectorAll(sel));
+                                for (const n of nodes) {
+                                    try {
+                                        const cs = window.getComputedStyle(n);
+                                        if (cs && (cs.position === 'fixed' || cs.position === 'absolute' || parseInt(cs.zIndex || '0', 10) > 1000)) {
+                                            console.log('[Browser] ✖️ Removing overlay node for selector', sel);
+                                            n.remove();
+                                            return;
+                                        }
+                                    } catch (e) {}
+                                }
+                            }
+
+                            // Fallback: dispatch Escape to try to close dialogs
+                            try {
+                                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+                                console.log('[Browser] ✖️ Dispatched Escape to dismiss possible dialogs');
+                            } catch (e) {}
+
                         } catch (error) {
                             console.error('[Browser] Modal dismiss error:', error);
                         }
-                    }, 3000);
+                    }, 2000);
                     
                     // Store in window global for cleanup
                     window.__modalDismissInterval = modalDismissInterval;
@@ -1675,6 +1786,7 @@ class Bot {
                 inactivityLimit: this.inactivityLimit,
                 slightlySecretId: this.slightlySecretId,
                 activateInactivityAfterMinutes: this.activateInactivityAfter,
+                recordingType: this.recordingType || 'audio-video'
             }
         );
 
@@ -1716,6 +1828,212 @@ class Bot {
     }
 
     /**
+     * Inject bot logo overlay on the bot's video tile in Google Meet
+     */
+    async injectBotLogo() {
+        if (!this.botLogoUrl || !this.page) {
+            return;
+        }
+
+        try {
+            console.log(`[${this.id}] 🖼️ Injecting bot logo: ${this.botLogoUrl}`);
+
+            await this.page.evaluate((logoUrl, botName) => {
+                try {
+                    // Remove any existing logo overlay
+                    const existingOverlay = document.getElementById('cxflow-bot-logo-overlay');
+                    if (existingOverlay) {
+                        existingOverlay.remove();
+                    }
+
+                    // Create logo overlay styles
+                    const style = document.createElement('style');
+                    style.id = 'cxflow-bot-logo-styles';
+                    style.textContent = `
+                        #cxflow-bot-logo-overlay {
+                            position: absolute;
+                            top: 8px;
+                            left: 8px;
+                            width: 48px;
+                            height: 48px;
+                            border-radius: 50%;
+                            border: 2px solid rgba(255, 255, 255, 0.9);
+                            background: white;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            z-index: 10000;
+                            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+                            overflow: hidden;
+                            pointer-events: none;
+                        }
+                        #cxflow-bot-logo-overlay img {
+                            width: 100%;
+                            height: 100%;
+                            object-fit: cover;
+                        }
+                    `;
+                    if (!document.getElementById('cxflow-bot-logo-styles')) {
+                        document.head.appendChild(style);
+                    }
+
+                    // Function to find and attach logo to bot's video tile
+                    const attachLogoToBotTile = () => {
+                        // Try multiple selectors to find the bot's self-view tile
+                        const selectors = [
+                            '[data-self-name]',
+                            '[aria-label*="you" i]',
+                            '[aria-label*="your video" i]',
+                            '[aria-label*="self view" i]',
+                            'div[jsname="BOHaEe"]', // Common Meet tile container
+                            'div[data-participant-id]'
+                        ];
+
+                        let botTile = null;
+                        for (const selector of selectors) {
+                            const tiles = Array.from(document.querySelectorAll(selector));
+                            // Find the tile that contains video or is the self-view
+                            botTile = tiles.find(tile => {
+                                const hasVideo = tile.querySelector('video') || 
+                                                tile.querySelector('[jsname="BOHaEe"]') ||
+                                                tile.getAttribute('aria-label')?.toLowerCase().includes('you') ||
+                                                tile.getAttribute('aria-label')?.toLowerCase().includes('your');
+                                return hasVideo && tile.offsetParent !== null;
+                            });
+                            if (botTile) break;
+                        }
+
+                        // Fallback: find any video tile that might be the bot's
+                        if (!botTile) {
+                            const allTiles = Array.from(document.querySelectorAll('div[jsname="BOHaEe"], div[data-participant-id]'));
+                            botTile = allTiles.find(tile => {
+                                const video = tile.querySelector('video');
+                                return video && tile.offsetParent !== null;
+                            });
+                        }
+
+                        if (botTile) {
+                            // Ensure the tile has position: relative for absolute positioning
+                            const computedStyle = window.getComputedStyle(botTile);
+                            if (computedStyle.position === 'static') {
+                                botTile.style.position = 'relative';
+                            }
+
+                            // Create overlay element
+                            const overlay = document.createElement('div');
+                            overlay.id = 'cxflow-bot-logo-overlay';
+                            overlay.style.position = 'absolute';
+                            overlay.style.borderRadius = '50%';
+                            overlay.style.overflow = 'hidden';
+                            overlay.style.pointerEvents = 'none';
+                            overlay.style.display = 'flex';
+                            overlay.style.alignItems = 'center';
+                            overlay.style.justifyContent = 'center';
+                            overlay.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
+                            overlay.style.border = '2px solid rgba(255,255,255,0.9)';
+                            overlay.style.background = 'white';
+                            overlay.style.zIndex = '10000';
+
+                            const img = document.createElement('img');
+                            img.src = logoUrl;
+                            img.alt = botName || 'Bot Logo';
+                            img.style.width = '100%';
+                            img.style.height = '100%';
+                            img.style.objectFit = 'cover';
+                            img.onerror = () => {
+                                console.warn('[CXFlow] Failed to load bot logo image');
+                                overlay.style.display = 'none';
+                            };
+                            overlay.appendChild(img);
+
+                            // Heuristic: try to find avatar (circular initial) inside the tile
+                            const findAvatar = (tile) => {
+                                try {
+                                    // common candidates
+                                    const sel = ['img', 'svg', '[role="img"]', 'div'];
+                                    for (const s of sel) {
+                                        const nodes = Array.from(tile.querySelectorAll(s));
+                                        for (const n of nodes) {
+                                            try {
+                                                if (n.offsetParent === null) continue;
+                                                const r = n.getBoundingClientRect();
+                                                if (r.width < 6 || r.height < 6) continue;
+                                                // roughly square
+                                                const ratio = Math.max(r.width / r.height, r.height / r.width);
+                                                if (ratio > 1.6) continue;
+                                                const txt = (n.innerText || '').trim();
+                                                if ((txt.length > 0 && txt.length <= 3 && /^[A-Za-z]{1,3}$/.test(txt)) || n.tagName.toLowerCase() === 'img' || n.tagName.toLowerCase() === 'svg') {
+                                                    return n;
+                                                }
+                                                const cs = window.getComputedStyle(n);
+                                                if (cs && cs.borderRadius && cs.borderRadius.indexOf('%') !== -1 && parseFloat(cs.borderRadius) >= 30) return n;
+                                            } catch {}
+                                        }
+                                    }
+                                } catch {}
+                                return null;
+                            };
+
+                            const avatar = findAvatar(botTile);
+                            // Default overlay size
+                            let size = 48;
+                            let left = 8;
+                            let top = 8;
+
+                            if (avatar) {
+                                try {
+                                    const tileRect = botTile.getBoundingClientRect();
+                                    const aRect = avatar.getBoundingClientRect();
+                                    const relLeft = aRect.left - tileRect.left;
+                                    const relTop = aRect.top - tileRect.top;
+                                    size = Math.min(64, Math.max(24, Math.min(aRect.width, aRect.height)));
+                                    left = Math.max(0, relLeft + (aRect.width - size) / 2);
+                                    top = Math.max(0, relTop + (aRect.height - size) / 2);
+                                } catch (e) {
+                                    // fallback to defaults
+                                }
+                            }
+
+                            overlay.style.width = `${size}px`;
+                            overlay.style.height = `${size}px`;
+                            overlay.style.left = `${left}px`;
+                            overlay.style.top = `${top}px`;
+
+                            botTile.appendChild(overlay);
+                            return true;
+                        }
+                        return false;
+                    };
+
+                    // Try to attach immediately
+                    if (!attachLogoToBotTile()) {
+                        // If not found, wait for video tiles to appear and retry
+                        const observer = new MutationObserver(() => {
+                            if (attachLogoToBotTile()) {
+                                observer.disconnect();
+                            }
+                        });
+
+                        observer.observe(document.body, {
+                            childList: true,
+                            subtree: true
+                        });
+
+                        // Stop observing after 10 seconds
+                        setTimeout(() => observer.disconnect(), 10000);
+                    }
+                } catch (error) {
+                    console.warn('[CXFlow] Error injecting bot logo:', error);
+                }
+            }, this.botLogoUrl, this.botName || 'Bot');
+
+            console.log(`[${this.id}] ✅ Bot logo injection initiated`);
+        } catch (e) {
+            console.warn(`[${this.id}] ⚠️ Could not inject bot logo:`, e.message);
+        }
+    }
+
+    /**
      * Perpetual modal dismissal (GoogleMeetBot style)
      * Continuously checks for and dismisses "Got it" modals during recording
      */
@@ -1730,17 +2048,60 @@ class Bot {
             try {
                 const dismissed = await this.page.evaluate(() => {
                     try {
-                        const buttons = document.querySelectorAll('button');
-                        const gotItButtons = Array.from(buttons).filter(
-                            button => button.offsetParent !== null && 
-                                     button.innerText && 
-                                     button.innerText.includes('Got it')
-                        );
-                        
-                        if (gotItButtons.length > 0) {
-                            gotItButtons[0].click();
-                            return true;
+                        const textCandidates = ['got it', 'click allow', 'click to allow', 'allow', 'allow access', 'continue', 'ok', 'turn on captions', 'enable captions', 'accept'];
+
+                        const clickIfMatches = (el) => {
+                            try {
+                                const txt = (el.innerText || '').toLowerCase().trim();
+                                if (!txt) return false;
+                                for (const cand of textCandidates) {
+                                    if (txt.includes(cand)) {
+                                        try { el.click(); } catch {}
+                                        return true;
+                                    }
+                                }
+                            } catch {}
+                            return false;
+                        };
+
+                        const els = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                        for (const e of els) {
+                            if (e.offsetParent === null) continue;
+                            if (clickIfMatches(e)) return true;
                         }
+
+                        const overlaySelectors = ['[role="dialog"]', '.modal', '.overlay', '.caveat', '.permission', '[data-modal]'];
+                        for (const sel of overlaySelectors) {
+                            const nodes = Array.from(document.querySelectorAll(sel));
+                            for (const n of nodes) {
+                                try {
+                                    const cs = window.getComputedStyle(n);
+                                    if (cs && (cs.position === 'fixed' || cs.position === 'absolute' || parseInt(cs.zIndex || '0', 10) > 1000)) {
+                                        console.log('[Browser] ✖️ Removing overlay node for selector', sel);
+                                        n.remove();
+                                        return;
+                                    }
+                                } catch (e) {}
+                            }
+                        }
+
+                        // 👉 2b) *Specifically* remove the "Click Allow" helper card if it exists.
+                        try {
+                            const blocks = Array.from(document.querySelectorAll('div, section, article'));
+                            for (const node of blocks) {
+                                const txt = (node.innerText || '').toLowerCase();
+                                if (!txt) continue;
+
+                                if (txt.includes('click allow') && txt.includes('microphone anytime in the meeting')) {
+                                    console.log('[Browser] ✖️ Removing "Click Allow" helper card');
+                                    node.remove();
+                                    return;
+                                }
+                            }
+                        } catch (e) {}
+
+                        // Fallback: send Escape
+                        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true })); } catch {}
                         return false;
                     } catch {
                         return false;
@@ -1851,6 +2212,28 @@ class Bot {
     }
 
     /**
+     * Get meeting host from participant panel
+     * @returns {Promise<string|null>} Host name or null if not found
+     */
+    async getMeetingHost() {
+        // Prefer extension-published value (localStorage) to avoid toggling People panel
+        if (!this.page || (this.page.isClosed && this.page.isClosed())) return null;
+
+        try {
+            const { meetingHost } = await this.fetchTranscriptFromPage();
+            const hostName = meetingHost || null;
+            if (hostName && hostName !== this.meetingHost) {
+                this.meetingHost = hostName;
+                console.log(`[${this.id}] 👑 Meeting host captured from extension: ${hostName}`);
+            }
+            return hostName;
+        } catch (error) {
+            // Silently handle errors
+            return null;
+        }
+    }
+
+    /**
      * Sample currently active speaker names from the Google Meet UI and
      * register activity timestamps per speaker.
      *
@@ -1858,107 +2241,108 @@ class Bot {
      * "<Name> is speaking" or "Speaking now", as well as data-speaking flags
      * where available. It does not rely on any server-side audio pipeline.
      */
-    registerSpeakerActivity(name, timestampMs) {
-        // Clean the provided display name so we avoid suffixes like "is speaking" or self-view markers
-        const cleaned = this._cleanName(name);
-        if (!cleaned) return; // Skip if name cannot be determined or is self-view
-        const ts = typeof timestampMs === 'number' ? timestampMs : Date.now();
-        this.lastActivity = ts;
+    // registerSpeakerActivity(name, timestampMs) {
+    //     // Clean the provided display name so we avoid suffixes like "is speaking" or self-view markers
+    //     const cleaned = this._cleanName(name);
+    //     if (!cleaned) return; // Skip if name cannot be determined or is self-view
+    //     const ts = typeof timestampMs === 'number' ? timestampMs : Date.now();
+    //     this.lastActivity = ts;
 
-        if (!this.registeredActivityTimestamps[cleaned]) {
-            this.registeredActivityTimestamps[cleaned] = [];
-        }
-        this.registeredActivityTimestamps[cleaned].push(ts);
+    //     if (!this.registeredActivityTimestamps[cleaned]) {
+    //         this.registeredActivityTimestamps[cleaned] = [];
+    //     }
+    //     this.registeredActivityTimestamps[cleaned].push(ts);
 
-        if (!this.participants.includes(cleaned)) {
-            this.participants.push(cleaned);
-        }
-    }
+    //     if (!this.participants.includes(cleaned)) {
+    //         this.participants.push(cleaned);
+    //         try {
+    //             if (!this.participantJoinTimes[cleaned]) this.participantJoinTimes[cleaned] = ts;
+    //             this.participantAbsenceCounts[cleaned] = 0;
+    //         } catch (e) {}
+    //     }
+    // }
 
-    async sampleActiveSpeakers() {
-        if (!this.page || (this.page.isClosed && this.page.isClosed())) return;
+    // async sampleActiveSpeakers() {
+    //     if (!this.page || (this.page.isClosed && this.page.isClosed())) return;
 
-        const now = Date.now();
-        let activeNames = [];
+    //     const now = Date.now();
+    //     let activeNames = [];
         
-        try {
-            activeNames = await this.page.evaluate(() => {
-            const names = new Set();
-            const SELF_VIEW_LABELS = ['you', 'your video', 'self view'];
-            const clean = (raw) => {
-                if (!raw) return null;
-                let first = String(raw).split(/[,(]/)[0].trim();
-                const lower = first.toLowerCase();
-                if (SELF_VIEW_LABELS.includes(lower)) return null;
-                return first;
-            };
-            try {
-                const nodes = Array.from(document.querySelectorAll('[aria-label]'));
-                for (const el of nodes) {
-                    const labelRaw = el.getAttribute('aria-label') || '';
-                    const label = labelRaw.trim();
-                    if (!label) continue;
-                    const lower = label.toLowerCase();
+    //     try {
+    //         activeNames = await this.page.evaluate(() => {
+    //         const names = new Set();
+    //         const SELF_VIEW_LABELS = ['you', 'your video', 'self view'];
+    //         const clean = (raw) => {
+    //             if (!raw) return null;
+    //             let first = String(raw).split(/[,(]/)[0].trim();
+    //             const lower = first.toLowerCase();
+    //             if (SELF_VIEW_LABELS.includes(lower)) return null;
+    //             return first;
+    //         };
+    //         try {
+    //             const nodes = Array.from(document.querySelectorAll('[aria-label]'));
+    //             for (const el of nodes) {
+    //                 const labelRaw = el.getAttribute('aria-label') || '';
+    //                 const label = labelRaw.trim();
+    //                 if (!label) continue;
+    //                 const lower = label.toLowerCase();
 
-                    const markers = [
-                        ' is speaking',
-                        ' is presenting',
-                        ' speaking now',
-                    ];
+    //                 const markers = [
+    //                     ' is speaking',
+    //                     ' is presenting',
+    //                     ' speaking now',
+    //                 ];
 
-                    let matched = false;
-                    for (const m of markers) {
-                        if (lower.endsWith(m)) {
-                            const base = label.substring(0, label.length - m.length).trim();
-                            const c = clean(base);
-                            if (c) names.add(c);
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if (matched) continue;
+    //                 let matched = false;
+    //                 for (const m of markers) {
+    //                     if (lower.endsWith(m)) {
+    //                         const base = label.substring(0, label.length - m.length).trim();
+    //                         const c = clean(base);
+    //                         if (c) names.add(c);
+    //                         matched = true;
+    //                         break;
+    //                     }
+    //                 }
+    //                 if (matched) continue;
 
-                    // Fallback: Tiles may have role=presentation and aria-label="<name> (presenting)"
-                    if (lower.endsWith('(presenting)')) {
-                        const base = label.replace(/\(presenting\)$/i, '').trim();
-                        const c = clean(base);
-                        if (c) names.add(c);
-                        continue;
-                    }
+    //                 // Fallback: Tiles may have role=presentation and aria-label="<name> (presenting)"
+    //                 if (lower.endsWith('(presenting)')) {
+    //                     const base = label.replace(/\(presenting\)$/i, '').trim();
+    //                     const c = clean(base);
+    //                     if (c) names.add(c);
+    //                     continue;
+    //                 }
 
-                    // Generic speaking detection class
-                    if (el.getAttribute('data-speaking') === 'true') {
-                        const c = clean(label);
-                        if (c) names.add(c);
-                    }
-                }
-            } catch {}
-            return Array.from(names);
-        });
-        } catch (e) {
-            // Silently handle target closed errors during speaker sampling
-            const msg = e.message || String(e);
-            if (!msg.includes('Target closed') && !msg.includes('Session closed')) {
-                console.warn(`[${this.id}] ⚠️ Speaker sampling error:`, msg);
-            }
-            return;
-        }
+    //                 // Generic speaking detection class
+    //                 if (el.getAttribute('data-speaking') === 'true') {
+    //                     const c = clean(label);
+    //                     if (c) names.add(c);
+    //                 }
+    //             }
+    //         } catch {}
+    //         return Array.from(names);
+    //     });
+    //     } catch (e) {
+    //         // Silently handle target closed errors during speaker sampling
+    //         const msg = e.message || String(e);
+    //         if (!msg.includes('Target closed') && !msg.includes('Session closed')) {
+    //             console.warn(`[${this.id}] ⚠️ Speaker sampling error:`, msg);
+    //         }
+    //         return;
+    //     }
 
-        if (!Array.isArray(activeNames) || activeNames.length === 0) return;
+    //     if (!Array.isArray(activeNames) || activeNames.length === 0) return;
 
-        for (const name of activeNames) {
-            this.registerSpeakerActivity(name, now);
-        }
-    }
+    //     for (const name of activeNames) {
+    //         this.registerSpeakerActivity(name, now);
+    //     }
+    // }
 
     /**
      * Monitor participants and auto-leave when empty (enhanced with MeetsBot + GoogleMeetBot logic)
      */
     startParticipantMonitoring() {
         console.log(`[${this.id}] 👥 Starting comprehensive monitoring...`);
-        
-        // Start modal dismissal (GoogleMeetBot style)
-        this.startModalDismissal();
         
         // Start page validity checks (GoogleMeetBot style)
         this.startPageValidityCheck();
@@ -1967,45 +2351,25 @@ class Bot {
         let emptyStreak = 0;
         const leaveThreshold = 3; // require 3 consecutive empty readings before leaving (reserved for future use)
 
-        // Start speaker activity sampling (best-effort active speaker detection)
-        if (this.speakerActivityInterval) {
-            try { clearInterval(this.speakerActivityInterval); } catch {}
-        }
-        this.speakerActivityInterval = setInterval(async () => {
-            try {
-                await this.sampleActiveSpeakers();
-            } catch (e) {
-                // Non-fatal: just log once in a while
-                console.warn(`[${this.id}] ⚠️ Speaker sampling error:`, e.message || e);
-            }
-        }, 2000); // 2s resolution for speaker activity (optimized)
+        // // Start speaker activity sampling (best-effort active speaker detection)
+        // if (this.speakerActivityInterval) {
+        //     try { clearInterval(this.speakerActivityInterval); } catch {}
+        // }
+        // this.speakerActivityInterval = setInterval(async () => {
+        //     try {
+        //         await this.sampleActiveSpeakers();
+        //     } catch (e) {
+        //         // Non-fatal: just log once in a while
+        //         console.warn(`[${this.id}] ⚠️ Speaker sampling error:`, e.message || e);
+        //     }
+        // }, 2000); // 2s resolution for speaker activity (optimized)
         
-        // Periodically fetch meeting title from extension (every 30 seconds)
-        const titleCheckInterval = setInterval(async () => {
-            try {
-                if (!this.page || (this.page.isClosed && this.page.isClosed())) {
-                    clearInterval(titleCheckInterval);
-                    return;
-                }
-                
-                // Only fetch if we don't have a title yet, or check for updates
-                if (!this.meetingTitle) {
-                    const { meetingTitle } = await this.fetchTranscriptFromPage();
-                    if (meetingTitle && meetingTitle.trim()) {
-                        this.meetingTitle = meetingTitle.trim();
-                        console.log(`[${this.id}] 📝 Meeting title captured: ${this.meetingTitle}`);
-                        // Clear interval once we have the title
-                        clearInterval(titleCheckInterval);
-                    }
-                }
-            } catch (e) {
-                // Non-fatal: just log once in a while
-                if (Math.random() < 0.1) { // Log only 10% of errors to reduce noise
-                    console.warn(`[${this.id}] ⚠️ Title fetch error:`, e.message || e);
-                }
-            }
-        }, 30000); // Check every 30 seconds
+        // Meeting title capture removed — no periodic title fetch from extension
 
+        // Periodically detect meeting host (every 15 seconds)
+        let hostCheckCounter = 0;
+        const hostCheckInterval = 3; // Check every 3rd interval (15 seconds)
+        
         this.participantCheckInterval = setInterval(async () => {
             try {
                 if (!this.page || (this.page.isClosed && this.page.isClosed())) {
@@ -2015,10 +2379,126 @@ class Bot {
                     }
                     return;
                 }
-                const participantCount = await this.getParticipantCount();
-                
+
+                const detection = await this.detectOtherBots();
+                console.log("Detection OtherBots", detection && typeof detection.botCount === 'number' ? detection.botCount : null, 'humanCount:', detection && typeof detection.humanCount === 'number' ? detection.humanCount : null);
+
+                // Process detector details: record detected names, initialize join times
+                // and absence counters, and emit participant.joined for newly-seen names.
+
+                const participantCount = (Number(detection.botCount || 0) + Number(detection.humanCount || 0));
+
+                // Build list of currently-detected cleaned names (from detection.details)
+                const detectedNames = [];
+                try {
+                    if (detection && Array.isArray(detection.details)) {
+                        for (const det of detection.details) {
+                            try {
+                                const raw = det && (det.name || det.label || '');
+                                const cleaned = this._cleanName(raw || '');
+                                if (!cleaned) continue;
+
+                                // Add to detectedNames set for this interval
+                                if (!detectedNames.includes(cleaned)) detectedNames.push(cleaned);
+
+                                // If this is a newly-seen participant, emit 'participant.joined'
+                                const isNew = !this.participants.includes(cleaned);
+                                if (isNew) {
+                                    try {
+                                        const ts = getCurrentTimestamp();
+                                        const payload = {
+                                            meeting_id: this.getMeetingIdFromUrl(this.meetUrl) || null,
+                                            name: cleaned,
+                                            joined_at: ts.formatted,
+                                            timezone: ts.timezone,
+                                            reason: det.reason || null,
+                                            bot_like: !!(det.reason && det.reason !== 'text-suspect-human')
+                                        };
+
+                                        // Fire-and-forget; log failures but don't block monitoring loop
+                                        sendWebhook('participant.joined', payload).catch(err => {
+                                            console.warn(`[${this.id}] ⚠️ Failed to send participant.joined webhook for ${cleaned}: ${err && err.message ? err.message : err}`);
+                                        });
+
+                                        console.log(`[${this.id}] ➕ New participant detected: ${cleaned}`);
+                                    } catch (e) {
+                                        // ignore per-entry errors
+                                    }
+                                }
+
+                                // Ensure we have a join time for detected names
+                                if (!this.participantJoinTimes[cleaned]) {
+                                    try { this.participantJoinTimes[cleaned] = getCurrentTimestamp().timestampMs; } catch {}
+                                }
+                                // Reset absence counter for seen participants
+                                this.participantAbsenceCounts[cleaned] = 0;
+                                // Ensure in participants list
+                                if (!this.participants.includes(cleaned)) this.participants.push(cleaned);
+                            } catch {}
+                        }
+                    }
+                } catch (e) {}
+
+                // Detect participants that have disappeared and emit participant.left
+                try {
+                    const prev = Array.isArray(this.participants) ? [...this.participants] : [];
+                    for (const prevName of prev) {
+                        try {
+                            if (!prevName) continue;
+                            // Skip names that are currently detected
+                            if (detectedNames.includes(prevName)) continue;
+                            // Never emit for the bot itself
+                            if (this.botName && prevName === this.botName) continue;
+
+                            // Increase absence counter
+                            const cur = this.participantAbsenceCounts[prevName] || 0;
+                            this.participantAbsenceCounts[prevName] = cur + 1;
+
+                            // Require 2 consecutive misses before considering left (10s)
+                            if (this.participantAbsenceCounts[prevName] >= 2) {
+                                // Considered left
+                                const leftTs = getCurrentTimestamp();
+                                const joinMs = this.participantJoinTimes[prevName] || null;
+                                let joinedFormatted = null;
+                                if (joinMs) {
+                                    try {
+                                        const jt = timestampToTimezone(joinMs);
+                                        joinedFormatted = jt.formatted;
+                                    } catch {}
+                                }
+                                const leftFormatted = leftTs.formatted;
+                                const durationSeconds = joinMs ? Math.max(0, Math.round((leftTs.timestampMs - joinMs)/1000)) : null;
+
+                                // Send webhook
+                                    try {
+                                        sendWebhook('participant.left', {
+                                            meeting_id: this.getMeetingIdFromUrl(this.meetUrl) || null,
+                                            name: prevName,
+                                            joined_at: joinedFormatted,
+                                            left_at: leftFormatted,
+                                            duration_seconds: durationSeconds
+                                        }).catch(err => {
+                                            console.warn(`[${this.id}] ⚠️ Failed to send participant.left webhook for ${prevName}: ${err && err.message ? err.message : err}`);
+                                        });
+                                    } catch (e) {
+                                        // ignore
+                                    }
+
+                                console.log(`[${this.id}] ➖ Participant left: ${prevName} (duration: ${durationSeconds}s)`);
+
+                                // Remove from known participants and clear tracking
+                                try {
+                                    this.participants = this.participants.filter(p => p !== prevName);
+                                    delete this.participantJoinTimes[prevName];
+                                    delete this.participantAbsenceCounts[prevName];
+                                } catch (e) {}
+                            }
+                        } catch (e) {}
+                    }
+                } catch (e) {}
+
                 // Track maximum participants seen (excluding bot, so subtract 1)
-                const actualParticipants = Math.max(0, participantCount - 1);
+                const actualParticipants = detection.humanCount;
                 if (actualParticipants > this.maxParticipantsSeen) {
                     this.maxParticipantsSeen = actualParticipants;
                     console.log(`[${this.id}] 📊 New maximum participants: ${this.maxParticipantsSeen}`);
@@ -2070,6 +2550,38 @@ class Bot {
                     return;
                 }
 
+                // Heuristic: if only bot-like participants are present, optionally leave to avoid duplicated bots
+                try {
+                    const leaveOnOnlyBots = !(process.env.LEAVE_ON_ONLY_BOTS === '0' || /^false$/i.test(process.env.LEAVE_ON_ONLY_BOTS || ''));
+                    if (leaveOnOnlyBots) {
+                        if(detection.botCount > 0 && detection.humanCount === 0) {
+                            console.log(`[${this.id}] ⚠️ Detected only bot-like participants (${detection.botCount}) — leaving to avoid duplicated bots`);
+                            try { console.log(`[${this.id}] ⚠️ Bot detection details: ${JSON.stringify((detection && detection.details) ? detection.details.slice(0,10) : [])}`); } catch {}
+                            this.leaveMeet();
+                            return;
+                        }
+                    }
+                } catch (e) {
+                    // Non-fatal detection error - continue monitoring
+                }
+                
+                // Periodically check for meeting host (every 15 seconds) - only if not already found
+                if (!this.meetingHost) {
+                    hostCheckCounter++;
+                    if (hostCheckCounter >= hostCheckInterval) {
+                        hostCheckCounter = 0;
+                        try {
+                            await this.getMeetingHost();
+                            // If host was found, we don't need to check again
+                            if (this.meetingHost) {
+                                console.log(`[${this.id}] ✅ Host detection complete, stopping periodic checks`);
+                            }
+                        } catch (e) {
+                            // Silently ignore host detection errors
+                        }
+                    }
+                }
+                
             } catch (error) {
                 if (error && typeof error.message === 'string' && error.message.includes('Target closed')) {
                     if (this.participantCheckInterval) {
@@ -2094,6 +2606,31 @@ class Bot {
         
         // Recording is stopped from browser side, file is already written
         console.log(`[${this.id}] ✅ Recording stopped - file saved to ${this.recordingPath}`);
+
+        // Emit recording.ended webhook immediately after stopping capture
+        try {
+            const meetingId = this.getMeetingIdFromUrl(this.meetUrl) || null;
+            const recordingType = this.recordingType || 'audio-video';
+            const fileUrl = this.recordingPath || null;
+            let durationSeconds = null;
+            try {
+                if (this.recordingStartedAt) {
+                    durationSeconds = Math.max(0, Math.round((Date.now() - this.recordingStartedAt) / 1000));
+                }
+            } catch (e) {}
+
+            sendWebhook('recording.ended', {
+                meeting_id: meetingId,
+                recording_type: recordingType,
+                file_url: fileUrl,
+                duration_seconds: durationSeconds
+            }).catch(err => {
+                console.warn(`[${this.id}] ⚠️ Failed to send recording.ended webhook: ${err && err.message ? err.message : err}`);
+            });
+            console.log(`[${this.id}] 📣 Emitted recording.ended webhook (file: ${fileUrl || 'n/a'})`);
+        } catch (e) {
+            // non-fatal
+        }
     }
 
     /**
@@ -2212,6 +2749,7 @@ class Bot {
             console.log(`[${this.id}] 💾 SpeakerTimeframes saved to ${this.speakerTimeframesFile}`);
         } catch (e) {
             console.error(`[${this.id}] ❌ Failed to write SpeakerTimeframes file:`, e.message || e);
+            try { if (this.emitError) await this.emitError('file_write_error', 'Failed to write SpeakerTimeframes file', { path: this.speakerTimeframesFile, error: e && e.message ? e.message : String(e) }); } catch (err) {}
         }
     }
 
@@ -2263,7 +2801,8 @@ class Bot {
             participation: {
                 totalParticipants: 0,
                 speakers: [],
-                speakerStats: {}
+                speakerStats: {},
+                meetingHost: null
             }
         };
 
@@ -2498,19 +3037,19 @@ class Bot {
                 console.log(`[${this.id}] ℹ️  OpenAI keywords not yet generated (keywords.json not found)`);
             }
 
-            // Participation stats - use maximum participants seen during monitoring (most accurate)
-            // This represents the peak number of participants in the meeting (excluding bot)
-            // maxParticipantsSeen already excludes the bot (we subtract 1 in monitoring)
-            if (this.maxParticipantsSeen > 0) {
-                metrics.participation.totalParticipants = this.maxParticipantsSeen; // Already excludes bot
-                // Also collect unique speakers from captions for the speakers list
-                const uniqueSpeakers = new Set();
-                for (const caption of captions) {
-                    const speaker = (caption.speaker || '').trim();
-                    if (speaker && speaker !== 'Unknown Speaker' && speaker.length > 0) {
-                        uniqueSpeakers.add(speaker);
+                // Participation stats - use maximum participants seen during monitoring (most accurate)
+                // This represents the peak number of participants in the meeting (excluding bot)
+                // maxParticipantsSeen already excludes the bot (we subtract 1 in monitoring)
+                if (this.maxParticipantsSeen > 0) {
+                    metrics.participation.totalParticipants = this.maxParticipantsSeen; // Already excludes bot
+                    // Also collect unique speakers from captions for the speakers list
+                    const uniqueSpeakers = new Set();
+                    for (const caption of captions) {
+                        const speaker = (caption.speaker || '').trim();
+                        if (speaker && speaker !== 'Unknown Speaker' && speaker.length > 0) {
+                            uniqueSpeakers.add(speaker);
+                        }
                     }
-                }
                 if (uniqueSpeakers.size > 0) {
                     metrics.participation.speakers = Array.from(uniqueSpeakers);
                 } else {
@@ -2521,6 +3060,11 @@ class Bot {
                     } else {
                         metrics.participation.speakers = [];
                     }
+                }
+                
+                // Add meeting host if detected
+                if (this.meetingHost) {
+                    metrics.participation.meetingHost = this.meetingHost;
                 }
             } else {
                 // Fallback: count unique speakers from captions if maxParticipantsSeen not available
@@ -2614,6 +3158,7 @@ class Bot {
             return metrics;
         } catch (e) {
             console.error(`[${this.id}] ❌ Failed to save meeting metrics:`, e.message || e);
+            try { if (this.emitError) await this.emitError('file_write_error', 'Failed to save meeting metrics', { path: this.metricsFile, error: e && e.message ? e.message : String(e) }); } catch (err) {}
             return null;
         }
     }
@@ -2621,9 +3166,9 @@ class Bot {
     async fetchTranscriptFromPage() {
         // Check if page is valid and accessible
         if (!this.page || (this.page.isClosed && this.page.isClosed())) {
-            return { transcript: [], meetingStartTimeStamp: null, meetingTitle: null };
+            return { transcript: [], meetingStartTimeStamp: null };
         }
-        
+
         try {
             const data = await this.page.evaluate(() => {
                 try {
@@ -2637,15 +3182,15 @@ class Bot {
                             meetingStartTimeStamp = rawStart;
                         }
                     }
-                    // Also fetch meeting title from extension
-                    const meetingTitle = localStorage.getItem('meetingTitle') || null;
-                    return { transcript, meetingStartTimeStamp, meetingTitle };
+                    // Do NOT fetch meetingTitle from extension (removed requirement)
+                    const meetingHost = localStorage.getItem('meetingHost') || null;
+                    return { transcript, meetingStartTimeStamp, meetingHost };
                 } catch {
-                    return { transcript: [], meetingStartTimeStamp: null, meetingTitle: null };
+                    return { transcript: [], meetingStartTimeStamp: null, meetingHost: null };
                 }
             });
             if (!data || !Array.isArray(data.transcript)) {
-                return { transcript: [], meetingStartTimeStamp: null, meetingTitle: null };
+                return { transcript: [], meetingStartTimeStamp: null, meetingHost: null };
             }
             return data;
         } catch (e) {
@@ -2668,16 +3213,10 @@ class Bot {
      */
     async saveCaptionsToFile() {
         // Fetch transcript collected by extension instead of internal captions logic
-        const { transcript, meetingStartTimeStamp, meetingTitle } = await this.fetchTranscriptFromPage();
+        const { transcript, meetingStartTimeStamp } = await this.fetchTranscriptFromPage();
         if (!transcript || transcript.length === 0) {
             console.log(`[${this.id}] ⚠️ No transcript found in page storage.`);
             return;
-        }
-        
-        // Update meeting title if found from extension
-        if (meetingTitle && meetingTitle.trim()) {
-            this.meetingTitle = meetingTitle.trim();
-            console.log(`[${this.id}] 📝 Meeting title from extension: ${this.meetingTitle}`);
         }
 
         // Convert extension format -> generic captions format expected by frontend
@@ -2715,8 +3254,25 @@ class Bot {
         try {
             await fs.promises.writeFile(this.captionsFile, JSON.stringify(mapped, null, 2), 'utf8');
             console.log(`[${this.id}] 💾 Transcript saved to ${this.captionsFile}`);
+            // Emit transcript.completed webhook so external services know transcript is ready
+            try {
+                const meetingId = this.getMeetingIdFromUrl(this.meetUrl) || null;
+                const language = this.captionLanguage || null;
+                const transcriptUrl = this.captionsFile || null;
+                sendWebhook('transcript.completed', {
+                    meeting_id: meetingId,
+                    language,
+                    transcript_url: transcriptUrl
+                }).catch(err => {
+                    console.warn(`[${this.id}] ⚠️ Failed to send transcript.completed webhook: ${err && err.message ? err.message : err}`);
+                });
+                console.log(`[${this.id}] 📣 Emitted transcript.completed webhook (file: ${transcriptUrl || 'n/a'})`);
+            } catch (e) {
+                // ignore non-fatal errors
+            }
         } catch (e) {
             console.error(`[${this.id}] ❌ Failed to write transcript file:`, e.message || e);
+            try { if (this.emitError) await this.emitError('file_write_error', 'Failed to write transcript file', { path: this.captionsFile, error: e && e.message ? e.message : String(e) }); } catch (err) {}
         }
     }
 
@@ -2822,6 +3378,65 @@ class Bot {
         } catch (e) {
             console.error(`[${this.id}] Error saving meeting metrics:`, e);
         }
+
+        // Fire webhook for meeting ended (if configured)
+        try {
+            try {
+                const meetingId = this.getMeetingIdFromUrl(this.meetUrl) || null;
+                const endedAtFormatted = (this.meetingEndTimeFormatted) || getCurrentTimestamp().formatted;
+                // Compute duration in seconds where possible
+                let durationSeconds = null;
+                try {
+                    if (this.meetingStartTime && this.meetingEndTime) {
+                        const startMs = new Date(this.meetingStartTime).getTime();
+                        const endMs = new Date(this.meetingEndTime).getTime();
+                        if (!Number.isNaN(startMs) && !Number.isNaN(endMs)) durationSeconds = Math.max(0, Math.round((endMs - startMs) / 1000));
+                    } else if (this.recordingStartedAt) {
+                        durationSeconds = Math.max(0, Math.round((Date.now() - this.recordingStartedAt) / 1000));
+                    }
+                } catch (err) {}
+
+                // Attempt to populate participants list from saved metrics if available
+                let participantsList = [];
+                try {
+                    if (this.metricsFile && fs.existsSync(this.metricsFile)) {
+                        const raw = fs.readFileSync(this.metricsFile, 'utf8');
+                        const metrics = JSON.parse(raw);
+                        if (metrics && metrics.participation) {
+                            if (Array.isArray(metrics.participation.speakers) && metrics.participation.speakers.length) {
+                                participantsList = metrics.participation.speakers;
+                            }
+                        }
+                        // Fallback: talkTime.byParticipant keys
+                        if ((!participantsList || participantsList.length === 0) && metrics && metrics.talkTime && metrics.talkTime.byParticipant) {
+                            participantsList = Object.keys(metrics.talkTime.byParticipant || {});
+                        }
+                    }
+                } catch (err) {
+                    // ignore
+                }
+
+                // Final fallback: use current participants array (may be empty if already cleaned up)
+                if (!participantsList || participantsList.length === 0) {
+                    participantsList = Array.isArray(this.participants) ? Array.from(new Set(this.participants)) : [];
+                }
+
+                const tz = getCurrentTimestamp();
+                const payload = {
+                    meeting_id: meetingId,
+                    ended_at: endedAtFormatted,
+                    duration_seconds: durationSeconds,
+                    participants: participantsList,
+                    timezone: tz.timezone
+                };
+
+                // Send but don't block cleanup
+                sendWebhook('meeting.ended', payload).catch(err => {
+                    console.warn(`[${this.id}] ⚠️ Failed to send meeting.ended webhook: ${err && err.message ? err.message : err}`);
+                });
+                console.log(`[${this.id}] 📣 Emitted meeting.ended webhook (participants: ${participantsList.length})`);
+            } catch (err) {}
+        } catch (e) {}
         
         
         // STEP 3: Stop browser-side recording and cleanup browser-side intervals
@@ -2897,7 +3512,6 @@ class Bot {
         } catch (e) {
             console.error(`[${this.id}] Error stopping recording:`, e);
         }
-        
         // STEP 5: Click leave button if not kicked (before closing page)
         if (!await this.checkKicked()) {
             const leaveButton = '//button[@aria-label="Leave call"]';
@@ -3014,6 +3628,7 @@ class Bot {
 			recordingPath: this.recordingPath,
 			recordingFile: this.recordingPath, // WebM recording file
 			participants: this.participants,
+			meetingHost: this.meetingHost, // Meeting host name
 			speakerTimeframes,
 			hasSeenParticipants: this.hasSeenParticipants,
 			recordingFormat: 'webm', // MediaRecorder output
@@ -3044,7 +3659,6 @@ class Bot {
 		const total = await this.getParticipantCount().catch(() => null);
 		return { ...counts, totalIncludingBot: total };
 	}
-
     /**
      * Return a cleaned participant display name.
      * – Trim whitespace

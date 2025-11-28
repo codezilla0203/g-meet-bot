@@ -1,0 +1,53 @@
+# ============================================
+# Systemd Service File for CXFlow Meeting Bot Frontend
+# ============================================
+# Frontend Next.js Server (Port 3000)
+#
+# Installation:
+#   1. sudo cp meeting-bot-frontend.service /etc/systemd/system/
+#   2. Edit the file and replace USER and /path/to with your actual values
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable meeting-bot-frontend
+#   5. sudo systemctl start meeting-bot-frontend
+#
+# Commands:
+#   sudo systemctl status meeting-bot-frontend   - Check status
+#   sudo systemctl start meeting-bot-frontend    - Start service
+#   sudo systemctl stop meeting-bot-frontend     - Stop service
+#   sudo systemctl restart meeting-bot-frontend  - Restart service
+#   sudo journalctl -u meeting-bot-frontend -f   - View logs
+
+[Unit]
+Description=CXFlow Meeting Bot Frontend Next.js Server
+Documentation=https://github.com/yourusername/g-meet-node
+After=network.target meeting-bot.service
+Wants=meeting-bot.service
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/g-meet-bot/frontend
+Environment="NODE_ENV=production"
+Environment="PORT=3000"
+Environment="PATH=/usr/bin:/usr/local/bin:/home/ec2-user/.nvm/versions/node/v18.17.0/bin"
+
+# Main process - Frontend Next.js Server
+ExecStart=/usr/bin/node /home/ec2-user/g-meet-bot/frontend/node_modules/.bin/next start
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Resource limits
+LimitNOFILE=65536
+MemoryLimit=1G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meeting-bot-frontend
+
+[Install]
+WantedBy=multi-user.target
+

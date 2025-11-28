@@ -11,10 +11,13 @@
     "test": "node examples/test.py"
   },
   "dependencies": {
-    "aws-sdk": "^2.1691.0",
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@aws-sdk/s3-request-presigner": "^3.700.0",
+    "@aws-sdk/lib-storage": "^3.700.0",
     "axios": "^1.6.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^12.4.1",
+    "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "ffmpeg-static": "^5.2.0",

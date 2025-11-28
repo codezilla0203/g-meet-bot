@@ -54,16 +54,29 @@ MEETING_KEYWORDS=["action item","deadline","task","decision"]
 DATABASE_PATH=./meeting_bot.db
 ```
 
-4. Start the server:
+4. Start the server (modular server):
 ```bash
-node src/server.js
+# start with npm (recommended)
+npm start
+
+# or run directly
+node src/start.js
+
 ```
 
 ## Usage
 
-### Starting a Bot
+Quick smoke test
 
-Send a POST request to create and join a meeting:
+After installing dependencies, you can run a fast smoke test that starts the app on an ephemeral port and validates a few lightweight endpoints:
+
+```bash
+npm run smoke
+```
+
+Starting a Bot
+
+Send a POST request to create and join a meeting (example):
 
 ```bash
 curl -X POST http://localhost:3000/api/bot \
