@@ -3,6 +3,7 @@ const fs = require('fs-extra');
 const path = require('path');
 const { getCurrentTimestamp } = require('./utils/timezone');
 const { sendWebhook } = require('./utils/webhook');
+const { getCachedFile, invalidateCache } = require('./utils/file-cache');
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -791,6 +792,14 @@ async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate 
         const summaryPath = path.join(botDir, 'summary.txt');
         const keywordsPath = path.join(botDir, 'keywords.json');
         const metadataPath = path.join(botDir, 'bot_metadata.json');
+        // Resolve per-bot webhook override (if stored in runtime metadata) - use cached read
+        let finalWebhook = process.env.WEBHOOK_URL || null;
+        try {
+            const metaForWebhook = await getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null);
+            if (metaForWebhook) finalWebhook = metaForWebhook.webhookUrl || metaForWebhook.webhook_url || finalWebhook;
+        } catch (e) {
+            // ignore and fall back to env
+        }
 
         // Check if transcript exists
         if (!await fs.pathExists(transcriptPath)) {
@@ -809,12 +818,12 @@ async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate 
             return summaryPath;
         }
 
-        // Read bot metadata to get language preference and meeting type
+        // Read bot metadata to get language preference and meeting type - use cached read
         let languageCode = 'es'; // Default to Spanish
         let finalMeetingType = meetingType; // Use provided meeting type or try to get from metadata
         try {
-            if (await fs.pathExists(metadataPath)) {
-                const metadata = await fs.readJson(metadataPath);
+            const metadata = await getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null);
+            if (metadata) {
                 if (metadata.captionLanguage) {
                     languageCode = metadata.captionLanguage;
                     console.log(`🌐 Using language from metadata: ${languageCode}`);
@@ -856,7 +865,7 @@ async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate 
                 saved_path: summaryPath,
                 completed_at: ts.formatted,
                 timezone: ts.timezone
-            });
+            }, finalWebhook);
         } catch (e) {
             console.warn(`⚠️ Could not send summary.completed webhook for ${botId}: ${e && e.message ? e.message : e}`);
         }
@@ -870,7 +879,7 @@ async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate 
         // Metrics might have been calculated before keywords were generated
         try {
             const metricsPath = path.join(botDir, 'MeetingMetrics.json');
-            if (fs.existsSync(metricsPath)) {
+            if (await fs.pathExists(metricsPath)) {
                 const metrics = await fs.readJson(metricsPath);
                 
                 // Update keywords in metrics with OpenAI-generated keywords
@@ -925,6 +934,8 @@ async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate 
                 
                 // Save updated metrics
                 await fs.writeJson(metricsPath, metrics, { spaces: 2 });
+                // Invalidate cache after update
+                invalidateCache(metricsPath);
                 console.log(`✅ Updated metrics with ${keywords.length} OpenAI-generated keywords`);
             }
         } catch (e) {
@@ -949,6 +960,8 @@ async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate 
                 if (!metadata.title || metadata.title !== generatedTitle) {
                     metadata.title = generatedTitle;
                     await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+                    // Invalidate cache after update
+                    invalidateCache(metadataPath);
                     console.log(`✅ Updated bot metadata title: ${generatedTitle}`);
                 } else {
                     console.log('ℹ️  Bot metadata title already up-to-date');
@@ -964,7 +977,7 @@ async function generateAndSaveSummary(botId, runtimeRoot, customSummaryTemplate 
 
     } catch (error) {
         console.error(`❌ Error generating summary for bot ${botId}:`, error);
-        try { await sendWebhook('error.occurred', { meeting_id: botId, code: 'summary_pipeline_error', message: error && error.message ? error.message : String(error), details: {} }); } catch (e) {}
+        try { await sendWebhook('error.occurred', { meeting_id: botId, code: 'summary_pipeline_error', message: error && error.message ? error.message : String(error), details: {} }, finalWebhook); } catch (e) {}
         throw error;
     }
 }

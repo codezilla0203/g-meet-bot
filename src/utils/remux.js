@@ -11,7 +11,7 @@ const { sendWebhook } = require('./webhook');
  * @param {string} outputPath - desired output .mp4 path (will be overwritten)
  * @returns {Promise<void>}
  */
-async function remuxWebmToMp4(inputPath, outputPath) {
+async function remuxWebmToMp4(inputPath, outputPath, overrideUrl = null) {
   if (!inputPath || !outputPath) throw new Error('inputPath and outputPath are required');
   if (!(await fs.pathExists(inputPath))) throw new Error(`Input file not found: ${inputPath}`);
 
@@ -40,7 +40,7 @@ async function remuxWebmToMp4(inputPath, outputPath) {
       } else {
         const err = new Error(`ffmpeg remux failed with code ${code}: ${stderr.slice(0, 2000)}`);
         // Best-effort webhook notify
-        try { sendWebhook('error.occurred', { code: 'remux_error', message: err.message, details: { inputPath, outputPath, exitCode: code, stderr: stderr.slice(0,2000) } }); } catch (e) {}
+        try { sendWebhook('error.occurred', { code: 'remux_error', message: err.message, details: { inputPath, outputPath, exitCode: code, stderr: stderr.slice(0,2000) } }, overrideUrl || null); } catch (e) {}
         reject(err);
       }
     });

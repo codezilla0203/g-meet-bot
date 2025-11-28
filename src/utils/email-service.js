@@ -225,20 +225,26 @@ async function sendMeetingSummaryEmail(options) {
     let captions = null;
         let meetingTitle = 'Google Meet Recording';
         
-        if (fs.existsSync(summaryFile)) {
-            summary = await fs.readFile(summaryFile, 'utf8');
+        // Load all files in parallel for better performance
+        const { getCachedFile } = require('./file-cache');
+        const [summaryResult, metricsResult, captionsResult] = await Promise.allSettled([
+            getCachedFile(summaryFile, (p) => fs.readFile(p, 'utf8'), 30000).catch(() => null),
+            getCachedFile(metricsFile, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null),
+            getCachedFile(captionsFile, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null)
+        ]);
+        
+        if (summaryResult.status === 'fulfilled' && summaryResult.value) {
+            summary = summaryResult.value;
         }
         
-        if (fs.existsSync(metricsFile)) {
-            const metricsData = await fs.readFile(metricsFile, 'utf8');
-            metrics = JSON.parse(metricsData);
+        if (metricsResult.status === 'fulfilled' && metricsResult.value) {
+            metrics = metricsResult.value;
         }
 
         // Load captions (transcript) if available
-        if (fs.existsSync(captionsFile)) {
+        if (captionsResult.status === 'fulfilled' && captionsResult.value) {
             try {
-                const captionsData = await fs.readFile(captionsFile, 'utf8');
-                captions = JSON.parse(captionsData);
+                captions = captionsResult.value;
                 if (Array.isArray(captions) && captions.length > 0) {
                     // Try to derive a human-friendly meeting title from the first caption timestamp
                     if (captions[0].timestampMs) {
@@ -251,27 +257,32 @@ async function sendMeetingSummaryEmail(options) {
             }
         }
         
-        // Create transporter
+    // Create transporter
         const transporter = createTransporter();
         
-        // Prepare attachments
+        // Prepare attachments - check file existence in parallel
         const attachments = [];
+        const [summaryExists, metricsExists, captionsExists] = await Promise.all([
+            fs.pathExists(summaryFile).catch(() => false),
+            fs.pathExists(metricsFile).catch(() => false),
+            fs.pathExists(captionsFile).catch(() => false)
+        ]);
         
-        if (fs.existsSync(summaryFile)) {
+        if (summaryExists) {
             attachments.push({
                 filename: 'resumen.txt',
                 path: summaryFile
             });
         }
         
-        if (fs.existsSync(metricsFile)) {
+        if (metricsExists) {
             attachments.push({
                 filename: 'metricas.json',
                 path: metricsFile
             });
         }
         
-        if (fs.existsSync(captionsFile)) {
+        if (captionsExists) {
             attachments.push({
                 filename: 'transcripcion.json',
                 path: captionsFile
@@ -320,6 +331,14 @@ async function sendMeetingSummaryEmail(options) {
                 .replace(/'/g, '&#039;');
         };
 
+        // Generate shareUrl if not provided
+        let finalShareUrl = shareUrl;
+        if (!finalShareUrl && botId) {
+            const baseUrl = process.env.BASE_URL;
+            const cleanBaseUrl = String(baseUrl).replace(/\/$/, '');
+            finalShareUrl = `${cleanBaseUrl}/share?token=${encodeURIComponent(botId)}`;
+        }
+
         const emailHTML = `
 <!DOCTYPE html>
 <html>
@@ -331,6 +350,31 @@ async function sendMeetingSummaryEmail(options) {
         .header h1 { margin: 0; font-size: 24px; }
         .section { margin-bottom: 30px; }
         .footer { margin-top: 30px; padding-top: 20px; border-top: 2px solid #ddd; color: #666; font-size: 12px; }
+        .share-button-container { text-align: center; margin: 30px 0; }
+        .share-button { 
+            display: inline-block; 
+            background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+            color: white !important; 
+            padding: 18px 36px; 
+            border-radius: 10px; 
+            text-decoration: none; 
+            font-weight: 700; 
+            font-size: 18px;
+            box-shadow: 0 4px 15px rgba(37, 99, 235, 0.3);
+            transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+        }
+        .share-button:hover {
+            background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%);
+            box-shadow: 0 6px 20px rgba(37, 99, 235, 0.4);
+            transform: translateY(-2px);
+        }
+        .share-button-text { 
+            display: inline-block; 
+            vertical-align: middle; 
+            margin-left: 8px; 
+        }
     </style>
 </head>
 <body>
@@ -339,14 +383,12 @@ async function sendMeetingSummaryEmail(options) {
         <p style="margin: 5px 0 0 0;">${meetingTitle}</p>
     </div>
     
-    ${shareUrl ? `
-    <div class="section" style="background: #f0f9ff; border: 2px solid #2563eb; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
-        <h2 style="color: #2563eb; margin-top: 0;">🔗 View Online</h2>
-        <p style="margin-bottom: 15px; color: #2563eb;">Access the complete meeting recording, transcript, and interactive features:</p>
-        <a href="${shareUrl}" style="display: inline-block; background: #2563eb; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600;">
-            📺 View Meeting Recording
+    ${finalShareUrl ? `
+    <div style="text-align: center; margin: 30px 0; padding: 25px; background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); border-radius: 12px; border: 2px solid #2563eb;">
+        <a href="${finalShareUrl}" style="display: inline-block; background-color: #2563eb; background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); color: #ffffff !important; padding: 18px 40px; border-radius: 10px; text-decoration: none; font-weight: 700; font-size: 18px; box-shadow: 0 4px 15px rgba(37, 99, 235, 0.3); letter-spacing: 0.5px;">
+            🔗 Ver Reunión Completa
         </a>
-        <p style="font-size: 12px; color: #475569; margin-top: 10px;">Click the link above to access the full interactive meeting experience with video playback and searchable transcript.</p>
+        <p style="font-size: 14px; color: #475569; margin-top: 15px; text-align: center; line-height: 1.5;">Accede a la grabación completa, transcripción interactiva y todas las funcionalidades de la reunión</p>
     </div>
     ` : ''}
     
@@ -387,10 +429,63 @@ async function sendMeetingSummaryEmail(options) {
 </html>
         `;
         
+        // Try to read bot metadata for a more accurate meeting title/date - use cached read
+        const metadataFile = path.join(botDir, 'bot_metadata.json');
+        let metadata = null;
+        try {
+            const { getCachedFile } = require('./file-cache');
+            metadata = await getCachedFile(metadataFile, fs.readJson, 60000).catch(() => null);
+            if (metadata) {
+                if (metadata && (metadata.title || metadata.meetingTitle)) {
+                    meetingTitle = metadata.title || metadata.meetingTitle;
+                }
+            }
+        } catch (err) {
+            console.warn(`[${botId}] Could not read bot metadata: ${err.message}`);
+        }
+
+        // Derive a human-friendly meeting date if possible
+        let meetingDateStr = '';
+        try {
+            const dateCandidate = metadata && (metadata.startedAt || metadata.startTime || metadata.startTimestamp || metadata.start) 
+                ? (metadata.startedAt || metadata.startTime || metadata.startTimestamp || metadata.start)
+                : (metrics && metrics.duration && metrics.duration.startTimeFormatted) || (captions && captions[0] && captions[0].timestampMs ? captions[0].timestampMs : null);
+
+            if (dateCandidate) {
+                // If it's a numeric timestamp in ms
+                if (!isNaN(Number(dateCandidate))) {
+                    meetingDateStr = formatDateLong(new Date(Number(dateCandidate)));
+                } else {
+                    const parsed = new Date(dateCandidate);
+                    if (!isNaN(parsed.getTime())) {
+                        meetingDateStr = formatDateLong(parsed);
+                    } else if (typeof dateCandidate === 'string') {
+                        meetingDateStr = dateCandidate;
+                    }
+                }
+            }
+        } catch (err) {
+            console.warn(`[${botId}] Could not derive meeting date: ${err.message}`);
+        }
+
         // Send email
-        const emailSubject = isShareRequest 
-            ? `🔗 Shared: ${meetingTitle} - Meeting Summary & Recording`
-            : `📊 Resumen de Reunión - ${meetingTitle}`;
+        let emailSubject;
+        if (isShareRequest) {
+            emailSubject = `🔗 Shared: ${meetingTitle} - Meeting Summary & Recording`;
+        } else {
+            // If a summary file exists and contains content, use the requested new subject format
+            const hasSummary = (await fs.pathExists(summaryFile).catch(() => false)) && summary && summary.toString().trim() && summary.toString().trim() !== 'No summary available';
+            if (hasSummary) {
+                if (meetingDateStr) {
+                    emailSubject = `Resumen: ${meetingTitle} - ${meetingDateStr}`;
+                } else {
+                    emailSubject = `Resumen: ${meetingTitle}`;
+                }
+            } else {
+                // Fallback to previous subject when there is no summary
+                emailSubject = `📊 Resumen de Reunión - ${meetingTitle}`;
+            }
+        }
             
         const mailOptions = {
             from: `"CXFlow AI Summary" <contacto@cxflow.io>`,

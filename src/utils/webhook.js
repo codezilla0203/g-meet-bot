@@ -5,90 +5,170 @@ const path = require('path');
 const fs = require('fs-extra');
 const { getCurrentTimestamp } = require('./timezone');
 // Import configOps to read user's saved webhook_url if needed
-const { configOps } = require('../database');
+const { configOps, userOps } = require('../database');
 
-/**
- * sendWebhook(eventName, data)
- * Best-effort POST to configured WEBHOOK_URL.
- * Automatically augments payload with timestamp fields (iso + formatted + timezone).
- */
-// Helper: try to extract a meeting/bot id from a full meet URL or path
-function extractMeetingIdFromUrl(u) {
-    if (!u) return null;
+async function sendWebhook(eventName, data = {}, overrideUrl = null) {
+    // Resolve webhook URL priority:
+    // 1) overrideUrl argument
+    // 2) data.webhookUrl or data.webhook_url
+    // 3) runtime/<botId>/bot_metadata.json (if bot_id or meeting_id can be matched)
+    // 4) process.env.WEBHOOK_URL
+    let resolvedUrl = null;
     try {
-        const parsed = new URL(u);
-        const parts = parsed.pathname.split('/').filter(Boolean);
-        if (parts.length === 0) return null;
-        // heuristic: Google Meet ids are path segments like abc-defg-hij or long tokens
-        for (const p of parts) {
-            if (/^[a-z0-9-]{6,}$/i.test(p)) return p;
+        if (overrideUrl && String(overrideUrl).trim()) resolvedUrl = String(overrideUrl).trim();
+
+        // Short-circuit if payload includes an explicit webhook
+        if (!resolvedUrl) {
+            if (data && (data.webhookUrl || data.webhook_url)) {
+                resolvedUrl = data.webhookUrl || data.webhook_url;
+            }
         }
-        return parts[0];
-    } catch (e) {
-        // not a full URL, try simple segment extraction
-        const parts = String(u).split('/').filter(Boolean);
-        return parts.length ? parts[parts.length - 1] : null;
-    }
-}
 
-async function resolveWebhookUrl(overrideUrl, data) {
-    // Priority: explicit override -> env WEBHOOK_URL -> runtime metadata -> DB user config
-    if (overrideUrl) return overrideUrl;
+        const RUNTIME_ROOT = path.join(__dirname, '..', 'runtime');
 
-    try {
-        // Try to resolve by meeting_id or meeting_url fields in data
-        const meetingId = data && (data.meeting_id || (data.meeting_url && extractMeetingIdFromUrl(data.meeting_url)));
-        if (meetingId) {
-            const metadataPath = path.join(__dirname, '..', 'runtime', String(meetingId), 'bot_metadata.json');
-            if (await fs.pathExists(metadataPath)) {
-                try {
-                    const meta = await fs.readJson(metadataPath);
-                    if (meta) {
-                        if (meta.webhookUrl) return meta.webhookUrl;
-                        if (meta.userId) {
-                            try {
-                                const cfg = configOps.getByUserId(meta.userId);
-                                if (cfg && (cfg.webhook_url || cfg.webhookUrl)) return cfg.webhook_url;
-                            } catch (e) {}
-                        }
-                    }
-                } catch (e) {
-                    // ignore and continue to DB fallback
+        // Helper: try read runtime metadata for a given candidate id
+        const tryMetadataForId = async (candidateId) => {
+            if (!candidateId) return null;
+            try {
+                const metaPath = path.join(RUNTIME_ROOT, candidateId, 'bot_metadata.json');
+                if (await fs.pathExists(metaPath)) {
+                    const meta = await fs.readJson(metaPath).catch(() => null);
+                    if (meta) return meta;
+                }
+            } catch (e) {}
+            return null;
+        };
+
+        // Helper: get user email from userId
+        const getUserEmail = (userId) => {
+            if (!userId) return null;
+            try {
+                const user = userOps.findById(userId);
+                return user ? user.email : null;
+            } catch (e) {
+                return null;
+            }
+        };
+
+        // Helper: get account email from bot metadata
+        const getAccountEmailFromMetadata = async (metadata) => {
+            if (!metadata) return null;
+            const userId = metadata.userId || metadata.user_id || null;
+            if (!userId) return null;
+            return getUserEmail(userId);
+        };
+
+        // If still unresolved, check for bot_id or botId in payload
+        let botMetadata = null;
+        if (!resolvedUrl && data) {
+            const botId = data.bot_id || data.botId || null;
+            if (botId) {
+                const byBot = await tryMetadataForId(botId);
+                if (byBot) {
+                    botMetadata = byBot;
+                    resolvedUrl = byBot.webhookUrl || byBot.webhook_url || null;
                 }
             }
         }
-    } catch (e) {
-        // ignore errors and try DB fallback below
-    }
 
-    // As a last resort, if data includes user_id, try DB directly
-    try {
-        const userId = data && (data.user_id || data.userId);
-        if (userId) {
-            const cfg = configOps.getByUserId(userId);
-            if (cfg && (cfg.webhook_url || cfg.webhookUrl)) return cfg.webhook_url || cfg.webhookUrl;
+        // If meeting id/url provided, try to extract id and map to runtime metadata; else scan runtime entries
+        if (!resolvedUrl && data) {
+            const meetingId = data.meeting_id || data.meetingId || null;
+            const meetingUrl = data.meeting_url || data.meetUrl || data.meet_url || null;
+
+            // If meetingId present, try direct folder
+            if (meetingId && !botMetadata) {
+                const byMeeting = await tryMetadataForId(meetingId);
+                if (byMeeting) {
+                    botMetadata = byMeeting;
+                    resolvedUrl = byMeeting.webhookUrl || byMeeting.webhook_url || null;
+                }
+            }
+
+            // If still unresolved and meetingUrl provided, try extract id from URL
+            if (!resolvedUrl && meetingUrl) {
+                try {
+                    const u = new URL(meetingUrl);
+                    const parts = u.pathname.split('/').filter(Boolean);
+                    if (parts.length) {
+                        const candidate = parts[0];
+                        const byCandidate = await tryMetadataForId(candidate);
+                        if (byCandidate && !botMetadata) {
+                            botMetadata = byCandidate;
+                            resolvedUrl = byCandidate.webhookUrl || byCandidate.webhook_url || null;
+                        }
+                    }
+                } catch (e) {
+                    // ignore
+                }
+            }
+
+            // Fallback: scan runtime/*/bot_metadata.json looking for meeting_id or meetUrl matches
+            if (!resolvedUrl && (meetingId || meetingUrl)) {
+                try {
+                    const dirs = await fs.readdir(RUNTIME_ROOT).catch(() => []);
+                    for (const d of dirs) {
+                        try {
+                            const metaPath = path.join(RUNTIME_ROOT, d, 'bot_metadata.json');
+                            if (!await fs.pathExists(metaPath)) continue;
+                            const meta = await fs.readJson(metaPath).catch(() => null);
+                            if (!meta) continue;
+                            if (meetingId && (meta.meeting_id === meetingId || meta.meetingId === meetingId || String(meta.meetUrl || meta.meet_url || '').includes(meetingId))) {
+                                if (!botMetadata) botMetadata = meta;
+                                resolvedUrl = meta.webhookUrl || meta.webhook_url || null;
+                                if (resolvedUrl) break;
+                            }
+                            if (meetingUrl && (String(meta.meetUrl || meta.meet_url || '').includes(meetingUrl) || (meta.meeting_id && meetingUrl.includes(String(meta.meeting_id))))) {
+                                if (!botMetadata) botMetadata = meta;
+                                resolvedUrl = meta.webhookUrl || meta.webhook_url || null;
+                                if (resolvedUrl) break;
+                            }
+                        } catch (e) { continue; }
+                    }
+                } catch (e) {}
+            }
         }
-    } catch (e) {}
 
-    return null;
-}
+        // Final fallback to env
+        if (!resolvedUrl) resolvedUrl = process.env.WEBHOOK_URL || null;
 
-async function sendWebhook(eventName, data = {}, overrideUrl = null) {
-    const url = await resolveWebhookUrl(overrideUrl, data);
-    if (!url) return;
+        if (!resolvedUrl) {
+            // nothing to do
+            return;
+        }
 
-    try {
-        const u = new URL(url);
-        const lib = u.protocol === 'https:' ? https : http;
+        // Get account email from metadata if available
+        let accountEmail = null;
+        if (botMetadata) {
+            accountEmail = await getAccountEmailFromMetadata(botMetadata);
+        }
+        // If still no email and no metadata found yet, try to get it from meeting_id or bot_id in data
+        if (!accountEmail && data) {
+            const candidateId = data.meeting_id || data.meetingId || data.bot_id || data.botId || null;
+            if (candidateId) {
+                const metadata = await tryMetadataForId(candidateId);
+                if (metadata) {
+                    accountEmail = await getAccountEmailFromMetadata(metadata);
+                }
+            }
+        }
+
+        // Build payload and make request
         const ts = getCurrentTimestamp ? getCurrentTimestamp() : { iso: new Date().toISOString(), formatted: new Date().toISOString(), timezone: process.env.TIMEZONE || 'UTC' };
-
         const payload = Object.assign({}, data, {
             timestamp_iso: ts.iso,
             timestamp: ts.formatted,
             timezone: ts.timezone
         });
-
+        
+        // Add account email to payload if available
+        if (accountEmail) {
+            payload.account = accountEmail;
+        }
         const postData = JSON.stringify({ event: eventName, data: payload });
+
+        const u = new URL(resolvedUrl);
+        const lib = u.protocol === 'https:' ? https : http;
 
         const opts = {
             method: 'POST',
@@ -113,11 +193,11 @@ async function sendWebhook(eventName, data = {}, overrideUrl = null) {
             });
             req.on('error', (err) => reject(err));
             req.on('timeout', () => { req.destroy(new Error('Webhook request timeout')); });
-            req.write(postData);
+            try { req.write(postData); } catch (e) {}
             req.end();
         });
 
-        console.log(`✅ Webhook '${eventName}' sent to ${url}`);
+        console.log(`✅ Webhook '${eventName}' sent to ${resolvedUrl}`);
     } catch (err) {
         console.warn(`⚠️ Failed to send webhook '${eventName}': ${err && err.message ? err.message : err}`);
     }

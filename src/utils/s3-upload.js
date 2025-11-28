@@ -5,6 +5,22 @@ const fs = require('fs-extra');
 const path = require('path');
 const { sendWebhook } = require('./webhook');
 
+// Resolve per-bot webhook URL from runtime metadata if available
+async function resolveWebhookForBot(botId) {
+    try {
+        if (!botId) return process.env.WEBHOOK_URL || null;
+        const RUNTIME_ROOT = path.join(__dirname, '..', 'runtime');
+        const metadataPath = path.join(RUNTIME_ROOT, botId, 'bot_metadata.json');
+        if (await fs.pathExists(metadataPath)) {
+            const meta = await fs.readJson(metadataPath).catch(() => null);
+            if (meta) return meta.webhookUrl || meta.webhook_url || process.env.WEBHOOK_URL || null;
+        }
+    } catch (e) {
+        // ignore and fallback to env
+    }
+    return process.env.WEBHOOK_URL || null;
+}
+
 /**
  * S3 Upload Utility
  * Handles uploading video files to AWS S3 bucket
@@ -63,11 +79,12 @@ function initS3() {
  * Test S3 connection and bucket access
  * @returns {Promise<{success: boolean, error?: string}>}
  */
-async function testS3Connection() {
+async function testS3Connection(botId = null) {
     try {
         const client = initS3();
         if (!client) {
-            try { sendWebhook('error.occurred', { code: 's3_config_error', message: 'S3 not configured', details: {} }); } catch (e) {}
+            const override = await resolveWebhookForBot(botId);
+            try { await sendWebhook('error.occurred', { code: 's3_config_error', message: 'S3 not configured', details: {} }, override); } catch (e) {}
             return { success: false, error: 'S3 not configured' };
         }
         
@@ -103,7 +120,8 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
         }
         
         if (!await fs.pathExists(localFilePath)) {
-            try { sendWebhook('error.occurred', { code: 's3_upload_error', message: 'Local file not found', details: { localFilePath, botId } }); } catch (e) {}
+            const override = await resolveWebhookForBot(botId);
+            try { await sendWebhook('error.occurred', { code: 's3_upload_error', message: 'Local file not found', details: { localFilePath, botId } }, override); } catch (e) {}
             return { success: false, error: 'Local file not found' };
         }
         
@@ -122,9 +140,10 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
         }
         
         // Test connection first
-        const connectionTest = await testS3Connection();
+        const connectionTest = await testS3Connection(botId);
         if (!connectionTest.success) {
-            try { sendWebhook('error.occurred', { code: 's3_connection_error', message: 'S3 connection test failed', details: { error: connectionTest.error } }); } catch (e) {}
+            const override = await resolveWebhookForBot(botId);
+            try { await sendWebhook('error.occurred', { code: 's3_connection_error', message: 'S3 connection test failed', details: { error: connectionTest.error } }, override); } catch (e) {}
             return { success: false, error: connectionTest.error };
         }
         
@@ -214,7 +233,10 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
         
     // All retries failed
     const finalErr = lastError || new Error('Upload failed after all retries');
-    try { sendWebhook('error.occurred', { code: 's3_upload_error', message: 'Upload failed after retries', details: { localFilePath, botId, error: finalErr && finalErr.message ? finalErr.message : String(finalErr) } }); } catch (e) {}
+    try {
+        const override = await resolveWebhookForBot(botId);
+        await sendWebhook('error.occurred', { code: 's3_upload_error', message: 'Upload failed after retries', details: { localFilePath, botId, error: finalErr && finalErr.message ? finalErr.message : String(finalErr) } }, override);
+    } catch (e) {}
     throw finalErr;
         
     } catch (error) {
@@ -227,8 +249,8 @@ async function uploadVideoToS3(localFilePath, botId, maxRetries = 3) {
             key: s3Key
         });
         
-        // Emit error webhook
-        try { sendWebhook('error.occurred', { code: 's3_upload_error', message: 'S3 upload failed', details: { localFilePath, botId, error: error && error.message ? error.message : String(error) } }); } catch (e) {}
+    // Emit error webhook
+    try { const override = await resolveWebhookForBot(botId); await sendWebhook('error.occurred', { code: 's3_upload_error', message: 'S3 upload failed', details: { localFilePath, botId, error: error && error.message ? error.message : String(error) } }, override); } catch (e) {}
         
         // Provide more specific error messages
         let errorMessage = error.message || 'Unknown error';

@@ -21,6 +21,15 @@ try {
 }
 // Set busy timeout to handle locked database situations (milliseconds)
 db.pragma('busy_timeout = 10000');
+// Optimize for performance
+try {
+    db.pragma('cache_size = -64000'); // 64MB cache (negative = KB)
+    db.pragma('temp_store = MEMORY'); // Store temporary tables in memory
+    db.pragma('synchronous = NORMAL'); // Balance between safety and speed
+    console.log('✅ Database performance optimizations enabled');
+} catch (e) {
+    console.warn('⚠️  Could not enable database performance optimizations:', e.message);
+}
 
 /**
  * Initialize database schema

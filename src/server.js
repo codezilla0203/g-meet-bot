@@ -5,12 +5,12 @@ const { Bot } = require('./bot');
 const path = require('path');
 const fs = require('fs-extra');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
-const { spawn } = require('child_process');
 const { remuxWebmToMp4 } = require('./utils/remux');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { userOps, botOps, configOps, closeDatabase } = require('./database');
 const { generateAndSaveSummary, getModelInfo, getDefaultSummaryTemplate } = require('./openai-service');
+const { getCachedFile, invalidateCache } = require('./utils/file-cache');
 
 const app = express();
 
@@ -33,10 +33,9 @@ app.use(cors({
       return callback(null, true);
     }
     
-    // Log CORS requests for debugging (remove in production if not needed)
-    if (process.env.NODE_ENV !== 'production') {
+    // Log CORS requests for debugging (only in development)
+    if (process.env.NODE_ENV === 'development' && process.env.DEBUG_CORS === 'true') {
       console.log(`[CORS] Request from origin: ${origin}`);
-      console.log(`[CORS] Allowed origins:`, allowedOrigins);
     }
     
     if (allowedOrigins.includes(origin)) {
@@ -157,6 +156,81 @@ function authMiddleware(req, res, next) {
 //     next();
 // }
 
+/**
+ * Force cleanup all processes related to a specific bot (Chrome, Node, etc.)
+ * This is called before creating a new bot to ensure clean state
+ */
+async function forceCleanupBotProcesses(botId) {
+    console.log(`🧹 Force cleaning up all processes for bot ${botId}...`);
+    const isWindows = process.platform === 'win32';
+    const { execSync } = require('child_process');
+    
+    try {
+        // 1. Check if bot has PID file and kill that process tree
+        const botPidFile = path.join(RUNTIME_DIR, `${botId}.pid`);
+        if (await fs.pathExists(botPidFile)) {
+            try {
+                const pidStr = await fs.readFile(botPidFile, 'utf8');
+                const pid = parseInt(pidStr.trim(), 10);
+                
+                if (!isNaN(pid) && Number.isInteger(pid)) {
+                    if (isWindows) {
+                        try {
+                            execSync(`taskkill /F /T /PID ${pid}`, { 
+                                stdio: 'ignore',
+                                timeout: 5000 
+                            });
+                            console.log(`  ✅ Killed process tree (Windows) PID: ${pid}`);
+                        } catch {}
+                    } else {
+                        try {
+                            // Kill process tree
+                            execSync(`pkill -P ${pid}`, { stdio: 'ignore', timeout: 3000 });
+                            process.kill(pid, 'SIGTERM');
+                            await new Promise(r => setTimeout(r, 500));
+                            process.kill(pid, 'SIGKILL');
+                            console.log(`  ✅ Killed process tree (Unix) PID: ${pid}`);
+                        } catch {}
+                    }
+                }
+            } catch (e) {
+                console.warn(`  ⚠️ Error reading/killing PID from ${botPidFile}:`, e.message);
+            }
+            
+            // Remove PID file
+            try {
+                await fs.remove(botPidFile);
+            } catch {}
+        }
+        
+        // 2. Kill any Chrome processes that might be orphaned for this bot
+        // (Search by botId pattern in process command line or window title)
+        const botIdPattern = botId.slice(0, 8);
+        
+        if (isWindows) {
+            try {
+                // Kill Chrome processes that might be related to this bot
+                execSync(`taskkill /F /IM chrome.exe /FI "WINDOWTITLE eq *${botIdPattern}*"`, {
+                    stdio: 'ignore',
+                    timeout: 3000
+                });
+            } catch {}
+        } else {
+            // Unix: kill chrome processes that might be orphaned
+            try {
+                execSync(`pkill -f "chrome.*${botIdPattern}"`, {
+                    stdio: 'ignore',
+                    timeout: 3000
+                });
+            } catch {}
+        }
+        
+        console.log(`✅ Force cleanup completed for bot ${botId}`);
+    } catch (e) {
+        console.warn(`⚠️ Error during force cleanup for bot ${botId}:`, e.message);
+    }
+}
+
 // Kill leftover Chrome processes from previous crash/restart
 async function cleanupLeftoverBrowsers() {
     console.log('🧹 Cleaning up leftover browser processes...');
@@ -225,6 +299,9 @@ async function cleanupLeftoverBrowsers() {
         console.warn('⚠️ Error during browser cleanup:', e.message);
     }
 }
+
+// Note: Crash recovery is handled in bot.js via browser.on('disconnected')
+// The forceCleanupBotProcesses function is exported for use in bot.js if needed
 
 /**
  * SIMPLE LOCAL TESTING API
@@ -843,23 +920,39 @@ app.get('/api/bots', authMiddleware, async (req, res) => {
         const userBots = botOps.findByUserId(req.user.id);
         
         // Convert snake_case to camelCase for frontend compatibility
-        const formattedBots = [];
-        for (const bot of userBots) {
+        // Read all metadata files in parallel for better performance
+        const metadataPromises = userBots.map(bot => {
+            const metadataPath = path.join(RUNTIME_ROOT, String(bot.id), 'bot_metadata.json');
+            return getCachedFile(metadataPath, fs.readJson, 60000)
+                .then(metadata => ({ bot, metadata }))
+                .catch(() => ({ bot, metadata: null }));
+        });
+        
+        const metadataResults = await Promise.allSettled(metadataPromises);
+        const formattedBots = metadataResults.map((result, index) => {
+            if (result.status === 'rejected') {
+                const bot = userBots[index];
+                return {
+                    id: bot.id,
+                    userId: bot.user_id,
+                    meetUrl: bot.meet_url,
+                    title: bot.title,
+                    status: bot.status,
+                    error: bot.error,
+                    createdAt: bot.created_at,
+                    startedAt: bot.started_at,
+                    endTime: bot.ended_at
+                };
+            }
+            
+            const { bot, metadata } = result.value;
             // Prefer runtime metadata title when available (e.g. AI-generated or extension-provided title)
             let resolvedTitle = bot.title;
-            try {
-                const metadataPath = path.join(RUNTIME_ROOT, String(bot.id), 'bot_metadata.json');
-                if (await fs.pathExists(metadataPath)) {
-                    const metadata = await fs.readJson(metadataPath);
-                    if (metadata && metadata.title && typeof metadata.title === 'string' && metadata.title.trim().length > 0) {
-                        resolvedTitle = metadata.title;
-                    }
-                }
-            } catch (e) {
-                // If anything goes wrong reading metadata, fall back to DB title
+            if (metadata && metadata.title && typeof metadata.title === 'string' && metadata.title.trim().length > 0) {
+                resolvedTitle = metadata.title;
             }
-
-            formattedBots.push({
+            
+            return {
                 id: bot.id,
                 userId: bot.user_id,
                 meetUrl: bot.meet_url,
@@ -869,71 +962,73 @@ app.get('/api/bots', authMiddleware, async (req, res) => {
                 createdAt: bot.created_at,
                 startedAt: bot.started_at,
                 endTime: bot.ended_at
-            });
-        }
+            };
+        });
         
         // Also check runtime directory for historical bots not in DB
+        // Optimize: Only scan if we have less than 100 bots (to avoid performance issues)
+        // and limit to checking metadata files first (faster than full directory scan)
         try {
-            const runtimeDirs = await fs.readdir(RUNTIME_ROOT);
-            const dbBotIds = new Set(formattedBots.map(b => b.id));
-            
-            for (const dirName of runtimeDirs) {
-                // Skip if already in DB or not a valid bot directory
-                if (dbBotIds.has(dirName) || dirName === 'bots') continue;
+            if (formattedBots.length < 100) {
+                const runtimeDirs = await fs.readdir(RUNTIME_ROOT);
+                const dbBotIds = new Set(formattedBots.map(b => b.id));
                 
-                const botDir = path.join(RUNTIME_ROOT, dirName);
-                const stat = await fs.stat(botDir).catch(() => null);
-                
-                if (!stat || !stat.isDirectory()) continue;
-                
-                // Check if this directory has bot data (video, transcript, or summary)
-                const videoDir = path.join(botDir, 'video');
-                const videoPath = await findVideoFile(dirName, videoDir);
-                const metricsPath = path.join(botDir, 'MeetingMetrics.json');
-                const metadataPath = path.join(botDir, 'bot_metadata.json');
-                const hasData = (videoPath !== null) || await fs.pathExists(metricsPath);
-                
-                if (hasData) {
-                    // Check user ownership from metadata file
-                    let metadata = null;
-                    let belongsToUser = false;
-                    
-                    if (await fs.pathExists(metadataPath)) {
-                        try {
-                            metadata = await fs.readJson(metadataPath);
-                            belongsToUser = metadata.userId === req.user.id;
-                        } catch (e) {
-                            console.warn(`Could not parse metadata for ${dirName}`);
-                        }
-                    }
-                    
-                    // Only show historical bots that belong to this user
-                    if (belongsToUser) {
-                        // This is a historical bot - try to restore info from metrics
-                        let metrics = null;
-                        if (await fs.pathExists(metricsPath)) {
-                            try {
-                                metrics = JSON.parse(await fs.readFile(metricsPath, 'utf8'));
-                            } catch (e) {
-                                console.warn(`Could not parse metrics for ${dirName}`);
-                            }
-                        }
+                // Batch process directories in parallel (limit to 10 at a time to avoid memory issues)
+                const batchSize = 10;
+                for (let i = 0; i < runtimeDirs.length; i += batchSize) {
+                    const batch = runtimeDirs.slice(i, i + batchSize);
+                    const batchPromises = batch.map(async (dirName) => {
+                        // Skip if already in DB or not a valid bot directory
+                        if (dbBotIds.has(dirName) || dirName === 'bots') return null;
                         
-                        // Add to bot list as historical/orphaned bot
-                        formattedBots.push({
-                            id: dirName,
-                            userId: req.user.id,
-                            meetUrl: metadata?.meetUrl || metrics?.meetUrl || 'N/A',
-                            title: metadata?.title || `Historical Meeting ${dirName.slice(0, 8)}`,
-                            status: 'completed',
-                            error: null,
-                            createdAt: metadata?.createdAt || metrics?.duration?.startTime || stat.mtime.toISOString(),
-                            startedAt: metrics?.duration?.startTime || stat.mtime.toISOString(),
-                            endTime: metrics?.duration?.endTime || stat.mtime.toISOString(),
-                            isHistorical: true // Flag to indicate this bot was restored from files
-                        });
+                        const botDir = path.join(RUNTIME_ROOT, dirName);
+                        const stat = await fs.stat(botDir).catch(() => null);
                         
-                        console.log(`📂 Found historical bot: ${dirName}`);
+                        if (!stat || !stat.isDirectory()) return null;
+                        
+                        // Check metadata first (faster than checking video files)
+                        const metadataPath = path.join(botDir, 'bot_metadata.json');
+                        const metadata = await getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null);
+                        
+                        // Early exit if metadata doesn't exist or doesn't belong to user
+                        if (!metadata || metadata.userId !== req.user.id) return null;
+                        
+                        // Only check for data if metadata exists and belongs to user
+                        const metricsPath = path.join(botDir, 'MeetingMetrics.json');
+                        const videoDir = path.join(botDir, 'video');
+                        const [videoPath, metrics] = await Promise.allSettled([
+                            findVideoFile(dirName, videoDir),
+                            getCachedFile(metricsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 60000).catch(() => null)
+                        ]);
+                        
+                        const hasData = (videoPath.status === 'fulfilled' && videoPath.value !== null) || 
+                                       (metrics.status === 'fulfilled' && metrics.value !== null);
+                        
+                        if (hasData) {
+                            const metricsData = metrics.status === 'fulfilled' ? metrics.value : null;
+                            
+                            return {
+                                id: dirName,
+                                userId: req.user.id,
+                                meetUrl: metadata.meetUrl || metricsData?.meetUrl || 'N/A',
+                                title: metadata.title || `Historical Meeting ${dirName.slice(0, 8)}`,
+                                status: 'completed',
+                                error: null,
+                                createdAt: metadata.createdAt || metricsData?.duration?.startTime || stat.mtime.toISOString(),
+                                startedAt: metricsData?.duration?.startTime || stat.mtime.toISOString(),
+                                endTime: metricsData?.duration?.endTime || stat.mtime.toISOString(),
+                                isHistorical: true
+                            };
+                        }
+                        return null;
+                    });
+                    
+                    const batchResults = await Promise.allSettled(batchPromises);
+                    for (const result of batchResults) {
+                        if (result.status === 'fulfilled' && result.value) {
+                            formattedBots.push(result.value);
+                            console.log(`📂 Found historical bot: ${result.value.id}`);
+                        }
                     }
                 }
             }
@@ -977,50 +1072,37 @@ app.get('/api/bots/:id', authMiddleware, async (req, res) => {
             // Check if this is a historical bot in runtime directory
             const botDir = path.join(RUNTIME_ROOT, req.params.id);
             if (await fs.pathExists(botDir)) {
-                // Check user ownership from metadata
+                // Check user ownership from metadata - use cached read
                 const metadataPath = path.join(botDir, 'bot_metadata.json');
-                let metadata = null;
-                let belongsToUser = false;
+                const metricsPath = path.join(botDir, 'MeetingMetrics.json');
                 
-                if (await fs.pathExists(metadataPath)) {
-                    try {
-                        metadata = await fs.readJson(metadataPath);
-                        belongsToUser = metadata.userId === req.user.id;
-                    } catch (e) {
-                        console.warn(`Could not parse metadata for ${req.params.id}`);
-                    }
-                }
+                const [metadata, metrics, stat] = await Promise.allSettled([
+                    getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null),
+                    getCachedFile(metricsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 60000).catch(() => null),
+                    fs.stat(botDir)
+                ]);
+                
+                const metadataData = metadata.status === 'fulfilled' ? metadata.value : null;
+                const metricsData = metrics.status === 'fulfilled' ? metrics.value : null;
+                const statData = stat.status === 'fulfilled' ? stat.value : null;
+                const belongsToUser = metadataData && metadataData.userId === req.user.id;
                 
                 if (!belongsToUser) {
                     console.log(`❌ Bot ${req.params.id} does not belong to user ${req.user.id}`);
                     return res.status(403).json({ error: 'Access denied' });
                 }
                 
-                // Try to load metrics
-                const metricsPath = path.join(botDir, 'MeetingMetrics.json');
-                let metrics = null;
-                
-                if (await fs.pathExists(metricsPath)) {
-                    try {
-                        metrics = JSON.parse(await fs.readFile(metricsPath, 'utf8'));
-                    } catch (e) {
-                        console.warn(`Could not parse metrics for ${req.params.id}`);
-                    }
-                }
-                
-                const stat = await fs.stat(botDir);
-                
                 // Create a historical bot entry
                 formattedBot = {
                     id: req.params.id,
                     userId: req.user.id,
-                    meetUrl: metadata?.meetUrl || metrics?.meetUrl || 'N/A',
-                    title: metadata?.title || `Historical Meeting ${req.params.id.slice(0, 8)}`,
+                    meetUrl: metadataData?.meetUrl || metricsData?.meetUrl || 'N/A',
+                    title: metadataData?.title || `Historical Meeting ${req.params.id.slice(0, 8)}`,
                     status: 'completed',
                     error: null,
-                    createdAt: metadata?.createdAt || metrics?.duration?.startTime || stat.mtime.toISOString(),
-                    startedAt: metrics?.duration?.startTime || stat.mtime.toISOString(),
-                    endTime: metrics?.duration?.endTime || stat.mtime.toISOString(),
+                    createdAt: metadataData?.createdAt || metricsData?.duration?.startTime || (statData ? statData.mtime.toISOString() : new Date().toISOString()),
+                    startedAt: metricsData?.duration?.startTime || (statData ? statData.mtime.toISOString() : new Date().toISOString()),
+                    endTime: metricsData?.duration?.endTime || (statData ? statData.mtime.toISOString() : new Date().toISOString()),
                     isHistorical: true
                 };
                 
@@ -1059,13 +1141,13 @@ app.get('/api/bots/:id', authMiddleware, async (req, res) => {
             
             console.log(`📂 Checking RUNTIME_ROOT: ${runtimeDir}`);
             
-            // Generate signed S3 URL if video is in S3
+            // Generate signed S3 URL if video is in S3 - use cached file read
             const metadataPath = path.join(runtimeDir, 'bot_metadata.json');
-            if (fs.existsSync(metadataPath)) {
+            const metadata = await getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null);
+            if (metadata) {
                 try {
-                    const metadata = fs.readJsonSync(metadataPath);
                     // Prefer metadata.title from runtime if available (e.g. AI-generated or extension-provided title)
-                    if (metadata && metadata.title && typeof metadata.title === 'string' && metadata.title.trim().length > 0) {
+                    if (metadata.title && typeof metadata.title === 'string' && metadata.title.trim().length > 0) {
                         formattedBot.title = metadata.title;
                     }
                     if (metadata.s3Key || metadata.s3VideoUrl) {
@@ -1088,9 +1170,18 @@ app.get('/api/bots/:id', authMiddleware, async (req, res) => {
                 }
             }
             
+            // Read all files in parallel for better performance
+            const [transcript, summary, keywords, formattedTranscript, metrics] = await Promise.allSettled([
+                getCachedFile(transcriptPath, fs.readJson, 30000).catch(() => null),
+                getCachedFile(summaryPath, (p) => fs.readFile(p, 'utf8'), 30000).catch(() => null),
+                getCachedFile(path.join(runtimeDir, 'keywords.json'), fs.readJson, 30000).catch(() => null),
+                getCachedFile(formattedTranscriptPath, (p) => fs.readFile(p, 'utf8'), 30000).catch(() => null),
+                getCachedFile(path.join(runtimeDir, 'MeetingMetrics.json'), (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null)
+            ]);
+            
             // Read transcript
-            if (fs.existsSync(transcriptPath)) {
-                formattedBot.transcript = fs.readJsonSync(transcriptPath);
+            if (transcript.status === 'fulfilled' && transcript.value) {
+                formattedBot.transcript = transcript.value;
                 console.log(`✅ Transcript loaded: ${formattedBot.transcript.length} captions`);
             } else {
                 formattedBot.transcript = [];
@@ -1098,8 +1189,8 @@ app.get('/api/bots/:id', authMiddleware, async (req, res) => {
             }
             
             // Read summary
-            if (fs.existsSync(summaryPath)) {
-                formattedBot.summary = fs.readFileSync(summaryPath, 'utf8');
+            if (summary.status === 'fulfilled' && summary.value) {
+                formattedBot.summary = summary.value;
                 console.log(`✅ Summary loaded: ${formattedBot.summary.length} characters`);
             } else {
                 formattedBot.summary = '';
@@ -1107,35 +1198,24 @@ app.get('/api/bots/:id', authMiddleware, async (req, res) => {
             }
             
             // Read OpenAI-generated keywords
-            const keywordsPath = path.join(runtimeDir, 'keywords.json');
-            if (fs.existsSync(keywordsPath)) {
-                try {
-                    formattedBot.keywords = fs.readJsonSync(keywordsPath);
-                    console.log(`✅ Keywords loaded: ${formattedBot.keywords.length} keywords`);
-                } catch (e) {
-                    console.warn(`⚠️  Could not read keywords: ${e.message}`);
-                    formattedBot.keywords = [];
-                }
+            if (keywords.status === 'fulfilled' && keywords.value) {
+                formattedBot.keywords = keywords.value;
+                console.log(`✅ Keywords loaded: ${formattedBot.keywords.length} keywords`);
             } else {
                 formattedBot.keywords = [];
-                console.log(`⚠️  No keywords found at: ${keywordsPath}`);
+                console.log(`⚠️  No keywords found`);
             }
             
             // Read formatted transcript if available
-            if (fs.existsSync(formattedTranscriptPath)) {
-                formattedBot.formattedTranscript = fs.readFileSync(formattedTranscriptPath, 'utf8');
+            if (formattedTranscript.status === 'fulfilled' && formattedTranscript.value) {
+                formattedBot.formattedTranscript = formattedTranscript.value;
                 console.log(`✅ Formatted transcript loaded`);
             }
             
             // Read metrics if available
-            const metricsPath = path.join(runtimeDir, 'MeetingMetrics.json');
-            if (fs.existsSync(metricsPath)) {
-                try {
-                    formattedBot.metrics = JSON.parse(fs.readFileSync(metricsPath, 'utf8'));
-                    console.log(`✅ Metrics loaded`);
-                } catch (e) {
-                    console.warn(`⚠️  Could not parse metrics:`, e.message);
-                }
+            if (metrics.status === 'fulfilled' && metrics.value) {
+                formattedBot.metrics = metrics.value;
+                console.log(`✅ Metrics loaded`);
             }
             
         } catch (e) {
@@ -1172,6 +1252,9 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
             notification_emails = null,  // Optional: comma-separated email addresses (snake_case)
             recording_type = "audio-video",
             meeting_type = "other",
+            // Allow callers to set a per-bot webhook URL when creating the bot
+            webhook_url = null,
+            webhookUrl = null
         } = req.body;
 
         // Get user configuration if fields are not provided
@@ -1217,6 +1300,24 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
         const botId = uuidv4();
         console.log(`🤖 Creating bot ${botId} for user ${req.user.id}: ${meeting_url}`);
         
+        // STEP 1: Force cleanup any existing processes for this botId (if somehow it exists)
+        // This ensures clean state before creating new bot
+        await forceCleanupBotProcesses(botId);
+        
+        // STEP 2: Check if bot already exists in activeBots (shouldn't happen, but safety check)
+        if (activeBots.has(botId)) {
+            console.warn(`⚠️  Bot ${botId} already exists in activeBots, cleaning up...`);
+            const existingBotData = activeBots.get(botId);
+            try {
+                if (existingBotData.bot && typeof existingBotData.bot.leaveMeet === 'function') {
+                    await existingBotData.bot.leaveMeet().catch(() => {});
+                }
+                activeBots.delete(botId);
+            } catch (e) {
+                console.error(`❌ Error cleaning up existing bot ${botId}:`, e);
+            }
+        }
+        
         // Save bot to database (user is authenticated at this point)
         botOps.create(botId, req.user.id, meeting_url, finalBotName);
         
@@ -1225,6 +1326,7 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
             const botDir = path.join(RUNTIME_ROOT, botId);
             await fs.ensureDir(botDir);
             const metadataPath = path.join(botDir, 'bot_metadata.json');
+
             await fs.writeJson(metadataPath, {
                 botId,
                 userId: req.user.id, // User is authenticated, so this is always available
@@ -1235,8 +1337,8 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 meetingType: meeting_type,
                 summaryTemplate: finalSummaryTemplate,
                 maxRecordingTime: finalMaxRecordingTime,
-                // Include user's configured webhook URL (if any) so runtime metadata reflects it
-                webhookUrl: userConfig?.webhook_url || null,
+                // Include per-bot webhook URL from request, or fall back to user config / env
+                webhookUrl: userConfig?.webhook_url || process.env.WEBHOOK_URL || null,
                 emailRecipients: finalEmailRecipients,
                 createdAt: new Date().toISOString()
             });
@@ -1281,8 +1383,8 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 try {
                     const botDir = path.join(RUNTIME_ROOT, botId);
                     const metadataPath = path.join(botDir, 'bot_metadata.json');
-                    if (await fs.pathExists(metadataPath)) {
-                        const metadata = await fs.readJson(metadataPath);
+                    const metadata = await getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null);
+                    if (metadata) {
                         summaryTemplateToUse = metadata.summaryTemplate || null;
                         meetingTypeToUse = metadata.meetingType || null;
                     }
@@ -1310,6 +1412,8 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                         const metadata = await fs.readJson(metadataPath);
                         metadata.title = meetingTitle;
                         await fs.writeJson(metadataPath, metadata);
+                        // Invalidate cache after update
+                        invalidateCache(metadataPath);
                         console.log(`📝 Bot ${botId}: updated metadata with meeting title: ${meetingTitle}`);
                     }
                     
@@ -1332,9 +1436,9 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 console.log(`🧾 Bot ${botId}: configured botData.emailRecipients =`, botData?.emailRecipients);
                 try {
                     const metadataPath = path.join(RUNTIME_ROOT, botId, 'bot_metadata.json');
-                    if (await fs.pathExists(metadataPath)) {
-                        const metadata = await fs.readJson(metadataPath).catch(() => null);
-                        console.log(`🧾 Bot ${botId}: metadata.emailRecipients =`, metadata && metadata.emailRecipients);
+                    const metadata = await getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null);
+                    if (metadata) {
+                        console.log(`🧾 Bot ${botId}: metadata.emailRecipients =`, metadata.emailRecipients);
                     }
                 } catch (metaErr) {
                     console.warn(`⚠️ Bot ${botId}: could not read metadata for email debug:`, metaErr && metaErr.message ? metaErr.message : metaErr);
@@ -1400,21 +1504,19 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
              try {
                 const bot = botOps.findById(botId);
                 if (bot && bot.user_id) {
-                    // Try to get recording duration from metrics
+                    // Try to get recording duration from metrics - use cached read
                     let recordingDurationMinutes = 0;
                     const botDir = path.join(RUNTIME_ROOT, botId);
                     const metricsPath = path.join(botDir, 'MeetingMetrics.json');
                     
-                    if (await fs.pathExists(metricsPath)) {
-                        try {
-                            const metrics = await fs.readJson(metricsPath);
-                            if (metrics.duration && metrics.duration.totalMinutes) {
-                                recordingDurationMinutes = Math.ceil(metrics.duration.totalMinutes); // Round up to nearest minute
-                                console.log(`📊 Bot ${botId}: recording duration from metrics: ${recordingDurationMinutes} minutes`);
-                            }
-                        } catch (e) {
-                            console.warn(`⚠️  Could not read metrics for duration: ${e.message}`);
+                    try {
+                        const metrics = await getCachedFile(metricsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 60000).catch(() => null);
+                        if (metrics && metrics.duration && metrics.duration.totalMinutes) {
+                            recordingDurationMinutes = Math.ceil(metrics.duration.totalMinutes); // Round up to nearest minute
+                            console.log(`📊 Bot ${botId}: recording duration from metrics: ${recordingDurationMinutes} minutes`);
                         }
+                    } catch (e) {
+                        console.warn(`⚠️  Could not read metrics for duration: ${e.message}`);
                     }
                     
                     // Fallback: calculate from bot stats if metrics not available
@@ -1463,14 +1565,14 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                 if (botInstance && typeof botInstance.getStats === 'function') {
                     const stats = botInstance.getStats();
                     let recordingFile = stats.recordingFile || stats.recordingPath;
-                    if (recordingFile && fs.existsSync(recordingFile)) {
+                    if (recordingFile && await fs.pathExists(recordingFile)) {
                         // Compress video to reduce file size (enabled by default for optimization)
                         // Can be disabled by setting ENABLE_VIDEO_COMPRESSION=false for maximum speed
                         const enableCompression = process.env.ENABLE_VIDEO_COMPRESSION !== 'false';
                         
                         // Fast mode: skip compression for files under 100MB for maximum speed
                         const fastMode = process.env.FAST_VIDEO_MODE === 'true';
-                        const stats = fs.statSync(recordingFile);
+                        const stats = await fs.stat(recordingFile);
                         const sizeMB = stats.size / 1024 / 1024;
                         // if (enableCompression && fastMode) {
                         //     try {
@@ -1520,9 +1622,9 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                                     const ext = path.extname(recordingFile || '').toLowerCase();
                                     if (ext === '.webm') {
                                         const remuxedPath = recordingFile.replace(/\.webm$/i, '.mp4');
-                                        if (!fs.existsSync(remuxedPath)) {
+                                            if (!(await fs.pathExists(remuxedPath))) {
                                             console.log(`🔁 Bot ${botId}: remuxing ${recordingFile} -> ${remuxedPath}`);
-                                            await remuxWebmToMp4(recordingFile, remuxedPath);
+                                            await remuxWebmToMp4(recordingFile, remuxedPath, botData?.webhookUrl || null);
                                             console.log(`✅ Bot ${botId}: remuxed to mp4: ${remuxedPath}`);
                                         } else {
                                             console.log(`ℹ️ Bot ${botId}: remuxed file already exists: ${remuxedPath}`);
@@ -1551,6 +1653,8 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                                         metadata.s3UploadedAt = new Date().toISOString();
                                         metadata.s3FileSize = uploadResult.size;
                                         await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+                                        // Invalidate cache after update
+                                        invalidateCache(metadataPath);
                                     }
                                     // Mark cache as S3 so future range requests short-circuit
                                     try { recordingStorageCache.set(recordingId, { where: 's3', ts: Date.now() }); } catch (e) {}
@@ -1561,7 +1665,7 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                                             await fs.remove(fileToUpload);
                                             console.log(`🗑️  Bot ${botId}: uploaded file deleted after S3 upload: ${fileToUpload}`);
                                             // Also consider deleting original .webm if a remuxed .mp4 was created
-                                            if (fileToUpload !== recordingFile && fs.existsSync(recordingFile)) {
+                                            if (fileToUpload !== recordingFile && await fs.pathExists(recordingFile)) {
                                                 try { await fs.remove(recordingFile); console.log(`🗑️  Bot ${botId}: original file deleted: ${recordingFile}`); } catch (e) {}
                                             }
                                         } catch (e) {
@@ -1579,6 +1683,8 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
                                         metadata.s3UploadError = uploadResult.error;
                                         metadata.s3UploadAttemptedAt = new Date().toISOString();
                                         await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+                                        // Invalidate cache after update
+                                        invalidateCache(metadataPath);
                                     }
                                 }
                             } else {
@@ -1597,11 +1703,45 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
             // Remove bot instance to free memory and cleanup references
             if (activeBots.has(botId)) {
                 try {
-                    // Clear bot instance reference
-                    if (botData && botData.bot) {
-                        botData.bot = null;
+                    // Clear bot instance reference and all associated data
+                    if (botData) {
+                        if (botData.bot) {
+                            // Ensure browser is closed before clearing reference
+                            try {
+                                if (botData.bot.browser && botData.bot.browser.isConnected()) {
+                                    await botData.bot.browser.close().catch(() => {});
+                                }
+                            } catch (e) {
+                                // Browser might already be closed
+                            }
+                            // Clear bot instance
+                            botData.bot = null;
+                        }
+                        // Clear timers
+                        if (botData.ttlTimer) {
+                            clearTimeout(botData.ttlTimer);
+                            botData.ttlTimer = null;
+                        }
+                        if (botData.maxRecordingTimer) {
+                            clearTimeout(botData.maxRecordingTimer);
+                            botData.maxRecordingTimer = null;
+                        }
+                        // Clear all references
+                        botData.meetingUrl = null;
+                        botData.emailRecipients = null;
+                        botData.botName = null;
+                        botData.webhookUrl = null;
                     }
                     activeBots.delete(botId);
+                    
+                    // Force garbage collection hint (if available)
+                    if (global.gc) {
+                        global.gc();
+                    }
+                    
+                    // Additional cleanup: wait a bit for processes to fully terminate
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    
                     console.log(`🗑️  Bot ${botId} removed from active list`);
                 } catch (e) {
                     console.error(`❌ Error removing bot ${botId} from active list:`, e);
@@ -1616,17 +1756,34 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
             console.log(`✅ Bot ${botId} cleanup completed`);
         };
 
-        // Create bot
-    const bot = new Bot(botId, finalBotName, onLeaveCallback, caption_language, finalEmailRecipients, recording_type, finalMaxRecordingTime, finalBotLogoUrl);
-        // If the user has configured a webhook URL in their settings, attach it to the bot instance
+        const finalWebhook = userConfig?.webhook_url || process.env.WEBHOOK_URL || null;
+
+
+        // Create bot with error handling wrapper
+        let bot;
         try {
-            const configuredWebhook = userConfig?.webhook_url || process.env.WEBHOOK_URL || null;
-            bot.webhookUrl = configuredWebhook;
-            if (configuredWebhook) console.log(`ℹ️ Bot ${botId}: using user-configured webhook: ${configuredWebhook}`);
+            bot = new Bot(botId, finalBotName, onLeaveCallback, caption_language, finalEmailRecipients, recording_type, finalMaxRecordingTime, finalBotLogoUrl, finalWebhook);
         } catch (e) {
-            console.warn(`⚠️ Bot ${botId}: could not set configured webhook URL: ${e.message}`);
+            console.error(`❌ Failed to create bot instance ${botId}:`, e);
+            botOps.updateStatus(botId, 'failed', `Bot creation failed: ${e.message}`);
+            return res.status(500).json({ 
+                error: 'Failed to create bot instance',
+                bot_id: botId,
+                details: e.message
+            });
         }
         
+        // Determine the webhook URL for this bot (priority: request body -> user config -> env)
+        try {
+            bot.webhookUrl = finalWebhook;
+            if (finalWebhook) console.log(`ℹ️ Bot ${botId}: using webhook URL: ${finalWebhook}`);
+        } catch (e) {
+            console.warn(`⚠️ Bot ${botId}: could not set webhook URL: ${e.message}`);
+        }
+
+        // Note: Crash recovery is handled in bot.js via browser.on('disconnected')
+        // The forceCleanupBotProcesses will be called automatically on crashes
+
         // Store bot data
         const botData = {
             botId,
@@ -1634,6 +1791,7 @@ app.post('/v1/bots', authMiddleware, async (req, res) => {
             userId: req.user.id, // Store userId since authentication is required
             meetingUrl: meeting_url,
             botName: finalBotName,
+            webhookUrl: bot.webhookUrl || null,
             captionLanguage: caption_language,
             recordingType: recording_type,
             meetingType: meeting_type,
@@ -2372,63 +2530,67 @@ app.get('/api/share/:shareToken', async (req, res) => {
         const botDir = path.join(RUNTIME_ROOT, botId);
         
         // Check if bot directory exists
-        if (!fs.existsSync(botDir)) {
+        if (!(await fs.pathExists(botDir))) {
             return res.status(404).json({
                 success: false,
                 error: 'Meeting not found'
             });
         }
         
-        // Load bot data
+        // Load bot data - use cached reads and parallel loading
         const metadataPath = path.join(botDir, 'bot_metadata.json');
         const summaryPath = path.join(botDir, 'summary.txt');
         const captionsPath = path.join(botDir, 'transcripts', 'captions.json');
         const metricsPath = path.join(botDir, 'MeetingMetrics.json');
         
-        // Generate signed S3 URL if video is in S3
+        // Generate signed S3 URL if video is in S3 - use cached read
         let s3VideoUrl = null;
-        if (fs.existsSync(metadataPath)) {
+        const metadata = await getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null);
+        if (metadata && (metadata.s3Key || metadata.s3VideoUrl)) {
             try {
-                const metadata = fs.readJsonSync(metadataPath);
-                if (metadata.s3Key || metadata.s3VideoUrl) {
-                    // Generate signed URL for secure access (expires in 4 hours)
-                    // URL is cached to avoid regenerating on every request
-                    const { getS3VideoUrl } = require('./utils/s3-upload');
-                    s3VideoUrl = await getS3VideoUrl(botId, null, 14400); // 4 hours
-                    
-                    if (s3VideoUrl) {
-                        console.log(`🔐 Generated signed S3 URL for shared bot ${botId}`);
-                    } else {
-                        console.warn(`⚠️  Failed to generate signed URL for shared bot ${botId}`);
-                    }
+                // Generate signed URL for secure access (expires in 4 hours)
+                // URL is cached to avoid regenerating on every request
+                const { getS3VideoUrl } = require('./utils/s3-upload');
+                s3VideoUrl = await getS3VideoUrl(botId, null, 14400); // 4 hours
+                
+                if (s3VideoUrl) {
+                    console.log(`🔐 Generated signed S3 URL for shared bot ${botId}`);
+                } else {
+                    console.warn(`⚠️  Failed to generate signed URL for shared bot ${botId}`);
                 }
             } catch (e) {
-                console.warn('Could not parse bot_metadata.json');
+                console.warn('Could not generate S3 URL');
             }
         }
         
+        // Load all files in parallel for better performance
+        const [summaryResult, metricsResult] = await Promise.allSettled([
+            getCachedFile(summaryPath, (p) => fs.readFile(p, 'utf8'), 30000).catch(() => null),
+            getCachedFile(metricsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null)
+        ]);
+        
         let summary = 'No summary available';
-        let transcript = [];
         let metrics = null;
         
         // Load summary
-        if (fs.existsSync(summaryPath)) {
-            summary = await fs.readFile(summaryPath, 'utf8');
+        if (summaryResult.status === 'fulfilled' && summaryResult.value) {
+            summary = summaryResult.value;
         }
         
         // Load metrics first to get meeting start time
-        if (fs.existsSync(metricsPath)) {
-            metrics = JSON.parse(await fs.readFile(metricsPath, 'utf8'));
+        if (metricsResult.status === 'fulfilled' && metricsResult.value) {
+            metrics = metricsResult.value;
         }
         
-        // Load captions and build transcript (after loading metrics)
+        // Load captions and build transcript (after loading metrics) - use cached read
         let rawCaptions = [];
+        let transcript = [];
         console.log(`📄 Looking for captions at: ${captionsPath}`);
         
-        if (await fs.pathExists(captionsPath)) {
+        const captionsData = await getCachedFile(captionsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null);
+        if (captionsData) {
             try {
-                const captionsContent = await fs.readFile(captionsPath, 'utf8');
-                rawCaptions = JSON.parse(captionsContent);
+                rawCaptions = captionsData;
                 console.log(`✅ Loaded ${rawCaptions?.length || 0} raw captions from file`);
                 
                 // Build utterances from captions
@@ -2442,7 +2604,7 @@ app.get('/api/share/:shareToken', async (req, res) => {
                     console.warn(`⚠️  Captions file exists but is empty or invalid`);
                 }
             } catch (error) {
-                console.error(`❌ Error reading/parsing captions file:`, error.message);
+                console.error(`❌ Error parsing captions:`, error.message);
             }
         } else {
             console.warn(`⚠️  Captions file not found at: ${captionsPath}`);
@@ -2455,11 +2617,11 @@ app.get('/api/share/:shareToken', async (req, res) => {
             ];
             
             for (const altPath of altPaths) {
-                if (await fs.pathExists(altPath)) {
+                const altCaptions = await getCachedFile(altPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null);
+                if (altCaptions) {
                     console.log(`📄 Trying alternative path: ${altPath}`);
                     try {
-                        const captionsContent = await fs.readFile(altPath, 'utf8');
-                        rawCaptions = JSON.parse(captionsContent);
+                        rawCaptions = altCaptions;
                         console.log(`✅ Loaded ${rawCaptions?.length || 0} raw captions from alternative path`);
                         
                         if (rawCaptions && rawCaptions.length > 0) {
@@ -2476,27 +2638,19 @@ app.get('/api/share/:shareToken', async (req, res) => {
             }
         }
         
-        // Load OpenAI-generated keywords
+        // Load OpenAI-generated keywords and title in parallel
         const keywordsPath = path.join(botDir, 'keywords.json');
+        const [keywordsResult] = await Promise.allSettled([
+            getCachedFile(keywordsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null)
+        ]);
+        
         let keywords = [];
-        if (fs.existsSync(keywordsPath)) {
-            try {
-                keywords = JSON.parse(await fs.readFile(keywordsPath, 'utf8'));
-            } catch (e) {
-                console.warn(`⚠️  Could not read keywords: ${e.message}`);
-            }
+        if (keywordsResult.status === 'fulfilled' && keywordsResult.value) {
+            keywords = keywordsResult.value;
         }
         
-        // Load metadata to get title
-        let title = null;
-        if (fs.existsSync(metadataPath)) {
-            try {
-                const metadata = fs.readJsonSync(metadataPath);
-                title = metadata.title || null;
-            } catch (e) {
-                console.warn('Could not parse bot_metadata.json for title');
-            }
-        }
+        // Load metadata to get title (already loaded above)
+        const title = metadata?.title || null;
         
         // Build bot info
         const bot = {
@@ -2536,7 +2690,7 @@ app.get('/v1/bots/:botId/export/pdf', async (req, res) => {
         const { botId } = req.params;
         
         const botDir = path.join(RUNTIME_ROOT, botId);
-        if (!fs.existsSync(botDir)) {
+        if (!(await fs.pathExists(botDir))) {
             return res.status(404).json({ error: 'Bot not found' });
         }
         

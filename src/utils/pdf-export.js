@@ -23,7 +23,8 @@ async function generateMeetingPDF(options) {
         summary = '',
         metrics = null,
         meetUrl = '',
-        createdAt = null
+        createdAt = null,
+        logoBase64 = '' // Accept logo as parameter
     } = options;
 
     console.log(`📄 Generating PDF for bot ${botId}...`);
@@ -35,7 +36,8 @@ async function generateMeetingPDF(options) {
         summary,
         metrics,
         meetUrl,
-        createdAt
+        createdAt,
+        logoBase64 // Pass logo to HTML builder
     });
 
     // Launch headless browser
@@ -81,7 +83,7 @@ async function generateMeetingPDF(options) {
  * Build HTML for PDF
  */
 function buildPDFHTML(data) {
-    const { title, transcript, summary, metrics, meetUrl, createdAt } = data;
+    const { title, transcript, summary, metrics, meetUrl, createdAt, logoBase64 = '' } = data;
 
     // Format date
     const dateStr = createdAt ? formatDateLong(new Date(createdAt)) : 'N/A';
@@ -101,12 +103,16 @@ function buildPDFHTML(data) {
         formattedSummary = `<p>${formattedSummary}</p>`;
     }
 
-    // Build metrics section
-    let logoBase64 = fs.readFileSync(path.join(__dirname, '../../', 'public', 'isotipo.png'), 'base64');    let metricsHTML = '';
+    // Build metrics section - use logoBase64 passed from caller
+    let metricsHTML = '';
     if (metrics && metrics.duration) {
+        // Only show logo if we have base64 data
+        // Determine MIME type - default to PNG, but check file extension if available
+        const logoMimeType = logoBase64 ? 'image/png' : ''; // PNG is default for isotipo.png
+        const logoImg = logoBase64 ? `<img src="data:${logoMimeType};base64,${logoBase64}" alt="CXFlow Logo" class="metrics-logo">` : '';
         metricsHTML = `
             <div class="metrics-grid">
-                <img src="data:image/png;base64,${logoBase64}" alt="CXFlow Logo" class="metrics-logo">
+                ${logoImg}
                 <div class="metrics-website">www.cxflow.io</div>
                 <div class="metric-card">
                     <div class="metric-label">Duration</div>
@@ -407,7 +413,7 @@ function buildPDFHTML(data) {
     </div>
     ` : ''}
     
-    <div class="section">
+    <div class="section" style="page-break-before: always;">
         <h2 class="section-title">Summary</h2>
         <div class="summary-content">
             ${formattedSummary}
@@ -457,27 +463,69 @@ async function generateBotPDF(botId, runtimeRoot) {
     let metrics = null;
     let metadata = null;
     
-    // Load metadata to get meeting title
-    if (fs.existsSync(metadataPath)) {
+    // Load all files in parallel for better performance
+    const { getCachedFile } = require('./file-cache');
+    
+    // Load logo BEFORE building HTML (so it can be included)
+    // Try multiple possible logo paths to handle different deployment scenarios
+    const possibleLogoPaths = [
+        path.join(__dirname, '../../', 'public', 'isotipo.png'), // From src/utils -> root/public
+        path.join(process.cwd(), 'public', 'isotipo.png'), // From current working directory
+        path.resolve(__dirname, '../../', 'public', 'isotipo.png'), // Absolute path
+    ];
+    
+    let logoBase64 = '';
+    let logoPath = null;
+    
+    for (const testPath of possibleLogoPaths) {
         try {
-            metadata = await fs.readJson(metadataPath);
+            const resolvedPath = path.resolve(testPath);
+            if (await fs.pathExists(resolvedPath)) {
+                const logoBuffer = await fs.readFile(resolvedPath);
+                logoBase64 = logoBuffer.toString('base64');
+                logoPath = resolvedPath;
+                console.log(`✅ Logo loaded for PDF: ${resolvedPath} (${(logoBuffer.length / 1024).toFixed(2)} KB)`);
+                break;
+            }
+        } catch (e) {
+            // Try next path
+            continue;
+        }
+    }
+    
+    if (!logoBase64) {
+        console.warn(`⚠️  Logo file not found. Tried paths: ${possibleLogoPaths.map(p => path.resolve(p)).join(', ')}`);
+        console.warn(`⚠️  Current working directory: ${process.cwd()}`);
+        console.warn(`⚠️  __dirname: ${__dirname}`);
+    }
+    
+    const [metadataResult, summaryResult, captionsResult, metricsResult] = await Promise.allSettled([
+        getCachedFile(metadataPath, fs.readJson, 60000).catch(() => null),
+        getCachedFile(summaryPath, (p) => fs.readFile(p, 'utf8'), 30000).catch(() => null),
+        getCachedFile(captionsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null),
+        getCachedFile(metricsPath, (p) => fs.readFile(p, 'utf8').then(d => JSON.parse(d)), 30000).catch(() => null)
+    ]);
+    
+    if (metadataResult.status === 'fulfilled' && metadataResult.value) {
+        try {
+            metadata = metadataResult.value;
         } catch (e) {
             console.warn(`⚠️  Could not parse metadata for ${botId}:`, e.message);
         }
     }
     
-    if (fs.existsSync(summaryPath)) {
-        summary = await fs.readFile(summaryPath, 'utf8');
+    if (summaryResult.status === 'fulfilled' && summaryResult.value) {
+        summary = summaryResult.value;
     }
     
-    if (fs.existsSync(captionsPath)) {
-        const captions = JSON.parse(await fs.readFile(captionsPath, 'utf8'));
+    if (captionsResult.status === 'fulfilled' && captionsResult.value) {
+        const captions = captionsResult.value;
         const { buildUtterances } = require('../openai-service');
         transcript = buildUtterances(captions);
     }
     
-    if (fs.existsSync(metricsPath)) {
-        metrics = JSON.parse(await fs.readFile(metricsPath, 'utf8'));
+    if (metricsResult.status === 'fulfilled' && metricsResult.value) {
+        metrics = metricsResult.value;
     }
     
     // Determine meeting title: prefer metadata title, fallback to default format
@@ -489,7 +537,7 @@ async function generateBotPDF(botId, runtimeRoot) {
     // Get meetUrl from metadata or metrics
     const meetUrl = metadata?.meetUrl || metrics?.meetUrl || '';
     
-    // Generate PDF
+    // Generate PDF (pass logoBase64 so it's included in HTML)
     const pdfBuffer = await generateMeetingPDF({
         botId,
         title: meetingTitle,
@@ -497,7 +545,8 @@ async function generateBotPDF(botId, runtimeRoot) {
         summary,
         metrics,
         meetUrl: meetUrl,
-        createdAt: metadata?.createdAt || metrics?.duration?.startTime
+        createdAt: metadata?.createdAt || metrics?.duration?.startTime,
+        logoBase64 // Pass the loaded logo
     });
     
     // Sanitize title for filename (remove invalid characters)

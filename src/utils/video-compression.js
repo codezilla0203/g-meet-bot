@@ -42,14 +42,14 @@ async function compressVideo(inputPath, outputPath, options = {}) {
   console.log(`🗜️  Compressing video: ${inputPath}`);
   console.log(`   targetHeight=${targetHeight}, crf=${crf}, preset=${preset}, codec=${codec}`);
 
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(inputPath)) {
+  return new Promise(async (resolve, reject) => {
+    if (!(await fs.pathExists(inputPath))) {
       // Notify webhook and reject
       try { sendWebhook('error.occurred', { code: 'video_compression_error', message: 'Input file not found', details: { inputPath } }); } catch (e) {}
       return reject(new Error(`Input file not found: ${inputPath}`));
     }
 
-    const inputStats = fs.statSync(inputPath);
+    const inputStats = await fs.stat(inputPath);
     const inputSizeMB = (inputStats.size / 1024 / 1024).toFixed(2);
 
     const args = [];
@@ -125,12 +125,12 @@ async function compressVideo(inputPath, outputPath, options = {}) {
       }
     });
 
-    ffmpeg.on('close', (code) => {
+    ffmpeg.on('close', async (code) => {
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
       if (code === 0) {
-        if (fs.existsSync(outputPath)) {
-          const outputStats = fs.statSync(outputPath);
+        if (await fs.pathExists(outputPath)) {
+          const outputStats = await fs.stat(outputPath);
           const outputSizeMB = (outputStats.size / 1024 / 1024).toFixed(2);
           const reduction = ((1 - outputStats.size / inputStats.size) * 100).toFixed(1);
 
@@ -139,7 +139,7 @@ async function compressVideo(inputPath, outputPath, options = {}) {
           console.log(`   Reduction: ${reduction}%`);
 
           if (removeOriginal) {
-            fs.removeSync(inputPath);
+            await fs.remove(inputPath);
             console.log('   🗑️  Original file removed');
           }
 
@@ -194,9 +194,9 @@ async function compressVideoInPlace(filePath, options = {}) {
     const finalPath = path.join(pathObj.dir, pathObj.name + extension);
 
     // Remove original file
-    fs.removeSync(filePath);
+    await fs.remove(filePath);
     // Rename compressed temp to final path
-    fs.renameSync(tempPath, finalPath);
+    await fs.rename(tempPath, finalPath);
 
     console.log('✅ Original file replaced with compressed version');
 
@@ -205,8 +205,8 @@ async function compressVideoInPlace(filePath, options = {}) {
       outputPath: finalPath
     };
   } catch (error) {
-    if (fs.existsSync(tempPath)) {
-      fs.removeSync(tempPath);
+    if (await fs.pathExists(tempPath)) {
+      await fs.remove(tempPath);
     }
     try { sendWebhook('error.occurred', { code: 'video_compression_error', message: 'compressVideoInPlace failed', details: { filePath, error: error && error.message ? error.message : String(error) } }); } catch (e) {}
     throw error;
@@ -286,7 +286,7 @@ async function getVideoInfo(filePath) {
  * @returns {Promise<{shouldCompress:boolean, reason:string, settings:Object}>}
  */
 async function getCompressionRecommendations(filePath) {
-  const stats = fs.statSync(filePath);
+  const stats = await fs.stat(filePath);
   const sizeMB = stats.size / 1024 / 1024;
 
   const recommendations = {

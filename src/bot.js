@@ -31,7 +31,7 @@ const GOOGLE_NO_RESPONSE = 'No one responded to your request to join the call';
  * - High-quality recording output
  */
 class Bot {
-    constructor(id, botName = "CXFlow Meeting Bot", onLeaveCallback = null, captionLanguage = "es", emailRecipients = null, recordingType = "audio-video", maxRecordingDuration = null, botLogoUrl = null) {
+    constructor(id, botName = "CXFlow Meeting Bot", onLeaveCallback = null, captionLanguage = "es", emailRecipients = null, recordingType = "audio-video", maxRecordingDuration = null, botLogoUrl = null, webhookURL = null) {
         this.id = id;
         this.botName = botName;
         this.onLeave = onLeaveCallback;
@@ -106,7 +106,7 @@ class Bot {
         // Track participant join times and temporary absence counts for left detection
         this.participantJoinTimes = {}; // name -> timestampMs
         this.participantAbsenceCounts = {}; // name -> consecutive missing checks
-
+        this.webhookUrl = webhookURL || null;
         // Meeting metrics tracking
         this.meetingStartTime = null;
         this.meetingEndTime = null;
@@ -152,7 +152,7 @@ class Bot {
             console.error(`[${this.id}] 🔥 Emitting error webhook: ${payload.code} - ${payload.message}`);
 
             // Best-effort send; do not throw on failure
-            await sendWebhook('error.occurred', payload);
+            await sendWebhook('error.occurred', payload, this.webhookUrl || null);
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ emitError failed: ${e && e.message ? e.message : e}`);
         }
@@ -356,7 +356,7 @@ class Bot {
         
         // Maximize window and force Tiled layout before recording
         try {
-            await this.page.setViewport({ width: 1920, height: 1080 });
+            await this.page.setViewport({ width: parseInt(process.env.BOT_VIEWPORT_WIDTH) || 1280, height: parseInt(process.env.BOT_VIEWPORT_HEIGHT) || 720 });
             await this.page.evaluate(() => {
                 window.moveTo(0, 0);
                 window.resizeTo(screen.availWidth, screen.availHeight);
@@ -388,13 +388,13 @@ class Bot {
             // Use repo timezone helper so joined_at is in configured Mexico timezone (formatted)
             const ts = getCurrentTimestamp();
             const joinedAt = ts.formatted; // e.g. '2025-11-27 10:30:45' in TIMEZONE
-            // Send asynchronously but await to log errors
+            // Send asynchronously but await to log errors. Pass per-bot webhook override when available.
             await sendWebhook('meeting.bot_joined', {
                 meeting_id: meetingId,
                 meeting_url: this.meetUrl,
                 joined_at: joinedAt,
                 timezone: ts.timezone
-            });
+            }, this.webhookUrl || null);
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ Error sending meeting.bot_joined webhook: ${e && e.message ? e.message : e}`);
         }
@@ -440,13 +440,58 @@ class Bot {
         // - We explicitly ignore that default arg and add explicit audio/MediaRecorder flags,
         //   mirroring the proven configuration from `meeting-bot` so that tab audio
         //   (other participants) is actually present in the captured stream.
+        // Optimize viewport size for lower memory usage (1280x720 instead of 1920x1080)
+        // This reduces memory by ~40% while maintaining good quality
+        const viewportWidth = parseInt(process.env.BOT_VIEWPORT_WIDTH) || 1280;
+        const viewportHeight = parseInt(process.env.BOT_VIEWPORT_HEIGHT) || 720;
+        
+        // Memory limit per bot (in MB) - configurable via env
+        const memoryLimitMB = parseInt(process.env.BOT_MEMORY_LIMIT_MB) || 512;
+        
         this.browser = await puppeteer.launch({
             headless: headlessMode ? 'new' : false,
-            defaultViewport: { width: 1920, height: 1080 },
+            defaultViewport: { width: viewportWidth, height: viewportHeight },
             ignoreDefaultArgs: ['--mute-audio'],
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
+                // Memory and CPU optimizations
+                `--memory-pressure-off`, // Disable memory pressure notifications
+                `--max-old-space-size=${memoryLimitMB}`, // Limit V8 heap size
+                `--js-flags=--max-old-space-size=${memoryLimitMB}`, // Additional JS heap limit
+                // Reduce GPU usage (disable hardware acceleration in headless mode only)
+                ...(headlessMode ? [
+                    '--disable-gpu', // Disable GPU for headless (saves memory)
+                    '--disable-software-rasterizer',
+                ] : []),
+                '--disable-dev-shm-usage', // Overcome limited resource problems
+                // Disable unnecessary features to save memory
+                '--disable-extensions-file-access-check',
+                '--disable-extensions-http-throttling',
+                '--disable-component-extensions-with-background-pages',
+                '--disable-default-apps',
+                '--disable-sync', // Disable Chrome sync
+                '--disable-translate', // Disable translation service
+                '--disable-background-networking', // Disable background networking
+                '--disable-background-downloads',
+                '--disable-breakpad', // Disable crash reporting
+                '--disable-client-side-phishing-detection',
+                '--disable-component-update',
+                '--disable-domain-reliability',
+                '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
+                '--disable-hang-monitor',
+                '--disable-ipc-flooding-protection',
+                '--disable-notifications',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-renderer-backgrounding',
+                '--disable-speech-api',
+                '--disable-web-resources',
+                '--metrics-recording-only',
+                '--no-crash-upload',
+                '--no-pings',
+                '--no-zygote', // Disable zygote process (saves memory per bot)
+                // Essential features for recording
                 '--autoplay-policy=no-user-gesture-required',
                 '--enable-features=WebCodecs,MediaRecorder',
                 '--enable-audio-output',
@@ -458,29 +503,35 @@ class Bot {
                 '--auto-select-desktop-capture-source=Meet',
                 // Prevent background throttling so recording and captions keep running without focus
                 '--disable-background-timer-throttling',
-                '--disable-renderer-backgrounding',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-features=CalculateNativeWinOcclusion',
                 '--disable-background-media-suspend',
                 '--no-first-run',
                 '--no-default-browser-check',
                 '--disable-features=BackForwardCache,OptimizationHints',
-                '--window-size=1920,1080',
-                '--start-maximized',
+                `--window-size=${viewportWidth},${viewportHeight}`,
                 // Load custom transcript extension instead of using caption collector
                 `--disable-extensions-except=${EXTENSION_PATH}`,
                 `--load-extension=${EXTENSION_PATH}`,
                 `--allow-file-access-from-files`,
-                `--disable-features=IsolateOrigins,site-per-process`,
                 `--allow-insecure-localhost`,
-                // `--use-fake-ui-for-media-stream`
+                // Process limits (Linux only, optional via env)
+                // ...(process.platform === 'linux' && process.env.BOT_SINGLE_PROCESS === 'true' ? [
+                //     '--single-process', // Run in single process mode (saves memory, but less stable)
+                // ] : []),
             ]
         });
 
         // Handle browser disconnection
         this.browser.on('disconnected', () => {
-            console.warn(`[${this.id}] ⚠️ Browser disconnected unexpectedly`);
-            try { this.emitError && this.emitError('browser_disconnected', 'Browser disconnected unexpectedly'); } catch (e) {}
+            const isSingleProcess = process.platform === 'linux' && process.env.BOT_SINGLE_PROCESS === 'true';
+            console.warn(`[${this.id}] ⚠️ Browser disconnected unexpectedly${isSingleProcess ? ' (single-process mode - may be less stable)' : ''}`);
+            try { 
+                this.emitError && this.emitError('browser_disconnected', 
+                    `Browser disconnected unexpectedly${isSingleProcess ? ' (single-process mode)' : ''}`, 
+                    { singleProcessMode: isSingleProcess }
+                ); 
+            } catch (e) {}
             
             // Immediately stop all intervals to prevent errors
             try {
@@ -648,8 +699,8 @@ class Bot {
             if (pid && Number.isInteger(pid)) {
                 this.browserPid = pid;
                 // Only create botsPidDir when actually writing PID file
-                fs.ensureDirSync(this.botsPidDir);
-                fs.writeFileSync(this.browserPidFile, String(pid));
+                await fs.ensureDir(this.botsPidDir);
+                await fs.writeFile(this.browserPidFile, String(pid));
             }
         } catch {}
         
@@ -1164,6 +1215,8 @@ class Bot {
 
                 let botCount = 0, humanCount = 0;
                 const details = [];
+                const seenParticipantIds = new Set(); // Deduplicate by participant ID
+                const seenNames = new Set(); // Deduplicate by name as fallback
 
                 for (const tile of Array.from(tiles)) {
                     try {
@@ -1186,6 +1239,33 @@ class Bot {
                             continue;
                         }
 
+                        // Extract participant ID for deduplication (before name extraction)
+                        let participantId = '';
+                        try {
+                            participantId = tile.getAttribute && tile.getAttribute('data-participant-id');
+                        } catch {}
+                        
+                        // Skip tiles that appear to be in loading/transition states
+                        // Look for indicators of loading/joining states
+                        let isTransitioning = false;
+                        try {
+                            const tileText = (tile.innerText || tile.textContent || '').toLowerCase();
+                            const tileClass = (tile.className || '').toLowerCase();
+                            const tileId = (tile.id || '').toLowerCase();
+                            // Check for loading/joining indicators
+                            if (/loading|joining|connecting|waiting|pending|spinner/i.test(tileText) ||
+                                /loading|joining|connecting|waiting|pending|transition|spinner/i.test(tileClass) ||
+                                /loading|joining|connecting|waiting|pending|transition|spinner/i.test(tileId) ||
+                                (tile.querySelector && (tile.querySelector('[class*="loading"]') || 
+                                                       tile.querySelector('[class*="joining"]') ||
+                                                       tile.querySelector('[class*="spinner"]') ||
+                                                       tile.querySelector('[aria-label*="loading"]') ||
+                                                       tile.querySelector('[aria-label*="joining"]')))) {
+                                isTransitioning = true;
+                            }
+                        } catch {}
+                        if (isTransitioning) continue;
+
                         // Extract a sensible label/name from the tile
                         let label = '';
                         try { label = (tile.getAttribute && (tile.getAttribute('aria-label') || tile.getAttribute('data-self-name'))) || tile.innerText || ''; } catch {}
@@ -1206,6 +1286,18 @@ class Bot {
                         const isUiLabel = UI_BLACKLIST.some(tok => lower.includes(tok));
                         if (isUiLabel) continue;
 
+                        // Deduplicate: Skip if we've already seen this participant ID or name
+                        // This prevents counting the same participant multiple times during join animations
+                        const normalizedName = name.toLowerCase().trim();
+                        if (participantId && seenParticipantIds.has(participantId)) {
+                            continue; // Already counted this participant ID
+                        }
+                        if (normalizedName && seenNames.has(normalizedName) && normalizedName.length > 2) {
+                            // Only skip by name if name is meaningful (more than 2 chars) and we've seen it
+                            // This handles cases where participant ID might not be available
+                            continue;
+                        }
+
                         // Inspect images inside tile for known bot image domains
                         let imgMatches = false;
                         try {
@@ -1225,6 +1317,15 @@ class Bot {
                         const idMatch = idRegexes.some(r => r.test(name) || r.test(label));
 
                         const isBot = imgMatches || idMatch || recordingIndicator;
+                        
+                        // Mark this participant as seen (before counting)
+                        if (participantId) {
+                            seenParticipantIds.add(participantId);
+                        }
+                        if (normalizedName && normalizedName.length > 2) {
+                            seenNames.add(normalizedName);
+                        }
+                        
                         if (isBot) {
                             botCount++;
                             details.push({ name: name || '(unknown)', label: label || '(no-label)', reason: imgMatches ? 'img' : (recordingIndicator ? 'recording-indicator' : 'text-match') });
@@ -2380,13 +2481,15 @@ class Bot {
                     return;
                 }
 
+                // Skip participant detection if modals/dialogs are visible (they can cause false counts)
+
                 const detection = await this.detectOtherBots();
                 console.log("Detection OtherBots", detection && typeof detection.botCount === 'number' ? detection.botCount : null, 'humanCount:', detection && typeof detection.humanCount === 'number' ? detection.humanCount : null);
 
                 // Process detector details: record detected names, initialize join times
                 // and absence counters, and emit participant.joined for newly-seen names.
 
-                const participantCount = (Number(detection.botCount || 0) + Number(detection.humanCount || 0));
+                const participantCount = (detection.botCount || 0) + (detection.humanCount || 0);
 
                 // Build list of currently-detected cleaned names (from detection.details)
                 const detectedNames = [];
@@ -2416,7 +2519,7 @@ class Bot {
                                         };
 
                                         // Fire-and-forget; log failures but don't block monitoring loop
-                                        sendWebhook('participant.joined', payload).catch(err => {
+                                        sendWebhook('participant.joined', payload, this.webhookUrl || null).catch(err => {
                                             console.warn(`[${this.id}] ⚠️ Failed to send participant.joined webhook for ${cleaned}: ${err && err.message ? err.message : err}`);
                                         });
 
@@ -2477,7 +2580,7 @@ class Bot {
                                             joined_at: joinedFormatted,
                                             left_at: leftFormatted,
                                             duration_seconds: durationSeconds
-                                        }).catch(err => {
+                                        }, this.webhookUrl || null).catch(err => {
                                             console.warn(`[${this.id}] ⚠️ Failed to send participant.left webhook for ${prevName}: ${err && err.message ? err.message : err}`);
                                         });
                                     } catch (e) {
@@ -2511,7 +2614,7 @@ class Bot {
                 }
 
                 // Track when bot is alone (MeetsBot style)
-                if (participantCount <= 1) {
+                if (participantCount === 1) {
                     if (this.timeAloneStarted === Infinity) {
                         this.timeAloneStarted = Date.now();
                         console.log(`[${this.id}] ⏱️ Bot is now alone in meeting`);
@@ -2519,7 +2622,7 @@ class Bot {
                     
                     emptyStreak++;
                     const aloneMs = Date.now() - this.timeAloneStarted;
-                    const leaveAfterMs = 5000; // 5 seconds alone threshold
+                    const leaveAfterMs = 10000; // 5 seconds alone threshold
                     
                     if (aloneMs > leaveAfterMs) {
                         console.log(`[${this.id}] 🚪 Alone for ${(aloneMs/1000).toFixed(0)}s (>${leaveAfterMs/1000}s), leaving...`);
@@ -2566,21 +2669,21 @@ class Bot {
                 }
                 
                 // Periodically check for meeting host (every 15 seconds) - only if not already found
-                if (!this.meetingHost) {
-                    hostCheckCounter++;
-                    if (hostCheckCounter >= hostCheckInterval) {
-                        hostCheckCounter = 0;
-                        try {
-                            await this.getMeetingHost();
-                            // If host was found, we don't need to check again
-                            if (this.meetingHost) {
-                                console.log(`[${this.id}] ✅ Host detection complete, stopping periodic checks`);
-                            }
-                        } catch (e) {
-                            // Silently ignore host detection errors
-                        }
-                    }
-                }
+                // if (!this.meetingHost) {
+                //     hostCheckCounter++;
+                //     if (hostCheckCounter >= hostCheckInterval) {
+                //         hostCheckCounter = 0;
+                //         try {
+                //             await this.getMeetingHost();
+                //             // If host was found, we don't need to check again
+                //             if (this.meetingHost) {
+                //                 console.log(`[${this.id}] ✅ Host detection complete, stopping periodic checks`);
+                //             }
+                //         } catch (e) {
+                //             // Silently ignore host detection errors
+                //         }
+                //     }
+                // }
                 
             } catch (error) {
                 if (error && typeof error.message === 'string' && error.message.includes('Target closed')) {
@@ -2624,7 +2727,7 @@ class Bot {
                 recording_type: recordingType,
                 file_url: fileUrl,
                 duration_seconds: durationSeconds
-            }).catch(err => {
+            }, this.webhookUrl || null).catch(err => {
                 console.warn(`[${this.id}] ⚠️ Failed to send recording.ended webhook: ${err && err.message ? err.message : err}`);
             });
             console.log(`[${this.id}] 📣 Emitted recording.ended webhook (file: ${fileUrl || 'n/a'})`);
@@ -3258,15 +3361,56 @@ class Bot {
             try {
                 const meetingId = this.getMeetingIdFromUrl(this.meetUrl) || null;
                 const language = this.captionLanguage || null;
-                const transcriptUrl = this.captionsFile || null;
+                // Convert local file path to shareable URL
+                let transcriptUrl = null;
+                if (this.id) {
+                    const baseUrl = process.env.BASE_URL;
+                    const cleanBaseUrl = String(baseUrl).replace(/\/$/, ''); // Remove trailing slash
+                    transcriptUrl = `${cleanBaseUrl}/share?token=${encodeURIComponent(this.id)}`;
+                }
+                // Get meeting title from metadata
+                let meetingTitle = null;
+                try {
+                    const metadataPath = path.join(this.botDir, 'bot_metadata.json');
+                    if (await fs.pathExists(metadataPath)) {
+                        const metadata = await fs.readJson(metadataPath).catch(() => null);
+                        if (metadata && metadata.title) {
+                            meetingTitle = metadata.title;
+                        }
+                    }
+                } catch (e) {
+                    // Ignore errors when reading metadata
+                }
+                
+                // Get meeting duration in minutes
+                let meetingDurationMinutes = null;
+                try {
+                    // First, try to get duration from metrics file if it exists
+                    if (await fs.pathExists(this.metricsFile)) {
+                        const metrics = await fs.readJson(this.metricsFile).catch(() => null);
+                        if (metrics && metrics.duration && metrics.duration.totalMinutes) {
+                            meetingDurationMinutes = metrics.duration.totalMinutes;
+                        }
+                    }
+                    // Fallback: calculate from recording start time if available
+                    if (meetingDurationMinutes === null && this.recordingStartedAt && this.recordingStartedAt > 0) {
+                        const durationMs = Date.now() - this.recordingStartedAt;
+                        meetingDurationMinutes = Math.max(1, Math.floor(durationMs / 60000)); // At least 1 minute
+                    }
+                } catch (e) {
+                    // Ignore errors when reading duration
+                }
+                
                 sendWebhook('transcript.completed', {
                     meeting_id: meetingId,
                     language,
-                    transcript_url: transcriptUrl
-                }).catch(err => {
+                    transcript_url: transcriptUrl,
+                    meeting_title: meetingTitle,
+                    meeting_duration: meetingDurationMinutes
+                }, this.webhookUrl || null).catch(err => {
                     console.warn(`[${this.id}] ⚠️ Failed to send transcript.completed webhook: ${err && err.message ? err.message : err}`);
                 });
-                console.log(`[${this.id}] 📣 Emitted transcript.completed webhook (file: ${transcriptUrl || 'n/a'})`);
+                console.log(`[${this.id}] 📣 Emitted transcript.completed webhook (url: ${transcriptUrl || 'n/a'}, title: ${meetingTitle || 'n/a'}, duration: ${meetingDurationMinutes || 'n/a'} min)`);
             } catch (e) {
                 // ignore non-fatal errors
             }
@@ -3431,7 +3575,7 @@ class Bot {
                 };
 
                 // Send but don't block cleanup
-                sendWebhook('meeting.ended', payload).catch(err => {
+                sendWebhook('meeting.ended', payload, this.webhookUrl || null).catch(err => {
                     console.warn(`[${this.id}] ⚠️ Failed to send meeting.ended webhook: ${err && err.message ? err.message : err}`);
                 });
                 console.log(`[${this.id}] 📣 Emitted meeting.ended webhook (participants: ${participantsList.length})`);
@@ -3540,45 +3684,110 @@ class Bot {
         // Brief delay for browser to exit gracefully (optimized)
         await new Promise(resolve => setTimeout(resolve, 500));
 
-        // STEP 7: Force kill Chrome process if still running (platform-specific)
-        console.log(`[${this.id}] 🔪 Force killing browser process...`);
+        // STEP 7: Force kill Chrome process and all child processes (platform-specific)
+        console.log(`[${this.id}] 🔪 Force killing browser process and all children...`);
         try {
             if (this.browserPid && Number.isInteger(this.browserPid)) {
                 const isWindows = process.platform === 'win32';
                 
                 if (isWindows) {
-                    // Windows: use taskkill to kill process tree
+                    // Windows: use taskkill to kill process tree (more thorough)
                     try {
                         const { execSync } = require('child_process');
-                        // /F = force, /T = kill process tree, /PID = process ID
+                        // First try graceful kill
+                        try {
+                            execSync(`taskkill /T /PID ${this.browserPid}`, { 
+                                stdio: 'ignore',
+                                timeout: 3000 
+                            });
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        } catch {}
+                        
+                        // Force kill process tree
                         execSync(`taskkill /F /T /PID ${this.browserPid}`, { 
                             stdio: 'ignore',
                             timeout: 5000 
                         });
                         console.log(`[${this.id}] ✅ Killed Chrome process tree (Windows) PID: ${this.browserPid}`);
+                        
+                        // Also kill any remaining chrome/chromium processes for this bot
+                        try {
+                            execSync(`wmic process where "ParentProcessId=${this.browserPid}" delete`, {
+                                stdio: 'ignore',
+                                timeout: 3000
+                            });
+                        } catch {}
                     } catch (e) {
                         // Process might already be dead, ignore
                     }
                 } else {
-                    // Unix: use SIGTERM then SIGKILL
-                    try { 
+                    // Unix: kill process tree more thoroughly
+                    try {
+                        // Kill all child processes first
+                        const { execSync } = require('child_process');
+                        try {
+                            execSync(`pkill -P ${this.browserPid}`, { stdio: 'ignore', timeout: 3000 });
+                        } catch {}
+                        
+                        // SIGTERM for graceful shutdown
                         process.kill(this.browserPid, 'SIGTERM'); 
-                        await new Promise(resolve => setTimeout(resolve, 500));
-                    } catch {}
-                    try { 
-                        process.kill(this.browserPid, 'SIGKILL'); 
-                    } catch {}
-                    console.log(`[${this.id}] ✅ Killed Chrome process (Unix) PID: ${this.browserPid}`);
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        
+                        // Check if process still exists
+                        try {
+                            process.kill(this.browserPid, 0); // Signal 0 checks if process exists
+                            // Process still exists, force kill
+                            process.kill(this.browserPid, 'SIGKILL');
+                            await new Promise(resolve => setTimeout(resolve, 500));
+                        } catch {
+                            // Process already dead
+                        }
+                        
+                        console.log(`[${this.id}] ✅ Killed Chrome process tree (Unix) PID: ${this.browserPid}`);
+                    } catch (e) {
+                        // Try direct kill as fallback
+                        try { 
+                            process.kill(this.browserPid, 'SIGKILL'); 
+                        } catch {}
+                    }
                 }
+            }
+            
+            // Additional cleanup: kill any orphaned Chrome processes for this bot
+            // (in case PID file was lost but process still running)
+            try {
+                const { execSync } = require('child_process');
+                const isWindows = process.platform === 'win32';
+                const botIdPattern = this.id.slice(0, 8);
+                
+                if (isWindows) {
+                    // Find and kill Chrome processes that might belong to this bot
+                    try {
+                        execSync(`taskkill /F /IM chrome.exe /FI "WINDOWTITLE eq *${botIdPattern}*"`, {
+                            stdio: 'ignore',
+                            timeout: 3000
+                        });
+                    } catch {}
+                } else {
+                    // Unix: kill chrome processes that might be orphaned
+                    try {
+                        execSync(`pkill -f "chrome.*${botIdPattern}"`, {
+                            stdio: 'ignore',
+                            timeout: 3000
+                        });
+                    } catch {}
+                }
+            } catch (e) {
+                // Ignore errors in orphan cleanup
             }
         } catch (e) {
             console.warn(`[${this.id}] ⚠️ Error killing browser process:`, e.message);
         }
 
-        // Remove stored PID file
+        // Remove stored PID file (async)
         try { 
-            if (fs.existsSync(this.browserPidFile)) {
-                fs.removeSync(this.browserPidFile); 
+            if (await fs.pathExists(this.browserPidFile)) {
+                await fs.remove(this.browserPidFile); 
                 console.log(`[${this.id}] ✅ Removed PID file`);
             }
         } catch {}
@@ -3662,6 +3871,7 @@ class Bot {
     /**
      * Return a cleaned participant display name.
      * – Trim whitespace
+     * – Remove newlines and take first line (handles duplicates like "Name\nName")
      * – Drop everything after the first comma or parenthesis
      * – Ignore generic self-view labels ("You", "Your video", etc.)
      * The function is deliberately lenient to avoid throwing inside page.evaluate.
@@ -3669,7 +3879,11 @@ class Bot {
      */
     _cleanName(raw) {
         if (!raw) return null;
-        let candidate = String(raw).split(/[,(]/)[0].trim();
+        // Split by newlines and get the first non-empty line (removes duplicates like "Name\nName")
+        const lines = String(raw).split(/\n/).map(l => l.trim()).filter(l => l);
+        let candidate = lines.length > 0 ? lines[0] : String(raw).trim();
+        // Split on comma or parenthesis and take first part
+        candidate = candidate.split(/[,(]/)[0].trim();
         const lower = candidate.toLowerCase();
         if (this._SELF_VIEW_LABELS.includes(lower)) return null;
         return candidate;
